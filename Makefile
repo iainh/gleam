@@ -12,7 +12,17 @@ build: ## Build the compiler
 
 .PHONY: install
 install: ## Build the Gleam compiler and place it on PATH
+	cargo build --release -p runtime-cranelift
 	cd gleam-bin && cargo install --path . --force --locked
+	RUNTIME_INSTALL_DIR=$${CARGO_HOME:-$$HOME/.cargo}/lib/gleam ; \
+	mkdir -p $$RUNTIME_INSTALL_DIR ; \
+	cp target/release/libruntime_cranelift.a $$RUNTIME_INSTALL_DIR/ ; \
+	BDWGC_LIB_DIR=$$(find target/release/build -maxdepth 5 -path '*/out/lib' -print -quit) ; \
+	if [ -n "$$BDWGC_LIB_DIR" ]; then \
+	  cp $$BDWGC_LIB_DIR/libgc.a $$RUNTIME_INSTALL_DIR/ ; \
+	  if [ -f $$BDWGC_LIB_DIR/libcord.a ]; then cp $$BDWGC_LIB_DIR/libcord.a $$RUNTIME_INSTALL_DIR/ ; fi ; \
+	fi ; \
+	echo "Installed Cranelift runtime libraries to $$RUNTIME_INSTALL_DIR"
 
 .PHONY: test
 test: ## Run the compiler unit tests
