@@ -7,7 +7,8 @@ use ecow::EcoString;
 use gleam_core::{
     Error, Result,
     build::{
-        Mode, NullTelemetry, PackageCompiler, StaleTracker, Target, TargetCodegenConfiguration,
+        CraneliftCodegenConfiguration, Mode, NullTelemetry, PackageCompiler, StaleTracker, Target,
+        TargetCodegenConfiguration,
     },
     metadata,
     paths::{self, ProjectPaths},
@@ -32,6 +33,9 @@ pub fn command(options: CompilePackage) -> Result<()> {
             prelude_location: options
                 .javascript_prelude
                 .ok_or_else(|| Error::JavaScriptPreludeRequired)?,
+        },
+        Target::Cranelift => TargetCodegenConfiguration::Cranelift {
+            native: CraneliftCodegenConfiguration::default(),
         },
     };
 

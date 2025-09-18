@@ -135,6 +135,7 @@ impl Attributes {
         match target {
             Target::Erlang => self.external_erlang.is_some(),
             Target::JavaScript => self.external_javascript.is_some(),
+            Target::Cranelift => false,
         }
     }
 
@@ -142,6 +143,9 @@ impl Attributes {
         match target {
             Target::Erlang => self.external_erlang = ext,
             Target::JavaScript => self.external_javascript = ext,
+            Target::Cranelift => {
+                // Native externals will be introduced later; ignore for now.
+            }
         }
     }
 }

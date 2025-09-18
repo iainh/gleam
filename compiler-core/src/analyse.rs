@@ -1670,10 +1670,11 @@ fn target_function_implementation<'a>(
     target: Target,
     external_erlang: &'a Option<(EcoString, EcoString, SrcSpan)>,
     external_javascript: &'a Option<(EcoString, EcoString, SrcSpan)>,
-) -> &'a Option<(EcoString, EcoString, SrcSpan)> {
+) -> Option<&'a (EcoString, EcoString, SrcSpan)> {
     match target {
-        Target::Erlang => external_erlang,
-        Target::JavaScript => external_javascript,
+        Target::Erlang => external_erlang.as_ref(),
+        Target::JavaScript => external_javascript.as_ref(),
+        Target::Cranelift => None,
     }
 }
 

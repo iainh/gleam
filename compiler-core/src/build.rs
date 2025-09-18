@@ -63,6 +63,9 @@ pub enum Target {
     #[strum(serialize = "javascript", serialize = "js")]
     #[serde(rename = "javascript", alias = "js")]
     JavaScript,
+    #[strum(serialize = "cranelift", serialize = "native")]
+    #[serde(rename = "cranelift", alias = "native")]
+    Cranelift,
 }
 
 impl Target {
@@ -84,6 +87,14 @@ impl Target {
     #[must_use]
     pub fn is_erlang(&self) -> bool {
         matches!(self, Self::Erlang)
+    }
+
+    /// Returns `true` if the target is [`Cranelift`].
+    ///
+    /// [`Cranelift`]: Target::Cranelift
+    #[must_use]
+    pub fn is_cranelift(&self) -> bool {
+        matches!(self, Self::Cranelift)
     }
 }
 
@@ -148,6 +159,9 @@ pub enum TargetCodegenConfiguration {
     Erlang {
         app_file: Option<ErlangAppCodegenConfiguration>,
     },
+    Cranelift {
+        native: CraneliftCodegenConfiguration,
+    },
 }
 
 impl TargetCodegenConfiguration {
@@ -155,6 +169,7 @@ impl TargetCodegenConfiguration {
         match self {
             Self::JavaScript { .. } => Target::JavaScript,
             Self::Erlang { .. } => Target::Erlang,
+            Self::Cranelift { .. } => Target::Cranelift,
         }
     }
 }
@@ -166,6 +181,12 @@ pub struct ErlangAppCodegenConfiguration {
     /// name, as rebar3 (and Mix?) support this. The .app file must use the OTP
     /// name, not the package name.
     pub package_name_overrides: HashMap<EcoString, EcoString>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct CraneliftCodegenConfiguration {
+    /// Emit debuginfo alongside object files to aid native debugging.
+    pub emit_debug_info: bool,
 }
 
 #[derive(

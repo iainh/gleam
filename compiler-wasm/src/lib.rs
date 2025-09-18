@@ -7,7 +7,8 @@ use gleam_core::{
     Error,
     analyse::TargetSupport,
     build::{
-        Mode, NullTelemetry, PackageCompiler, StaleTracker, Target, TargetCodegenConfiguration,
+        CraneliftCodegenConfiguration, Mode, NullTelemetry, PackageCompiler, StaleTracker, Target,
+        TargetCodegenConfiguration,
     },
     config::PackageConfig,
     io::{FileSystemReader, FileSystemWriter},
@@ -182,6 +183,9 @@ fn do_compile_package(project: Project, target: Target) -> Result<(), Error> {
         Target::JavaScript => TargetCodegenConfiguration::JavaScript {
             emit_typescript_definitions: false,
             prelude_location: Utf8PathBuf::from("./gleam_prelude.mjs"),
+        },
+        Target::Cranelift => TargetCodegenConfiguration::Cranelift {
+            native: CraneliftCodegenConfiguration::default(),
         },
     };
 

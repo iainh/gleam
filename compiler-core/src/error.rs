@@ -3423,6 +3423,7 @@ and there is no implementation for the {} target.\n",
                             match current_target {
                                 Target::Erlang => "Erlang",
                                 Target::JavaScript => "JavaScript",
+                                Target::Cranelift => "Cranelift",
                             }
                         );
                         let hint = wrap("Did you mean to build for a different target?");
@@ -3451,6 +3452,7 @@ and there is no implementation for the {} target.\n",
                         let target = match target {
                             Target::Erlang => "Erlang",
                             Target::JavaScript => "JavaScript",
+                            Target::Cranelift => "Cranelift",
                         };
                         let text = wrap_format!(
                             "The `{name}` function is public but doesn't have an \
@@ -4436,6 +4438,9 @@ satisfying {required_version} but you are using v{gleam_version}.",
                     Target::Erlang => Some(
                         "You can not set a runtime for Erlang. Did you mean to target JavaScript?"
                             .into(),
+                    ),
+                    Target::Cranelift => Some(
+                        "Native (Cranelift) targets do not support selecting a runtime.".into(),
                     ),
                 };
 

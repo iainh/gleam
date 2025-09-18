@@ -36,7 +36,7 @@ use std::{
 };
 
 use super::{
-    Codegen, Compile, ErlangAppCodegenConfiguration, Outcome,
+    Codegen, Compile, CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, Outcome,
     elixir_libraries::ElixirLibraries,
     package_compiler::{CachedWarnings, CheckModuleConflicts, Compiled},
 };
@@ -576,6 +576,10 @@ where
                 emit_typescript_definitions: self.config.javascript.typescript_declarations,
                 // This path is relative to each package output directory
                 prelude_location: Utf8PathBuf::from("../prelude.mjs"),
+            },
+
+            Target::Cranelift => super::TargetCodegenConfiguration::Cranelift {
+                native: CraneliftCodegenConfiguration::default(),
             },
         };
 

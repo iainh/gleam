@@ -359,6 +359,10 @@ where
             TargetCodegenConfiguration::Erlang { app_file } => {
                 self.perform_erlang_codegen(modules, app_file.as_ref())
             }
+            TargetCodegenConfiguration::Cranelift { .. } => {
+                tracing::warn!("cranelift_codegen_not_yet_implemented");
+                Ok(())
+            }
         }
     }
 

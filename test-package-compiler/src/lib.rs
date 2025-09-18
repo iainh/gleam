@@ -4,8 +4,8 @@ mod generated_tests;
 use camino::Utf8PathBuf;
 use gleam_core::{
     build::{
-        ErlangAppCodegenConfiguration, Mode, NullTelemetry, Outcome, StaleTracker, Target,
-        TargetCodegenConfiguration,
+        CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, Mode, NullTelemetry, Outcome,
+        StaleTracker, Target, TargetCodegenConfiguration,
     },
     config::PackageConfig,
     io::{FileSystemReader, FileSystemWriter},
@@ -32,6 +32,9 @@ pub fn prepare(path: &str) -> String {
         Target::JavaScript => TargetCodegenConfiguration::JavaScript {
             emit_typescript_definitions: config.javascript.typescript_declarations,
             prelude_location: Utf8PathBuf::from("../prelude.mjs"),
+        },
+        Target::Cranelift => TargetCodegenConfiguration::Cranelift {
+            native: CraneliftCodegenConfiguration::default(),
         },
     };
 
