@@ -18,7 +18,7 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use ecow::EcoString;
 use num_traits::ToPrimitive;
@@ -45,26 +45,25 @@ impl<'a> ModuleConfig<'a> {
 }
 
 fn module_contains_public_main(module: &crate::ast::TypedModule) -> bool {
-    module.definitions.iter().any(|definition| match definition {
-        TypedDefinition::Function(Function {
-            name: Some((_, name)),
-            publicity: Publicity::Public,
-            arguments,
-            ..
-        }) if name == "main" && arguments.is_empty() => true,
-        _ => false,
-    })
+    module
+        .definitions
+        .iter()
+        .any(|definition| match definition {
+            TypedDefinition::Function(Function {
+                name: Some((_, name)),
+                publicity: Publicity::Public,
+                arguments,
+                ..
+            }) if name == "main" && arguments.is_empty() => true,
+            _ => false,
+        })
 }
 
-fn lower_main_function(
-    module: &mut ObjectModule,
-    config: &ModuleConfig<'_>,
-) -> Result<FuncId> {
-    let main_fn = find_main_function(&config.module.ast).ok_or_else(|| {
-        crate::Error::CraneliftCodegen {
+fn lower_main_function(module: &mut ObjectModule, config: &ModuleConfig<'_>) -> Result<FuncId> {
+    let main_fn =
+        find_main_function(&config.module.ast).ok_or_else(|| crate::Error::CraneliftCodegen {
             message: format!("module `{}` is missing public main/0", config.module.name),
-        }
-    })?;
+        })?;
 
     let mut ctx = module.make_context();
     ctx.func
@@ -79,18 +78,15 @@ fn lower_main_function(
         builder.switch_to_block(block);
         builder.seal_block(block);
 
-        let mut lowering = LoweringContext::new(&mut builder);
-        let value = lower_block(main_fn.body.as_slice(), &mut lowering)?;
+        let mut lowering =
+            LoweringContext::new(&mut builder, module.target_config().pointer_type());
+        let value = lower_block(module, main_fn.body.as_slice(), &mut lowering)?;
         let _ = builder.ins().return_(&[value]);
         builder.finalize();
     }
 
     let func_id = module
-        .declare_function(
-            "gleam$main_impl",
-            Linkage::Local,
-            &ctx.func.signature,
-        )
+        .declare_function("gleam$main_impl", Linkage::Local, &ctx.func.signature)
         .map_err(|err| crate::Error::CraneliftCodegen {
             message: err.to_string(),
         })?;
@@ -106,19 +102,26 @@ fn lower_main_function(
 }
 
 fn find_main_function(module: &crate::ast::TypedModule) -> Option<&Function<Arc<Type>, TypedExpr>> {
-    module.definitions.iter().find_map(|definition| match definition {
-        TypedDefinition::Function(function)
-            if function.publicity == Publicity::Public
-                && function.name.as_ref().is_some_and(|(_, name)| name == "main")
-                && function.arguments.is_empty() =>
-        {
-            Some(function)
-        }
-        _ => None,
-    })
+    module
+        .definitions
+        .iter()
+        .find_map(|definition| match definition {
+            TypedDefinition::Function(function)
+                if function.publicity == Publicity::Public
+                    && function
+                        .name
+                        .as_ref()
+                        .is_some_and(|(_, name)| name == "main")
+                    && function.arguments.is_empty() =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
 }
 
 fn lower_block(
+    module: &mut ObjectModule,
     statements: &[TypedStatement],
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<Value> {
@@ -127,15 +130,15 @@ fn lower_block(
     for statement in statements {
         match statement {
             Statement::Expression(expr) => {
-                last = lower_expression(expr, ctx)?;
+                last = lower_expression(module, expr, ctx)?;
             }
             Statement::Assignment(assignment) => {
-                lower_assignment(assignment.as_ref(), ctx)?;
+                lower_assignment(module, assignment.as_ref(), ctx)?;
             }
             Statement::Use(_) | Statement::Assert(_) => {
                 return Err(crate::Error::CraneliftCodegen {
                     message: "`use` and `assert` are not supported in native main yet".into(),
-                })
+                });
             }
         }
     }
@@ -144,38 +147,56 @@ fn lower_block(
 }
 
 fn lower_expression(
+    module: &mut ObjectModule,
     expression: &TypedExpr,
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<Value> {
     match expression {
         TypedExpr::Int { int_value, .. } => {
-            let value = int_value.to_i64().ok_or_else(|| crate::Error::CraneliftCodegen {
-                message: "integer literal out of range for 64-bit backend".into(),
-            })?;
+            let value = int_value
+                .to_i64()
+                .ok_or_else(|| crate::Error::CraneliftCodegen {
+                    message: "integer literal out of range for 64-bit backend".into(),
+                })?;
             Ok(ctx.builder.ins().iconst(ir::types::I64, value))
         }
 
-        TypedExpr::Var { name, .. } => ctx.lookup(name).copied().ok_or_else(|| {
-            crate::Error::CraneliftCodegen {
-                message: format!("unknown variable `{name}` in native main"),
-            }
-        }),
+        TypedExpr::Var { name, .. } => {
+            ctx.lookup(name)
+                .copied()
+                .ok_or_else(|| crate::Error::CraneliftCodegen {
+                    message: format!("unknown variable `{name}` in native main"),
+                })
+        }
 
-        TypedExpr::Block { statements, .. } => lower_block(statements.as_slice(), ctx),
+        TypedExpr::Block { statements, .. } => lower_block(module, statements.as_slice(), ctx),
 
         TypedExpr::Tuple { elements, .. } if elements.is_empty() => {
             Ok(ctx.builder.ins().iconst(ir::types::I64, 0))
         }
 
+        TypedExpr::Tuple { elements, .. } => {
+            let mut last = ctx.builder.ins().iconst(ir::types::I64, 0);
+            for element in elements {
+                last = lower_expression(module, element, ctx)?;
+            }
+            Ok(last)
+        }
+
+        TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
+
+        TypedExpr::Case {
+            subjects, clauses, ..
+        } => lower_case(module, subjects, clauses, ctx),
+
         _ => Err(crate::Error::CraneliftCodegen {
-            message: format!(
-                "unsupported expression in main function: {expression:?}"
-            ),
+            message: format!("unsupported expression in main function: {expression:?}"),
         }),
     }
 }
 
 fn lower_assignment(
+    module: &mut ObjectModule,
     assignment: &crate::ast::TypedAssignment,
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<()> {
@@ -185,7 +206,7 @@ fn lower_assignment(
         });
     }
 
-    let value = lower_expression(&assignment.value, ctx)?;
+    let value = lower_expression(module, &assignment.value, ctx)?;
 
     match &assignment.pattern {
         Pattern::Variable { name, .. } => {
@@ -199,16 +220,140 @@ fn lower_assignment(
     }
 }
 
+fn lower_call(
+    module: &mut ObjectModule,
+    fun: &TypedExpr,
+    arguments: &[crate::ast::CallArg<TypedExpr>],
+    ctx: &mut LoweringContext<'_, '_>,
+) -> Result<Value> {
+    if let TypedExpr::ModuleSelect {
+        module_name, label, ..
+    } = fun
+    {
+        if module_name == "gleam/io" && label == "println" && arguments.len() == 1 {
+            lower_print_call(module, &arguments[0].value, ctx, true)?;
+            return Ok(ctx.builder.ins().iconst(ir::types::I64, 0));
+        }
+        if module_name == "gleam/io" && label == "print" && arguments.len() == 1 {
+            lower_print_call(module, &arguments[0].value, ctx, false)?;
+            return Ok(ctx.builder.ins().iconst(ir::types::I64, 0));
+        }
+    }
+
+    Err(crate::Error::CraneliftCodegen {
+        message: format!("unsupported call in native main: {fun:?}"),
+    })
+}
+
+fn lower_print_call(
+    module: &mut ObjectModule,
+    argument: &TypedExpr,
+    ctx: &mut LoweringContext<'_, '_>,
+    newline: bool,
+) -> Result<()> {
+    let text = match argument {
+        TypedExpr::String { value, .. } => {
+            let mut s = value.as_str().to_string();
+            if newline && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s
+        }
+        TypedExpr::Int { int_value, .. } => {
+            let mut s = int_value
+                .to_i64()
+                .ok_or_else(|| crate::Error::CraneliftCodegen {
+                    message: "integer literal out of range for print".into(),
+                })?
+                .to_string();
+            if newline {
+                s.push('\n');
+            }
+            s
+        }
+        _ => {
+            return Err(crate::Error::CraneliftCodegen {
+                message: "println currently supports only string or integer literals".into(),
+            });
+        }
+    };
+
+    let pointer = ctx.string_constant(module, &text)?;
+    let puts = ctx.declare_puts(module)?;
+    let func_ref = module.declare_func_in_func(puts, &mut ctx.builder.func);
+    let _ = ctx.builder.ins().call(func_ref, &[pointer]);
+    Ok(())
+}
+
+fn lower_case(
+    module: &mut ObjectModule,
+    subjects: &[TypedExpr],
+    clauses: &[crate::ast::Clause<TypedExpr, Arc<Type>, EcoString>],
+    ctx: &mut LoweringContext<'_, '_>,
+) -> Result<Value> {
+    if subjects.len() != 1 || clauses.len() != 1 {
+        return Err(crate::Error::CraneliftCodegen {
+            message:
+                "case expressions in native main currently support only a single subject and clause"
+                    .into(),
+        });
+    }
+
+    let subject = &subjects[0];
+    let subject_value = lower_expression(module, subject, ctx)?;
+
+    ctx.push_scope();
+
+    let clause = &clauses[0];
+    if clause.pattern.len() != 1 {
+        return Err(crate::Error::CraneliftCodegen {
+            message: "case clause must have a single pattern".into(),
+        });
+    }
+
+    let result = match &clause.pattern[0] {
+        Pattern::Discard { .. } => {
+            if clause.guard.is_some() {
+                return Err(crate::Error::CraneliftCodegen {
+                    message: "case clause guards are not yet supported in native main".into(),
+                });
+            }
+            lower_expression(module, &clause.then, ctx)
+        }
+        Pattern::Variable { name, .. } => {
+            if clause.guard.is_some() {
+                return Err(crate::Error::CraneliftCodegen {
+                    message: "case clause guards are not yet supported in native main".into(),
+                });
+            }
+            ctx.define(name, subject_value);
+            lower_expression(module, &clause.then, ctx)
+        }
+        _ => Err(crate::Error::CraneliftCodegen {
+            message: "case patterns other than `_` are not yet supported in native main".into(),
+        }),
+    }?;
+
+    ctx.pop_scope();
+    Ok(result)
+}
+
 struct LoweringContext<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
+    pointer_type: ir::Type,
     scopes: Vec<HashMap<EcoString, Value>>,
+    string_data: HashMap<EcoString, DataId>,
+    puts: Option<FuncId>,
 }
 
 impl<'a, 'b> LoweringContext<'a, 'b> {
-    fn new(builder: &'a mut FunctionBuilder<'b>) -> Self {
+    fn new(builder: &'a mut FunctionBuilder<'b>, pointer_type: ir::Type) -> Self {
         Self {
             builder,
+            pointer_type,
             scopes: vec![HashMap::new()],
+            string_data: HashMap::new(),
+            puts: None,
         }
     }
 
@@ -229,6 +374,54 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
     fn lookup(&self, name: &EcoString) -> Option<&Value> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
     }
+
+    fn string_constant(&mut self, module: &mut ObjectModule, text: &str) -> Result<Value> {
+        let key: EcoString = text.into();
+        let data_id = if let Some(id) = self.string_data.get(&key) {
+            *id
+        } else {
+            let mut bytes = text.as_bytes().to_vec();
+            if !bytes.ends_with(&[0]) {
+                bytes.push(0);
+            }
+            let mut description = DataDescription::new();
+            description.define(bytes.into_boxed_slice());
+            let name = format!("gleam$str_{}", self.string_data.len());
+            let id = module
+                .declare_data(&name, Linkage::Local, false, false)
+                .map_err(|err| crate::Error::CraneliftCodegen {
+                    message: err.to_string(),
+                })?;
+            module
+                .define_data(id, &description)
+                .map_err(|err| crate::Error::CraneliftCodegen {
+                    message: err.to_string(),
+                })?;
+            let _ = self.string_data.insert(key.clone(), id);
+            id
+        };
+
+        let gv = module.declare_data_in_func(data_id, &mut self.builder.func);
+        Ok(self.builder.ins().global_value(self.pointer_type, gv))
+    }
+
+    fn declare_puts(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.puts {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(ir::types::I32));
+
+        let id = module
+            .declare_function("puts", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.puts = Some(id);
+        Ok(id)
+    }
 }
 
 #[instrument(skip_all, fields(module = %config.module.name, output = %output_path))]
@@ -237,8 +430,8 @@ pub fn emit_object(
     config: ModuleConfig<'_>,
     output_path: &Utf8Path,
 ) -> Result<()> {
-    let isa_builder = cranelift_native::builder()
-        .map_err(|err| crate::Error::CraneliftCodegen {
+    let isa_builder =
+        cranelift_native::builder().map_err(|err| crate::Error::CraneliftCodegen {
             message: err.to_string(),
         })?;
 

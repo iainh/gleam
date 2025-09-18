@@ -442,11 +442,10 @@ where
             objects: objects.iter().map(|p| p.as_str()).collect(),
         };
 
-        let manifest_text = serde_json::to_string_pretty(&manifest).map_err(|err| {
-            Error::CraneliftCodegen {
+        let manifest_text =
+            serde_json::to_string_pretty(&manifest).map_err(|err| Error::CraneliftCodegen {
                 message: err.to_string(),
-            }
-        })?;
+            })?;
 
         self.io
             .write(&artefact_dir.join("manifest.json"), &manifest_text)
