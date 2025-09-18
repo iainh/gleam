@@ -2826,6 +2826,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-cranelift"
+version = "0.1.0"
+
+[[package]]
 name = "rust-embed"
 version = "8.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

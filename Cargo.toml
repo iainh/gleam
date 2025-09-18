@@ -5,6 +5,7 @@ members = [
   "compiler-cli",
   "compiler-core",
   "compiler-wasm",
+  "runtime-cranelift",
   "test-helpers-rs",
   "test-output",
   "test-package-compiler",

@@ -19,7 +19,7 @@
 - [ ] Evaluate existing Rust runtime components for reuse (memory management, scheduler) and outline integration strategy.
 - [ ] Implement required wrappers/adapters exposing runtime functionality to generated Cranelift code.
 - [ ] Add intrinsics for panic handling, comparison, arithmetic overflow, etc.
-- [ ] Set up crate/module structure for the runtime (e.g. `runtime-cranelift`) and build scripts as needed.
+- [x] Set up crate/module structure for the runtime (`runtime-cranelift`) and initial build plumbing.
 - [ ] Design full runtime layer (value representations, ownership/GC, built-ins like `to_string`, pattern matching hooks) to unblock richer lowering support.
 
 ## PackageCompiler Integration
