@@ -6,6 +6,7 @@ mod native_file_copier;
 pub mod package_compiler;
 mod package_loader;
 mod project_compiler;
+mod runtime_lib;
 mod telemetry;
 
 #[cfg(test)]

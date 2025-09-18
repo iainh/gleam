@@ -185,12 +185,10 @@ fn lower_expression(
             }
 
             let count = elements.len();
-            let slot = ctx
-                .builder
-                .create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    (count * ctx.pointer_bytes()) as u32,
-                ));
+            let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (count * ctx.pointer_bytes()) as u32,
+            ));
 
             for (index, element) in elements.iter().enumerate() {
                 let value = lower_expression(module, element, ctx)?;

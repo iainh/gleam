@@ -26,14 +26,14 @@ use crate::{
 use askama::Template;
 use ecow::EcoString;
 use std::collections::HashSet;
-use std::{collections::HashMap, fmt::write, time::SystemTime};
+use std::{collections::HashMap, env, fmt::write, fs, path::Path, time::SystemTime};
 use vec1::Vec1;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{
     CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, TargetCodegenConfiguration,
-    Telemetry,
+    Telemetry, runtime_lib::locate_runtime_artifacts,
 };
 
 pub struct Compiled {
@@ -406,8 +406,19 @@ where
 
         let output = artefact_dir.join("module");
 
-        let mut args = Vec::with_capacity(objects.len() + 2);
+        let runtime = locate_runtime_artifacts()?;
+
+        let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 6);
         args.extend(objects.iter().map(|path| path.as_str().to_string()));
+        args.push(runtime.runtime_lib.as_str().to_string());
+        for lib in &runtime.additional_libs {
+            args.push(lib.as_str().to_string());
+        }
+        args.push("-lpthread".into());
+        #[cfg(target_os = "linux")]
+        {
+            args.push("-ldl".into());
+        }
         args.push("-o".into());
         args.push(output.as_str().to_string());
 

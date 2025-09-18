@@ -79,7 +79,7 @@ impl Heap {
         let ptr = self.allocate_box(FloatBox::HEADER)?;
         unsafe {
             let float_box = ptr.cast::<FloatBox>().as_ptr();
-            (*float_box).value = value;
+            core::ptr::addr_of_mut!((*float_box).value).write(value);
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }
