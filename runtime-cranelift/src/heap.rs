@@ -1,11 +1,10 @@
-use std::alloc::{alloc, dealloc, Layout, LayoutError};
+use std::alloc::{Layout, LayoutError};
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 
+use crate::gc;
 use crate::header::{Header, Tag};
-use crate::layout::{
-    Binary, BinaryData, BinarySlice, BitArray, ConsCell, FloatBox, Map, MapTable, Tuple,
-};
+use crate::layout::{Binary, BinaryData, BinarySlice, BitArray, ConsCell, FloatBox, Map, MapTable};
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,9 +30,10 @@ impl Heap {
 
     /// Allocate a boxed value using the provided header metadata and return a pointer to it.
     pub fn allocate_box(&self, header: Header) -> Result<NonNull<Header>, AllocationError> {
+        gc::ensure_initialised();
         let layout = header.allocation_layout().map_err(AllocationError::from)?;
-        // SAFETY: `alloc` returns suitably aligned memory for the layout or null on failure.
-        let ptr = unsafe { alloc(layout) };
+        // SAFETY: `malloc` returns suitably aligned memory or null on failure.
+        let ptr = unsafe { gc::malloc(layout.size()) } as *mut u8;
         let ptr = NonNull::new(ptr).ok_or(AllocationError::OutOfMemory)?;
         // SAFETY: the pointer is valid for the header size; write initial header contents.
         unsafe {
@@ -42,31 +42,15 @@ impl Heap {
         Ok(ptr.cast())
     }
 
-    /// Deallocate a previously allocated boxed value.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must be a pointer returned by [`Heap::allocate_box`] and must not be used afterwards.
-    pub unsafe fn deallocate_box(&self, ptr: NonNull<Header>) {
-        let layout = {
-            let header = unsafe { ptr.as_ref() };
-            header
-                .allocation_layout()
-                .expect("header layout should be valid for deallocation")
-        };
-        unsafe {
-            dealloc(ptr.cast().as_ptr(), layout);
-        }
-    }
-
     /// Allocate `words` 64-bit slots without writing a header. Intended for DST payloads.
     pub fn allocate_words(&self, words: usize) -> Result<NonNull<u8>, AllocationError> {
+        gc::ensure_initialised();
         let bytes = words
             .checked_mul(core::mem::size_of::<u64>())
             .ok_or(AllocationError::InvalidLayout)?;
-        let layout = Layout::from_size_align(bytes, core::mem::align_of::<u64>())
+        let _ = Layout::from_size_align(bytes, core::mem::align_of::<u64>())
             .map_err(AllocationError::from)?;
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { gc::malloc(bytes) } as *mut u8;
         NonNull::new(ptr).ok_or(AllocationError::OutOfMemory)
     }
 
@@ -74,26 +58,20 @@ impl Heap {
         &self,
         capacity: usize,
     ) -> Result<NonNull<BinaryData>, AllocationError> {
+        gc::ensure_initialised();
         let layout = BinaryData::layout_for(capacity).map_err(AllocationError::from)?;
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { gc::malloc(layout.size()) } as *mut u8;
         let ptr = NonNull::new(ptr).ok_or(AllocationError::OutOfMemory)?;
         unsafe {
             let data_ptr = ptr.cast::<BinaryData>().as_ptr();
             core::ptr::addr_of_mut!((*data_ptr).ref_count).write(AtomicUsize::new(1));
             core::ptr::addr_of_mut!((*data_ptr).capacity).write(capacity);
+            let bytes_ptr = data_ptr
+                .cast::<u8>()
+                .add(core::mem::size_of::<BinaryData>());
+            core::ptr::write_bytes(bytes_ptr, 0, capacity);
         }
         Ok(ptr.cast())
-    }
-
-    pub unsafe fn dealloc_binary_data(&self, ptr: NonNull<BinaryData>) {
-        let layout = {
-            let capacity = unsafe { ptr.as_ref() }.capacity;
-            BinaryData::layout_for(capacity)
-                .expect("binary data layout should be valid for stored capacity")
-        };
-        unsafe {
-            dealloc(ptr.cast().as_ptr(), layout);
-        }
     }
 
     /// Allocate a floating point box.
@@ -123,8 +101,10 @@ impl Heap {
         let header = Header::new(Tag::Tuple, arity as u16, arity as u32);
         let ptr = self.allocate_box(header)?;
         unsafe {
-            let payload =
-                ptr.as_ptr().cast::<u8>().add(core::mem::size_of::<Tuple>()) as *mut Value;
+            let payload = ptr
+                .as_ptr()
+                .cast::<u8>()
+                .add(core::mem::size_of::<Header>()) as *mut Value;
             core::ptr::copy_nonoverlapping(elements.as_ptr(), payload, arity);
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
@@ -189,5 +169,27 @@ impl Heap {
             (*map).table = table.as_ptr();
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alloc_float_boxes_value() {
+        let heap = Heap::new();
+        let value = heap.alloc_float(1.5).unwrap();
+        assert!(value.is_boxed());
+        let float_box = unsafe { value.as_boxed::<FloatBox>().unwrap().as_ref() };
+        assert_eq!(float_box.value, 1.5);
+    }
+
+    #[test]
+    fn alloc_binary_data_zeroes_buffer() {
+        let heap = Heap::new();
+        let data = heap.alloc_binary_data(4).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts((*data.as_ptr()).as_ptr(), 4) };
+        assert_eq!(bytes, &[0, 0, 0, 0]);
     }
 }

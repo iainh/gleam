@@ -15,6 +15,8 @@ pub enum Tag {
     BitArray = 9,
     Mailbox = 10,
     Resource = 11,
+    Boolean = 12,
+    Nil = 13,
 }
 
 impl Tag {

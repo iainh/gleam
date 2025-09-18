@@ -16,8 +16,8 @@
 
 ## Runtime & Value Representation
 - [ ] Document value layout decisions (records, enums, lists, strings, numbers) for native code.
-- [ ] Evaluate existing Rust runtime components for reuse (memory management, scheduler) and outline integration strategy.
-- [ ] Implement required wrappers/adapters exposing runtime functionality to generated Cranelift code.
+- [x] Evaluate existing Rust runtime components for reuse (memory management, scheduler) and outline integration strategy (using BDWGC via `bdwgc-sys`).
+- [x] Implement required wrappers/adapters exposing runtime functionality to generated Cranelift code (heap facade, GC helpers, binary retain/release).
 - [ ] Add intrinsics for panic handling, comparison, arithmetic overflow, etc.
 - [x] Set up crate/module structure for the runtime (`runtime-cranelift`) and initial build plumbing.
 - [ ] Design full runtime layer (value representations, ownership/GC, built-ins like `to_string`, pattern matching hooks) to unblock richer lowering support.
