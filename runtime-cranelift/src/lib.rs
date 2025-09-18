@@ -3,6 +3,7 @@
 
 pub mod atom;
 pub mod binary;
+pub mod ffi;
 pub mod gc;
 pub mod header;
 pub mod heap;

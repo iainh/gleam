@@ -14,7 +14,7 @@ use crate::{
 };
 use camino::Utf8Path;
 use cranelift_codegen::{
-    ir::{self, InstBuilder, Value},
+    ir::{self, InstBuilder, StackSlotData, StackSlotKind, Value},
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -78,8 +78,11 @@ fn lower_main_function(module: &mut ObjectModule, config: &ModuleConfig<'_>) -> 
         builder.switch_to_block(block);
         builder.seal_block(block);
 
-        let mut lowering =
-            LoweringContext::new(&mut builder, module.target_config().pointer_type());
+        let mut lowering = LoweringContext::new(
+            &mut builder,
+            module.target_config().pointer_type(),
+            module.target_config().pointer_bytes(),
+        );
         let value = lower_block(module, main_fn.body.as_slice(), &mut lowering)?;
         let _ = builder.ins().return_(&[value]);
         builder.finalize();
@@ -158,7 +161,8 @@ fn lower_expression(
                 .ok_or_else(|| crate::Error::CraneliftCodegen {
                     message: "integer literal out of range for 64-bit backend".into(),
                 })?;
-            Ok(ctx.builder.ins().iconst(ir::types::I64, value))
+            let encoded = encode_small_int(value)?;
+            Ok(ctx.builder.ins().iconst(ir::types::I64, encoded))
         }
 
         TypedExpr::Var { name, .. } => {
@@ -171,16 +175,37 @@ fn lower_expression(
 
         TypedExpr::Block { statements, .. } => lower_block(module, statements.as_slice(), ctx),
 
-        TypedExpr::Tuple { elements, .. } if elements.is_empty() => {
-            Ok(ctx.builder.ins().iconst(ir::types::I64, 0))
-        }
-
         TypedExpr::Tuple { elements, .. } => {
-            let mut last = ctx.builder.ins().iconst(ir::types::I64, 0);
-            for element in elements {
-                last = lower_expression(module, element, ctx)?;
+            if elements.is_empty() {
+                let func_id = ctx.declare_runtime_nil(module)?;
+                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                let call = ctx.builder.ins().call(func_ref, &[]);
+                let results = ctx.builder.inst_results(call);
+                return Ok(results[0]);
             }
-            Ok(last)
+
+            let count = elements.len();
+            let slot = ctx
+                .builder
+                .create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (count * ctx.pointer_bytes()) as u32,
+                ));
+
+            for (index, element) in elements.iter().enumerate() {
+                let value = lower_expression(module, element, ctx)?;
+                let offset = (index * ctx.pointer_bytes()) as i32;
+                let _ = ctx.builder.ins().stack_store(value, slot, offset);
+            }
+
+            let base_ptr = ctx.builder.ins().stack_addr(ctx.pointer_type, slot, 0);
+            let len_value = ctx.builder.ins().iconst(ctx.pointer_type, count as i64);
+
+            let func_id = ctx.declare_runtime_alloc_tuple(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[base_ptr, len_value]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
         }
 
         TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
@@ -344,16 +369,26 @@ struct LoweringContext<'a, 'b> {
     scopes: Vec<HashMap<EcoString, Value>>,
     string_data: HashMap<EcoString, DataId>,
     puts: Option<FuncId>,
+    runtime_nil: Option<FuncId>,
+    runtime_alloc_tuple: Option<FuncId>,
+    pointer_bytes: u8,
 }
 
 impl<'a, 'b> LoweringContext<'a, 'b> {
-    fn new(builder: &'a mut FunctionBuilder<'b>, pointer_type: ir::Type) -> Self {
+    fn new(
+        builder: &'a mut FunctionBuilder<'b>,
+        pointer_type: ir::Type,
+        pointer_bytes: u8,
+    ) -> Self {
         Self {
             builder,
             pointer_type,
             scopes: vec![HashMap::new()],
             string_data: HashMap::new(),
             puts: None,
+            runtime_nil: None,
+            runtime_alloc_tuple: None,
+            pointer_bytes,
         }
     }
 
@@ -422,6 +457,60 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         self.puts = Some(id);
         Ok(id)
     }
+
+    fn declare_runtime_nil(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_nil {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleam_list_nil", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_nil = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_alloc_tuple(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_alloc_tuple {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleam_alloc_tuple", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_alloc_tuple = Some(id);
+        Ok(id)
+    }
+
+    fn pointer_bytes(&self) -> usize {
+        self.pointer_bytes as usize
+    }
+}
+
+fn encode_small_int(value: i64) -> Result<i64, crate::Error> {
+    const MIN_I63: i64 = -(1i64 << 61);
+    const MAX_I63: i64 = (1i64 << 61) - 1;
+
+    if value < MIN_I63 || value > MAX_I63 {
+        return Err(crate::Error::CraneliftCodegen {
+            message: format!("integer literal out of range for Gleam immediate: {value}"),
+        });
+    }
+
+    let shifted = (value as i128) << 2;
+    Ok(((shifted as u128) as i64) | 0b01)
 }
 
 #[instrument(skip_all, fields(module = %config.module.name, output = %output_path))]
@@ -488,6 +577,15 @@ fn build_entrypoint(module: &mut ObjectModule, main_func: FuncId) -> Result<()> 
     let block = builder.create_block();
     builder.switch_to_block(block);
     builder.seal_block(block);
+
+    let init_signature = module.make_signature();
+    let runtime_init = module
+        .declare_function("gleam_runtime_init", Linkage::Import, &init_signature)
+        .map_err(|err| crate::Error::CraneliftCodegen {
+            message: err.to_string(),
+        })?;
+    let runtime_init_ref = module.declare_func_in_func(runtime_init, &mut builder.func);
+    let _ = builder.ins().call(runtime_init_ref, &[]);
 
     let main_ref = module.declare_func_in_func(main_func, &mut builder.func);
     let _ = builder.ins().call(main_ref, &[]);
