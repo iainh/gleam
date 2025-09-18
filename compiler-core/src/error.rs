@@ -138,6 +138,9 @@ pub enum Error {
     #[error("source code incorrectly formatted")]
     Format { problem_files: Vec<Unformatted> },
 
+    #[error("native code generation failed: {message}")]
+    CraneliftCodegen { message: String },
+
     #[error("Hex error: {0}")]
     Hex(String),
 
@@ -4460,6 +4463,13 @@ satisfying {required_version} but you are using v{gleam_version}.",
                 level: Level::Error,
                 location: None,
                 hint: None,
+            }],
+            Error::CraneliftCodegen { message } => vec![Diagnostic {
+                title: "Native code generation failed".into(),
+                text: message.clone(),
+                hint: None,
+                level: Level::Error,
+                location: None,
             }],
             Error::CorruptManifest => vec![Diagnostic {
                 title: "Corrupt manifest.toml".into(),

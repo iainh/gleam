@@ -31,7 +31,10 @@ use vec1::Vec1;
 
 use camino::{Utf8Path, Utf8PathBuf};
 
-use super::{ErlangAppCodegenConfiguration, TargetCodegenConfiguration, Telemetry};
+use super::{
+    CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, TargetCodegenConfiguration,
+    Telemetry,
+};
 
 pub struct Compiled {
     /// The modules which were just compiled
@@ -359,11 +362,40 @@ where
             TargetCodegenConfiguration::Erlang { app_file } => {
                 self.perform_erlang_codegen(modules, app_file.as_ref())
             }
-            TargetCodegenConfiguration::Cranelift { .. } => {
-                tracing::warn!("cranelift_codegen_not_yet_implemented");
-                Ok(())
+            TargetCodegenConfiguration::Cranelift { native } => {
+                self.perform_cranelift_codegen(modules, native)
             }
         }
+    }
+
+    fn perform_cranelift_codegen(
+        &mut self,
+        modules: &[Module],
+        _config: &CraneliftCodegenConfiguration,
+    ) -> Result<(), Error> {
+        use crate::cranelift;
+
+        let artefact_dir = self.out.join(paths::ARTEFACT_DIRECTORY_NAME);
+        if !self.io.is_directory(&artefact_dir) {
+            self.io.mkdir(&artefact_dir)?;
+        }
+
+        let mut object_paths = Vec::with_capacity(modules.len());
+
+        for module in modules {
+            let object_name = format!("{}.o", module.name.replace("/", "__"));
+            let output_path = artefact_dir.join(&object_name);
+            let module_config = cranelift::ModuleConfig::new(module, self.root);
+            cranelift::emit_object(&self.io, module_config, &output_path)?;
+            object_paths.push(output_path);
+        }
+
+        self.link_cranelift_objects(&object_paths)
+    }
+
+    fn link_cranelift_objects(&self, _objects: &[Utf8PathBuf]) -> Result<(), Error> {
+        tracing::warn!("cranelift_linking_not_yet_implemented");
+        Ok(())
     }
 
     fn perform_erlang_codegen(
