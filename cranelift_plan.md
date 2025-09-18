@@ -17,6 +17,7 @@
 - Leverage existing Rust implementations for memory management and scheduling to minimise bespoke runtime work; adapt as needed for Gleam semantics.
 - Defer FFI surface design until a later milestone; keep runtime boundaries clean so it can be added incrementally.
 - Provide intrinsics/utilities callable from both generated code and user-written native modules.
+- Schedule a dedicated runtime design task covering value layout, ownership/GC, built-in functions (e.g. `to_string`), and pattern matching support so richer lowering can be enabled safely.
 
 - Introduce `perform_cranelift_codegen` in `compiler-core/src/build/package_compiler.rs`, invoked when the target config is Cranelift.
 - Lower each module to native object files (`.o`/`.obj`) written under `build/<mode>/cranelift/<package>/artefacts`.
