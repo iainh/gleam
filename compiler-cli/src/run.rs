@@ -8,7 +8,7 @@ use gleam_core::{
     config::{DenoFlag, PackageConfig},
     error::Error,
     io::{Command, CommandExecutor, Stdio},
-    paths::ProjectPaths,
+    paths::{self, ProjectPaths},
     type_::ModuleFunction,
 };
 
@@ -153,10 +153,39 @@ pub fn setup(
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
         },
-        Target::Cranelift => {
-            unimplemented!("gleam run for the Cranelift target is not yet implemented")
-        }
+        Target::Cranelift => run_cranelift_command(
+            paths,
+            &main_function.package,
+            &module,
+            arguments,
+        ),
     }
+}
+
+fn run_cranelift_command(
+    paths: &ProjectPaths,
+    package: &str,
+    module: &str,
+    arguments: Vec<String>,
+) -> Result<Command, Error> {
+    let package_dir = paths.build_directory_for_package(Mode::Dev, Target::Cranelift, package);
+    let binary = package_dir
+        .join(paths::ARTEFACT_DIRECTORY_NAME)
+        .join("module");
+
+    if !binary.is_file() {
+        return Err(Error::CraneliftExecutableMissing {
+            module: module.to_string(),
+        });
+    }
+
+    Ok(Command {
+        program: binary.as_str().to_string(),
+        args: arguments,
+        env: vec![],
+        cwd: None,
+        stdio: Stdio::Inherit,
+    })
 }
 
 fn run_erlang_command(

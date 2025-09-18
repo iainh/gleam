@@ -390,12 +390,66 @@ where
             object_paths.push(output_path);
         }
 
-        self.link_cranelift_objects(&object_paths)
+        self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+        self.link_cranelift_objects(&artefact_dir, &object_paths)
     }
 
-    fn link_cranelift_objects(&self, _objects: &[Utf8PathBuf]) -> Result<(), Error> {
-        tracing::warn!("cranelift_linking_not_yet_implemented");
+    fn link_cranelift_objects(
+        &self,
+        artefact_dir: &Utf8Path,
+        objects: &[Utf8PathBuf],
+    ) -> Result<(), Error> {
+        if objects.is_empty() {
+            tracing::debug!("no_objects_to_link");
+            return Ok(());
+        }
+
+        let output = artefact_dir.join("module");
+
+        let mut args = Vec::with_capacity(objects.len() + 2);
+        args.extend(objects.iter().map(|path| path.as_str().to_string()));
+        args.push("-o".into());
+        args.push(output.as_str().to_string());
+
+        let output = std::process::Command::new("cc")
+            .args(&args)
+            .output()
+            .map_err(|err| Error::CraneliftCodegen {
+                message: format!("failed to invoke linker: {err}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::CraneliftCodegen {
+                message: format!("linker failed: {}", stderr.trim()),
+            });
+        }
+
         Ok(())
+    }
+
+    fn write_cranelift_manifest(
+        &self,
+        artefact_dir: &Utf8Path,
+        objects: &[Utf8PathBuf],
+    ) -> Result<(), Error> {
+        #[derive(serde::Serialize)]
+        struct Manifest<'a> {
+            objects: Vec<&'a str>,
+        }
+
+        let manifest = Manifest {
+            objects: objects.iter().map(|p| p.as_str()).collect(),
+        };
+
+        let manifest_text = serde_json::to_string_pretty(&manifest).map_err(|err| {
+            Error::CraneliftCodegen {
+                message: err.to_string(),
+            }
+        })?;
+
+        self.io
+            .write(&artefact_dir.join("manifest.json"), &manifest_text)
     }
 
     fn perform_erlang_codegen(

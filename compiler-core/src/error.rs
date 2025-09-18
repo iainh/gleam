@@ -140,6 +140,8 @@ pub enum Error {
 
     #[error("native code generation failed: {message}")]
     CraneliftCodegen { message: String },
+    #[error("native executable for module {module} was not produced")]
+    CraneliftExecutableMissing { module: String },
 
     #[error("Hex error: {0}")]
     Hex(String),
@@ -4468,6 +4470,15 @@ satisfying {required_version} but you are using v{gleam_version}.",
                 title: "Native code generation failed".into(),
                 text: message.clone(),
                 hint: None,
+                level: Level::Error,
+                location: None,
+            }],
+            Error::CraneliftExecutableMissing { module } => vec![Diagnostic {
+                title: "Native executable missing".into(),
+                text: format!(
+                    "The Cranelift backend expected a linked executable for `{module}` but none was found."
+                ),
+                hint: Some("Ensure your build completed successfully before running.".into()),
                 level: Level::Error,
                 location: None,
             }],
