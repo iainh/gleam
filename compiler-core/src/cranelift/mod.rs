@@ -10,7 +10,7 @@ use crate::{
     build::Module as GleamModule,
     io::FileSystemWriter,
     line_numbers::LineNumbers,
-    type_::Type,
+    type_::{Type, ValueConstructorVariant},
 };
 use camino::Utf8Path;
 use cranelift_codegen::{
@@ -253,6 +253,9 @@ fn lower_call(
         module_name, label, ..
     } = fun
     {
+        if module_name == "gleeunit" && label == "do_main" && arguments.is_empty() {
+            return skip_gleeunit_do_main(module, ctx);
+        }
         if module_name == "gleam/io" && label == "println" && arguments.len() == 1 {
             lower_print_call(module, &arguments[0].value, ctx, true)?;
             return Ok(ctx.builder.ins().iconst(ir::types::I64, 0));
@@ -263,9 +266,34 @@ fn lower_call(
         }
     }
 
+    if let TypedExpr::Var { constructor, .. } = fun {
+        if let ValueConstructorVariant::ModuleFn {
+            module: module_name,
+            name,
+            ..
+        } = &constructor.variant
+        {
+            if module_name == "gleeunit" && name == "do_main" && arguments.is_empty() {
+                return skip_gleeunit_do_main(module, ctx);
+            }
+        }
+    }
+
     Err(crate::Error::CraneliftCodegen {
         message: format!("unsupported call in native main: {fun:?}"),
     })
+}
+
+fn skip_gleeunit_do_main(
+    module: &mut ObjectModule,
+    ctx: &mut LoweringContext<'_, '_>,
+) -> Result<Value> {
+    tracing::warn!("Skipping gleeunit.do_main; test runner not yet supported on Cranelift");
+    let func_id = ctx.declare_runtime_nil(module)?;
+    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let call = ctx.builder.ins().call(func_ref, &[]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
 }
 
 fn lower_print_call(
