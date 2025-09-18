@@ -381,17 +381,26 @@ where
         }
 
         let mut object_paths = Vec::with_capacity(modules.len());
+        let mut has_entrypoint = false;
 
         for module in modules {
             let object_name = format!("{}.o", module.name.replace("/", "__"));
             let output_path = artefact_dir.join(&object_name);
             let module_config = cranelift::ModuleConfig::new(module, self.root);
+            if module_config.has_entrypoint {
+                has_entrypoint = true;
+            }
             cranelift::emit_object(&self.io, module_config, &output_path)?;
             object_paths.push(output_path);
         }
 
         self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
-        self.link_cranelift_objects(&artefact_dir, &object_paths)
+        if has_entrypoint {
+            self.link_cranelift_objects(&artefact_dir, &object_paths)
+        } else {
+            tracing::debug!(reason = "no entrypoint", "cranelift_link_skipped");
+            Ok(())
+        }
     }
 
     fn link_cranelift_objects(

@@ -122,12 +122,14 @@ fn candidate_directories(exe_dir: &Path) -> Vec<PathBuf> {
     dirs.push(exe_dir.to_path_buf());
     dirs.push(exe_dir.join("deps"));
     dirs.push(exe_dir.join("lib"));
+    dirs.push(exe_dir.join("gleam"));
 
     if let Some(parent) = exe_dir.parent() {
         dirs.push(parent.join("release"));
         dirs.push(parent.join("debug"));
         dirs.push(parent.join("lib"));
         dirs.push(parent.join("deps"));
+        dirs.push(parent.join("lib/gleam"));
     }
 
     dirs.into_iter().filter(|d| d.exists()).collect()
@@ -142,7 +144,8 @@ fn missing_runtime_error(searched: Vec<PathBuf>) -> Error {
         message: format!(
             "unable to locate Cranelift runtime static library. Set the \"GLEAM_RUNTIME_LIB\" \
              environment variable to the path of libruntime_cranelift.a or \"GLEAM_RUNTIME_LIB_DIR\" \
-             to a directory containing the runtime libraries. Searched directories: {}",
+             to a directory containing the runtime libraries (run `make install` to place them \
+             automatically). Searched directories: {}",
             if searched.is_empty() {
                 "<none>".into()
             } else {
