@@ -1,0 +1,26 @@
+---
+source: test-package-compiler/src/generated_tests.rs
+assertion_line: 19
+expression: "./cases/cranelift_unsupported_external"
+snapshot_kind: text
+---
+error: Unsupported target
+  ┌─ src/main.gleam:2:1
+  │
+2 │ pub fn erlang_only() -> Nil
+  │ ^
+
+The `erlang_only` function is public but doesn't have an implementation for
+the Cranelift target. All public functions of a package must be able to
+compile for a module to be valid.
+
+error: Unsupported target
+  ┌─ src/main.gleam:5:3
+  │
+5 │   erlang_only()
+  │   ^
+
+This value is not available as it is defined using externals, and there is
+no implementation for the Cranelift target.
+
+Hint: Did you mean to build for a different target?

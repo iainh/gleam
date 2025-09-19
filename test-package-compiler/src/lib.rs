@@ -3,6 +3,7 @@ mod generated_tests;
 
 use camino::Utf8PathBuf;
 use gleam_core::{
+    analyse::TargetSupport,
     build::{
         CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, Mode, NullTelemetry, Outcome,
         StaleTracker, Target, TargetCodegenConfiguration,
@@ -61,6 +62,9 @@ pub fn prepare(path: &str) -> String {
     compiler.write_metadata = true;
     compiler.compile_beam_bytecode = false;
     compiler.copy_native_files = false;
+    if matches!(config.target, Target::Cranelift) {
+        compiler.target_support = TargetSupport::Enforced;
+    }
     let result = compiler.compile(
         &warning_emitter,
         &mut modules,

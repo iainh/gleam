@@ -607,9 +607,13 @@ where
             // compilation. It's impossible for a dependecy module to call functions from the root
             // package, so it's OK if they could not be compiled.
             self.options.root_target_support
+        } else if matches!(self.target(), Target::Cranelift) {
+            // Native targets cannot link against non-native code, so dependencies must also be
+            // fully supported when compiling with the Cranelift backend.
+            TargetSupport::Enforced
         } else {
-            // When compiling dependencies we don't enforce that all functions have an
-            // implementation for the current target. It is OK if they have APIs that are
+            // When compiling dependencies for other targets we don't enforce that all functions
+            // have an implementation for the current target. It is OK if they have APIs that are
             // unaccessible so long as they are not used by the root package.
             TargetSupport::NotEnforced
         };

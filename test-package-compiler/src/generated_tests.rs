@@ -14,6 +14,17 @@ fn alias_unqualified_import() {
 
 #[rustfmt::skip]
 #[test]
+fn cranelift_unsupported_external() {
+    let output = crate::prepare("./cases/cranelift_unsupported_external");
+    insta::assert_snapshot!(
+        "cranelift_unsupported_external",
+        output,
+        "./cases/cranelift_unsupported_external",
+    );
+}
+
+#[rustfmt::skip]
+#[test]
 fn dev_importing_test() {
     let output = crate::prepare("./cases/dev_importing_test");
     insta::assert_snapshot!(

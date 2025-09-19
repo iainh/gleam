@@ -6,6 +6,7 @@ use camino::Utf8Path;
 use ecow::EcoString;
 use gleam_core::{
     Error, Result,
+    analyse::TargetSupport,
     build::{
         CraneliftCodegenConfiguration, Mode, NullTelemetry, PackageCompiler, StaleTracker, Target,
         TargetCodegenConfiguration,
@@ -54,6 +55,9 @@ pub fn command(options: CompilePackage) -> Result<()> {
     compiler.write_entrypoint = false;
     compiler.write_metadata = true;
     compiler.compile_beam_bytecode = !options.skip_beam_compilation;
+    if matches!(options.target, Target::Cranelift) {
+        compiler.target_support = TargetSupport::Enforced;
+    }
     compiler
         .compile(
             &warnings,
