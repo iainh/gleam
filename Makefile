@@ -12,7 +12,7 @@ build: ## Build the compiler
 
 .PHONY: install
 install: ## Build the Gleam compiler and place it on PATH
-	cargo build --release -p runtime-cranelift
+	CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release -p runtime-cranelift
 	cd gleam-bin && cargo install --path . --force --locked
 	RUNTIME_INSTALL_DIR=$${CARGO_HOME:-$$HOME/.cargo}/lib/gleam ; \
 	mkdir -p $$RUNTIME_INSTALL_DIR ; \
