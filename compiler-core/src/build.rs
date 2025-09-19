@@ -74,6 +74,15 @@ impl Target {
         Self::VARIANTS.iter().map(|s| (*s).into()).collect()
     }
 
+    #[must_use]
+    pub fn folder_name(&self) -> &'static str {
+        match self {
+            Self::Erlang => "erlang",
+            Self::JavaScript => "javascript",
+            Self::Native => "native",
+        }
+    }
+
     /// Returns `true` if the target is [`JavaScript`].
     ///
     /// [`JavaScript`]: Target::JavaScript
