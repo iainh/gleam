@@ -381,11 +381,16 @@ where
         }
 
         let mut object_paths = Vec::with_capacity(modules.len());
+        let src_root = self.root.join(Origin::Src.folder_name());
         let primary_entry_index = modules
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, module)| cranelift::module_contains_public_main(&module.ast))
+            .find(|(_, module)| {
+                module.origin == Origin::Src
+                    && module.input_path.starts_with(&src_root)
+                    && cranelift::module_contains_public_main(&module.ast)
+            })
             .map(|(index, _)| index);
         let mut has_entrypoint = primary_entry_index.is_some();
 
@@ -420,7 +425,15 @@ where
             return Ok(());
         }
 
-        let output = artefact_dir.join("module");
+        let mut output_name = self.config.name.as_str().replace('/', "__");
+        if output_name.is_empty() {
+            output_name = "module".into();
+        }
+        let exe_suffix = env::consts::EXE_SUFFIX;
+        if !exe_suffix.is_empty() && !output_name.ends_with(exe_suffix) {
+            output_name.push_str(exe_suffix);
+        }
+        let output = artefact_dir.join(output_name);
 
         let runtime = locate_runtime_artifacts()?;
 
