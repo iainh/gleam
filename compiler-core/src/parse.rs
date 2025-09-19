@@ -123,19 +123,22 @@ struct Attributes {
     deprecated: Deprecation,
     external_erlang: Option<(EcoString, EcoString, SrcSpan)>,
     external_javascript: Option<(EcoString, EcoString, SrcSpan)>,
+    external_cranelift: Option<(EcoString, EcoString, SrcSpan)>,
     internal: InternalAttribute,
 }
 
 impl Attributes {
     fn has_function_only(&self) -> bool {
-        self.external_erlang.is_some() || self.external_javascript.is_some()
+        self.external_erlang.is_some()
+            || self.external_javascript.is_some()
+            || self.external_cranelift.is_some()
     }
 
     fn has_external_for(&self, target: Target) -> bool {
         match target {
             Target::Erlang => self.external_erlang.is_some(),
             Target::JavaScript => self.external_javascript.is_some(),
-            Target::Cranelift => false,
+            Target::Cranelift => self.external_cranelift.is_some(),
         }
     }
 
@@ -143,9 +146,7 @@ impl Attributes {
         match target {
             Target::Erlang => self.external_erlang = ext,
             Target::JavaScript => self.external_javascript = ext,
-            Target::Cranelift => {
-                // Native externals will be introduced later; ignore for now.
-            }
+            Target::Cranelift => self.external_cranelift = ext,
         }
     }
 }
@@ -2165,12 +2166,15 @@ where
             deprecation: std::mem::take(&mut attributes.deprecated),
             external_erlang: attributes.external_erlang.take(),
             external_javascript: attributes.external_javascript.take(),
+            external_cranelift: attributes.external_cranelift.take(),
             implementations: Implementations {
                 gleam: true,
                 can_run_on_erlang: true,
                 can_run_on_javascript: true,
+                can_run_on_cranelift: true,
                 uses_erlang_externals: false,
                 uses_javascript_externals: false,
+                uses_cranelift_externals: false,
             },
             purity: Purity::Pure,
         })))
@@ -2460,6 +2464,7 @@ where
                         // Expecting all but the deprecated atterbutes to be default
                         if attributes.external_erlang.is_some()
                             || attributes.external_javascript.is_some()
+                            || attributes.external_cranelift.is_some()
                             || attributes.target.is_some()
                             || attributes.internal != InternalAttribute::Missing
                         {
@@ -3061,8 +3066,10 @@ where
                         gleam: true,
                         can_run_on_erlang: true,
                         can_run_on_javascript: true,
+                        can_run_on_cranelift: true,
                         uses_erlang_externals: false,
                         uses_javascript_externals: false,
+                        uses_cranelift_externals: false,
                     },
                 })))
             }
@@ -3841,6 +3848,7 @@ functions are declared separately from types.";
                         });
                     Ok(Target::Erlang)
                 }
+                "cranelift" | "native" => Ok(Target::Cranelift),
                 _ => parse_error(ParseErrorType::UnknownTarget, SrcSpan::new(start, end)),
             },
             _ => parse_error(ParseErrorType::ExpectedTargetName, paren_location),
@@ -4141,6 +4149,7 @@ functions are declared separately from types.";
         let target = match name.as_str() {
             "erlang" => Target::Erlang,
             "javascript" => Target::JavaScript,
+            "cranelift" | "native" => Target::Cranelift,
             _ => return parse_error(ParseErrorType::UnknownTarget, SrcSpan::new(start, end)),
         };
 

@@ -625,6 +625,7 @@ impl ModuleDecoder {
             implementations: self.implementations(reader.get_implementations()?),
             external_erlang: self.optional_external(reader.get_external_erlang()?)?,
             external_javascript: self.optional_external(reader.get_external_javascript()?)?,
+            external_cranelift: self.optional_external(reader.get_external_cranelift()?)?,
             purity,
         })
     }
@@ -636,6 +637,8 @@ impl ModuleDecoder {
             uses_javascript_externals: reader.get_uses_javascript_externals(),
             can_run_on_erlang: reader.get_can_run_on_erlang(),
             can_run_on_javascript: reader.get_can_run_on_javascript(),
+            uses_cranelift_externals: reader.get_uses_cranelift_externals(),
+            can_run_on_cranelift: reader.get_can_run_on_cranelift(),
         }
     }
 

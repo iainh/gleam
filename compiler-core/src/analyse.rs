@@ -200,9 +200,7 @@ struct ModuleAnalyzer<'a, A> {
     value_names: HashMap<EcoString, SrcSpan>,
     hydrators: HashMap<EcoString, Hydrator>,
     module_name: EcoString,
-
     inline_functions: HashMap<EcoString, InlinableFunction>,
-
     /// The minimum Gleam version required to compile the analysed module.
     minimum_required_version: Version,
 }
@@ -420,6 +418,7 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             has_body: true,
             has_erlang_external: false,
             has_javascript_external: false,
+            has_cranelift_external: false,
         };
         let mut expr_typer = ExprTyper::new(environment, definition, &mut self.problems);
         let typed_expr = expr_typer.infer_const(&annotation, *value);
@@ -437,7 +436,6 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             | Publicity::Internal {
                 attribute_location: None,
             } => (),
-
             Publicity::Internal {
                 attribute_location: Some(location),
             } => self.track_feature_usage(FeatureKind::InternalAnnotation, location),
@@ -513,6 +511,7 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             deprecation,
             external_erlang,
             external_javascript,
+            external_cranelift,
             return_type: (),
             implementations: _,
             purity: _,
@@ -537,14 +536,19 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
         self.assert_valid_javascript_external(&name, external_javascript.as_ref(), location);
 
         // Find the external implementation for the current target, if one has been given.
-        let external =
-            target_function_implementation(target, &external_erlang, &external_javascript);
+        let external = target_function_implementation(
+            target,
+            &external_erlang,
+            &external_javascript,
+            &external_cranelift,
+        );
 
         // The function must have at least one implementation somewhere.
         let has_implementation = self.ensure_function_has_an_implementation(
             &body,
             &external_erlang,
             &external_javascript,
+            &external_cranelift,
             location,
         );
 
@@ -561,6 +565,7 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             has_body,
             has_erlang_external: external_erlang.is_some(),
             has_javascript_external: external_javascript.is_some(),
+            has_cranelift_external: external_cranelift.is_some(),
         };
 
         // We have already registered the function in the `register_value_from_function`
@@ -658,7 +663,6 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             | Publicity::Internal {
                 attribute_location: None,
             } => (),
-
             Publicity::Internal {
                 attribute_location: Some(location),
             } => self.track_feature_usage(FeatureKind::InternalAnnotation, location),
@@ -705,6 +709,9 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             external_javascript: external_javascript
                 .as_ref()
                 .map(|(m, f, _)| (m.clone(), f.clone())),
+            external_cranelift: external_cranelift
+                .as_ref()
+                .map(|(m, f, _)| (m.clone(), f.clone())),
             field_map,
             module: environment.current_module.clone(),
             arity: typed_arguments.len(),
@@ -745,6 +752,7 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             body,
             external_erlang,
             external_javascript,
+            external_cranelift,
             implementations,
             purity,
         };
@@ -825,10 +833,11 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
         body: &[UntypedStatement],
         external_erlang: &Option<(EcoString, EcoString, SrcSpan)>,
         external_javascript: &Option<(EcoString, EcoString, SrcSpan)>,
+        external_cranelift: &Option<(EcoString, EcoString, SrcSpan)>,
         location: SrcSpan,
     ) -> bool {
-        match (external_erlang, external_javascript) {
-            (None, None) if body.is_empty() => {
+        match (external_erlang, external_javascript, external_cranelift) {
+            (None, None, None) if body.is_empty() => {
                 self.problems.error(Error::NoImplementation { location });
                 false
             }
@@ -929,7 +938,6 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             | Publicity::Internal {
                 attribute_location: None,
             } => (),
-
             Publicity::Internal {
                 attribute_location: Some(location),
             } => self.track_feature_usage(FeatureKind::InternalAnnotation, location),
@@ -1486,6 +1494,7 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
             documentation,
             external_erlang,
             external_javascript,
+            external_cranelift,
             deprecation,
             end_position: _,
             body: _,
@@ -1523,7 +1532,11 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
 
         // When external implementations are present then the type annotations
         // must be given in full, so we disallow holes in the annotations.
-        hydrator.permit_holes(external_erlang.is_none() && external_javascript.is_none());
+        hydrator.permit_holes(
+            external_erlang.is_none()
+                && external_javascript.is_none()
+                && external_cranelift.is_none(),
+        );
 
         let arguments_types = arguments
             .iter()
@@ -1563,6 +1576,9 @@ impl<'a, A> ModuleAnalyzer<'a, A> {
                 .as_ref()
                 .map(|(m, f, _)| (m.clone(), f.clone())),
             external_javascript: external_javascript
+                .as_ref()
+                .map(|(m, f, _)| (m.clone(), f.clone())),
+            external_cranelift: external_cranelift
                 .as_ref()
                 .map(|(m, f, _)| (m.clone(), f.clone())),
             module: environment.current_module.clone(),
@@ -1670,11 +1686,12 @@ fn target_function_implementation<'a>(
     target: Target,
     external_erlang: &'a Option<(EcoString, EcoString, SrcSpan)>,
     external_javascript: &'a Option<(EcoString, EcoString, SrcSpan)>,
+    external_cranelift: &'a Option<(EcoString, EcoString, SrcSpan)>,
 ) -> Option<&'a (EcoString, EcoString, SrcSpan)> {
     match target {
         Target::Erlang => external_erlang.as_ref(),
         Target::JavaScript => external_javascript.as_ref(),
-        Target::Cranelift => None,
+        Target::Cranelift => external_cranelift.as_ref(),
     }
 }
 
@@ -1735,7 +1752,6 @@ where
         }
 
         BitArrayOption::Unit { location, value } => Ok(BitArrayOption::Unit { location, value }),
-
         BitArrayOption::Bytes { location } => Ok(BitArrayOption::Bytes { location }),
         BitArrayOption::Int { location } => Ok(BitArrayOption::Int { location }),
         BitArrayOption::Float { location } => Ok(BitArrayOption::Float { location }),
@@ -1854,6 +1870,7 @@ fn generalise_function(
         return_type,
         external_erlang,
         external_javascript,
+        external_cranelift,
         implementations,
         purity,
     } = function;
@@ -1878,6 +1895,9 @@ fn generalise_function(
             .as_ref()
             .map(|(m, f, _)| (m.clone(), f.clone())),
         external_javascript: external_javascript
+            .as_ref()
+            .map(|(m, f, _)| (m.clone(), f.clone())),
+        external_cranelift: external_cranelift
             .as_ref()
             .map(|(m, f, _)| (m.clone(), f.clone())),
         module: module_name.clone(),
@@ -1917,6 +1937,7 @@ fn generalise_function(
         body,
         external_erlang,
         external_javascript,
+        external_cranelift,
         implementations,
         purity,
     })

@@ -447,6 +447,7 @@ impl<'a> ModuleEncoder<'a> {
                 implementations,
                 external_erlang,
                 external_javascript,
+                external_cranelift,
                 purity,
             } => {
                 let mut builder = builder.init_module_fn();
@@ -467,6 +468,10 @@ impl<'a> ModuleEncoder<'a> {
                 self.build_external(
                     builder.reborrow().init_external_javascript(),
                     external_javascript,
+                );
+                self.build_external(
+                    builder.reborrow().init_external_cranelift(),
+                    external_cranelift,
                 );
                 self.build_optional_field_map(builder.reborrow().init_field_map(), field_map);
                 self.build_src_span(builder.reborrow().init_location(), *location);
@@ -726,6 +731,8 @@ impl<'a> ModuleEncoder<'a> {
         builder.set_uses_javascript_externals(implementations.uses_javascript_externals);
         builder.set_can_run_on_erlang(implementations.can_run_on_erlang);
         builder.set_can_run_on_javascript(implementations.can_run_on_javascript);
+        builder.set_uses_cranelift_externals(implementations.uses_cranelift_externals);
+        builder.set_can_run_on_cranelift(implementations.can_run_on_cranelift);
     }
 
     fn build_external(

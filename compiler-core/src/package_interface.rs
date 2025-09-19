@@ -234,6 +234,8 @@ pub struct ImplementationsInterface {
     /// - `uses_javascript_externals: true` the function is using JavaScript
     ///   external code.
     uses_javascript_externals: bool,
+    /// Whether the function is using Cranelift specific external code.
+    uses_cranelift_externals: bool,
     /// Whether the function can be called on the Erlang target, either due to a
     /// pure Gleam implementation or an implementation that uses some Erlang
     /// externals.
@@ -242,6 +244,8 @@ pub struct ImplementationsInterface {
     /// to a pure Gleam implementation or an implementation that uses some
     /// JavaScript externals.
     can_run_on_javascript: bool,
+    /// Whether the function can be called on the Cranelift target.
+    can_run_on_cranelift: bool,
 }
 
 impl ImplementationsInterface {
@@ -259,17 +263,21 @@ impl ImplementationsInterface {
             gleam,
             uses_erlang_externals,
             uses_javascript_externals,
+            uses_cranelift_externals,
 
             can_run_on_erlang,
             can_run_on_javascript,
+            can_run_on_cranelift,
         } = implementations;
 
         ImplementationsInterface {
             gleam: *gleam,
             uses_erlang_externals: *uses_erlang_externals,
             uses_javascript_externals: *uses_javascript_externals,
+            uses_cranelift_externals: *uses_cranelift_externals,
             can_run_on_erlang: *can_run_on_erlang,
             can_run_on_javascript: *can_run_on_javascript,
+            can_run_on_cranelift: *can_run_on_cranelift,
         }
     }
 }
