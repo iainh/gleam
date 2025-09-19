@@ -139,9 +139,9 @@ pub enum Error {
     Format { problem_files: Vec<Unformatted> },
 
     #[error("native code generation failed: {message}")]
-    CraneliftCodegen { message: String },
+    NativeCodegen { message: String },
     #[error("native executable for module {module} was not produced")]
-    CraneliftExecutableMissing { module: String },
+    NativeExecutableMissing { module: String },
 
     #[error("Hex error: {0}")]
     Hex(String),
@@ -3428,7 +3428,7 @@ and there is no implementation for the {} target.\n",
                             match current_target {
                                 Target::Erlang => "Erlang",
                                 Target::JavaScript => "JavaScript",
-                                Target::Cranelift => "Cranelift",
+                                Target::Native => "native",
                             }
                         );
                         let hint = wrap("Did you mean to build for a different target?");
@@ -3457,7 +3457,7 @@ and there is no implementation for the {} target.\n",
                         let target = match target {
                             Target::Erlang => "Erlang",
                             Target::JavaScript => "JavaScript",
-                            Target::Cranelift => "Cranelift",
+                            Target::Native => "native",
                         };
                         let text = wrap_format!(
                             "The `{name}` function is public but doesn't have an \
@@ -4444,8 +4444,8 @@ satisfying {required_version} but you are using v{gleam_version}.",
                         "You can not set a runtime for Erlang. Did you mean to target JavaScript?"
                             .into(),
                     ),
-                    Target::Cranelift => Some(
-                        "Native (Cranelift) targets do not support selecting a runtime.".into(),
+                    Target::Native => Some(
+                        "Native targets do not support selecting a runtime.".into(),
                     ),
                 };
 
@@ -4466,17 +4466,17 @@ satisfying {required_version} but you are using v{gleam_version}.",
                 location: None,
                 hint: None,
             }],
-            Error::CraneliftCodegen { message } => vec![Diagnostic {
+            Error::NativeCodegen { message } => vec![Diagnostic {
                 title: "Native code generation failed".into(),
                 text: message.clone(),
                 hint: None,
                 level: Level::Error,
                 location: None,
             }],
-            Error::CraneliftExecutableMissing { module } => vec![Diagnostic {
+            Error::NativeExecutableMissing { module } => vec![Diagnostic {
                 title: "Native executable missing".into(),
                 text: format!(
-                    "The Cranelift backend expected a linked executable for `{module}` but none was found."
+                    "The native backend expected a linked executable for `{module}` but none was found."
                 ),
                 hint: Some("Ensure your build completed successfully before running.".into()),
                 level: Level::Error,

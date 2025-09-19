@@ -164,7 +164,7 @@ pub struct FunctionDefinition {
     pub has_erlang_external: bool,
     /// The function has @external(JavaScript, "...", "...")
     pub has_javascript_external: bool,
-    /// The function has @external(cranelift, "...", "...")
+    /// The function has @external(native, "...", "...")
     pub has_cranelift_external: bool,
 }
 
@@ -173,7 +173,7 @@ impl FunctionDefinition {
         match target {
             Target::Erlang => self.has_erlang_external,
             Target::JavaScript => self.has_javascript_external,
-            Target::Cranelift => self.has_cranelift_external,
+            Target::Native => self.has_cranelift_external,
         }
     }
 }
@@ -252,7 +252,7 @@ impl Implementations {
             || match target {
                 Target::Erlang => self.can_run_on_erlang,
                 Target::JavaScript => self.can_run_on_javascript,
-                Target::Cranelift => self.can_run_on_cranelift,
+                Target::Native => self.can_run_on_cranelift,
             }
     }
 }
@@ -340,7 +340,7 @@ impl<'a, 'b> ExprTyper<'a, 'b> {
         let uses_externals = match environment.target {
             Target::Erlang => implementations.uses_erlang_externals,
             Target::JavaScript => implementations.uses_javascript_externals,
-            Target::Cranelift => implementations.uses_cranelift_externals,
+            Target::Native => implementations.uses_cranelift_externals,
         };
 
         let purity = if is_trusted_pure_module(environment) {

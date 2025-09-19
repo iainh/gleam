@@ -362,7 +362,7 @@ where
             TargetCodegenConfiguration::Erlang { app_file } => {
                 self.perform_erlang_codegen(modules, app_file.as_ref())
             }
-            TargetCodegenConfiguration::Cranelift { native } => {
+            TargetCodegenConfiguration::Native { native } => {
                 self.perform_cranelift_codegen(modules, native)
             }
         }
@@ -410,7 +410,7 @@ where
         if has_entrypoint {
             self.link_cranelift_objects(&artefact_dir, &object_paths)
         } else {
-            tracing::debug!(reason = "no entrypoint", "cranelift_link_skipped");
+            tracing::debug!(reason = "no entrypoint", "native_link_skipped");
             Ok(())
         }
     }
@@ -454,13 +454,13 @@ where
         let output = std::process::Command::new("cc")
             .args(&args)
             .output()
-            .map_err(|err| Error::CraneliftCodegen {
+            .map_err(|err| Error::NativeCodegen {
                 message: format!("failed to invoke linker: {err}"),
             })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::CraneliftCodegen {
+            return Err(Error::NativeCodegen {
                 message: format!("linker failed: {}", stderr.trim()),
             });
         }
@@ -483,7 +483,7 @@ where
         };
 
         let manifest_text =
-            serde_json::to_string_pretty(&manifest).map_err(|err| Error::CraneliftCodegen {
+            serde_json::to_string_pretty(&manifest).map_err(|err| Error::NativeCodegen {
                 message: err.to_string(),
             })?;
 

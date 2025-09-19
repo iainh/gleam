@@ -102,7 +102,7 @@ pub struct TargetedDefinition {
 impl TargetedDefinition {
     pub fn is_for(&self, target: Target) -> bool {
         self.target
-            .map(|t| t == target || (target.is_cranelift() && t == Target::Erlang))
+            .map(|t| t == target || (target.is_native() && t == Target::Erlang))
             .unwrap_or(true)
     }
 }

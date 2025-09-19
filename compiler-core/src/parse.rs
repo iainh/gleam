@@ -138,7 +138,7 @@ impl Attributes {
         match target {
             Target::Erlang => self.external_erlang.is_some(),
             Target::JavaScript => self.external_javascript.is_some(),
-            Target::Cranelift => self.external_cranelift.is_some(),
+            Target::Native => self.external_cranelift.is_some(),
         }
     }
 
@@ -146,7 +146,7 @@ impl Attributes {
         match target {
             Target::Erlang => self.external_erlang = ext,
             Target::JavaScript => self.external_javascript = ext,
-            Target::Cranelift => self.external_cranelift = ext,
+            Target::Native => self.external_cranelift = ext,
         }
     }
 }
@@ -3848,7 +3848,7 @@ functions are declared separately from types.";
                         });
                     Ok(Target::Erlang)
                 }
-                "cranelift" | "native" => Ok(Target::Cranelift),
+                "native" | "cranelift" => Ok(Target::Native),
                 _ => parse_error(ParseErrorType::UnknownTarget, SrcSpan::new(start, end)),
             },
             _ => parse_error(ParseErrorType::ExpectedTargetName, paren_location),
@@ -4149,7 +4149,7 @@ functions are declared separately from types.";
         let target = match name.as_str() {
             "erlang" => Target::Erlang,
             "javascript" => Target::JavaScript,
-            "cranelift" | "native" => Target::Cranelift,
+            "native" | "cranelift" => Target::Native,
             _ => return parse_error(ParseErrorType::UnknownTarget, SrcSpan::new(start, end)),
         };
 

@@ -35,7 +35,7 @@ pub fn command(options: CompilePackage) -> Result<()> {
                 .javascript_prelude
                 .ok_or_else(|| Error::JavaScriptPreludeRequired)?,
         },
-        Target::Cranelift => TargetCodegenConfiguration::Cranelift {
+        Target::Native => TargetCodegenConfiguration::Native {
             native: CraneliftCodegenConfiguration::default(),
         },
     };
@@ -55,7 +55,7 @@ pub fn command(options: CompilePackage) -> Result<()> {
     compiler.write_entrypoint = false;
     compiler.write_metadata = true;
     compiler.compile_beam_bytecode = !options.skip_beam_compilation;
-    if matches!(options.target, Target::Cranelift) {
+    if matches!(options.target, Target::Native) {
         compiler.target_support = TargetSupport::Enforced;
     }
     compiler

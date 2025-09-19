@@ -153,19 +153,19 @@ pub fn setup(
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
         },
-        Target::Cranelift => {
-            run_cranelift_command(paths, &main_function.package, &module, arguments)
+        Target::Native => {
+            run_native_command(paths, &main_function.package, &module, arguments)
         }
     }
 }
 
-fn run_cranelift_command(
+fn run_native_command(
     paths: &ProjectPaths,
     package: &str,
     module: &str,
     arguments: Vec<String>,
 ) -> Result<Command, Error> {
-    let package_dir = paths.build_directory_for_package(Mode::Dev, Target::Cranelift, package);
+    let package_dir = paths.build_directory_for_package(Mode::Dev, Target::Native, package);
     let mut binary_name = package.replace('/', "__");
     if binary_name.is_empty() {
         binary_name = "module".into();
@@ -180,7 +180,7 @@ fn run_cranelift_command(
         .join(Utf8Path::new(&binary_name));
 
     if !binary.is_file() {
-        return Err(Error::CraneliftExecutableMissing {
+        return Err(Error::NativeExecutableMissing {
             module: module.to_string(),
         });
     }

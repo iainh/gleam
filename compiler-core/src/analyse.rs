@@ -1691,7 +1691,7 @@ fn target_function_implementation<'a>(
     match target {
         Target::Erlang => external_erlang.as_ref(),
         Target::JavaScript => external_javascript.as_ref(),
-        Target::Cranelift => external_cranelift.as_ref(),
+        Target::Native => external_cranelift.as_ref(),
     }
 }
 

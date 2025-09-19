@@ -34,7 +34,7 @@ pub fn prepare(path: &str) -> String {
             emit_typescript_definitions: config.javascript.typescript_declarations,
             prelude_location: Utf8PathBuf::from("../prelude.mjs"),
         },
-        Target::Cranelift => TargetCodegenConfiguration::Cranelift {
+        Target::Native => TargetCodegenConfiguration::Native {
             native: CraneliftCodegenConfiguration::default(),
         },
     };
@@ -62,7 +62,7 @@ pub fn prepare(path: &str) -> String {
     compiler.write_metadata = true;
     compiler.compile_beam_bytecode = false;
     compiler.copy_native_files = false;
-    if matches!(config.target, Target::Cranelift) {
+    if matches!(config.target, Target::Native) {
         compiler.target_support = TargetSupport::Enforced;
     }
     let result = compiler.compile(

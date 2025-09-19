@@ -140,9 +140,9 @@ fn missing_runtime_error(searched: Vec<PathBuf>) -> Error {
         .into_iter()
         .map(|p| p.display().to_string())
         .collect();
-    Error::CraneliftCodegen {
+    Error::NativeCodegen {
         message: format!(
-            "unable to locate Cranelift runtime static library. Set the \"GLEAM_RUNTIME_LIB\" \
+            "unable to locate native (Cranelift) runtime static library. Set the \"GLEAM_RUNTIME_LIB\" \
              environment variable to the path of libruntime_cranelift.a or \"GLEAM_RUNTIME_LIB_DIR\" \
              to a directory containing the runtime libraries (run `make install` to place them \
              automatically). Searched directories: {}",

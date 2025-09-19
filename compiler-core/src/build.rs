@@ -64,9 +64,9 @@ pub enum Target {
     #[strum(serialize = "javascript", serialize = "js")]
     #[serde(rename = "javascript", alias = "js")]
     JavaScript,
-    #[strum(serialize = "cranelift", serialize = "native")]
-    #[serde(rename = "cranelift", alias = "native")]
-    Cranelift,
+    #[strum(serialize = "native", serialize = "cranelift")]
+    #[serde(rename = "native", alias = "cranelift")]
+    Native,
 }
 
 impl Target {
@@ -90,12 +90,12 @@ impl Target {
         matches!(self, Self::Erlang)
     }
 
-    /// Returns `true` if the target is [`Cranelift`].
+    /// Returns `true` if the target is [`Native`].
     ///
-    /// [`Cranelift`]: Target::Cranelift
+    /// [`Native`]: Target::Native
     #[must_use]
-    pub fn is_cranelift(&self) -> bool {
-        matches!(self, Self::Cranelift)
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Native)
     }
 }
 
@@ -160,7 +160,7 @@ pub enum TargetCodegenConfiguration {
     Erlang {
         app_file: Option<ErlangAppCodegenConfiguration>,
     },
-    Cranelift {
+    Native {
         native: CraneliftCodegenConfiguration,
     },
 }
@@ -170,7 +170,7 @@ impl TargetCodegenConfiguration {
         match self {
             Self::JavaScript { .. } => Target::JavaScript,
             Self::Erlang { .. } => Target::Erlang,
-            Self::Cranelift { .. } => Target::Cranelift,
+            Self::Native { .. } => Target::Native,
         }
     }
 }

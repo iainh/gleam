@@ -578,7 +578,7 @@ where
                 prelude_location: Utf8PathBuf::from("../prelude.mjs"),
             },
 
-            Target::Cranelift => super::TargetCodegenConfiguration::Cranelift {
+            Target::Native => super::TargetCodegenConfiguration::Native {
                 native: CraneliftCodegenConfiguration::default(),
             },
         };
@@ -607,9 +607,9 @@ where
             // compilation. It's impossible for a dependecy module to call functions from the root
             // package, so it's OK if they could not be compiled.
             self.options.root_target_support
-        } else if matches!(self.target(), Target::Cranelift) {
+        } else if matches!(self.target(), Target::Native) {
             // Native targets cannot link against non-native code, so dependencies must also be
-            // fully supported when compiling with the Cranelift backend.
+            // fully supported when compiling with the native backend.
             TargetSupport::Enforced
         } else {
             // When compiling dependencies for other targets we don't enforce that all functions

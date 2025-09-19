@@ -73,7 +73,7 @@ pub(crate) fn module_contains_public_main(module: &crate::ast::TypedModule) -> b
 
 fn lower_main_function(module: &mut ObjectModule, config: &ModuleConfig<'_>) -> Result<FuncId> {
     let main_fn =
-        find_main_function(&config.module.ast).ok_or_else(|| crate::Error::CraneliftCodegen {
+        find_main_function(&config.module.ast).ok_or_else(|| crate::Error::NativeCodegen {
             message: format!("module `{}` is missing public main/0", config.module.name),
         })?;
 
@@ -102,13 +102,13 @@ fn lower_main_function(module: &mut ObjectModule, config: &ModuleConfig<'_>) -> 
 
     let func_id = module
         .declare_function("gleam$main_impl", Linkage::Local, &ctx.func.signature)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
     module
         .define_function(func_id, &mut ctx)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
@@ -151,7 +151,7 @@ fn lower_block(
                 lower_assignment(module, assignment.as_ref(), ctx)?;
             }
             Statement::Use(_) | Statement::Assert(_) => {
-                return Err(crate::Error::CraneliftCodegen {
+                return Err(crate::Error::NativeCodegen {
                     message: "`use` and `assert` are not supported in native main yet".into(),
                 });
             }
@@ -170,7 +170,7 @@ fn lower_expression(
         TypedExpr::Int { int_value, .. } => {
             let value = int_value
                 .to_i64()
-                .ok_or_else(|| crate::Error::CraneliftCodegen {
+                .ok_or_else(|| crate::Error::NativeCodegen {
                     message: "integer literal out of range for 64-bit backend".into(),
                 })?;
             let encoded = encode_small_int(value)?;
@@ -180,7 +180,7 @@ fn lower_expression(
         TypedExpr::String { value, .. } => {
             let data_ptr = ctx.string_constant(module, value.as_str())?;
             let len = i64::try_from(value.as_str().len()).map_err(|_| {
-                crate::Error::CraneliftCodegen {
+                crate::Error::NativeCodegen {
                     message: "string literal too long".into(),
                 }
             })?;
@@ -195,7 +195,7 @@ fn lower_expression(
         TypedExpr::Var { name, .. } => {
             ctx.lookup(name)
                 .copied()
-                .ok_or_else(|| crate::Error::CraneliftCodegen {
+                .ok_or_else(|| crate::Error::NativeCodegen {
                     message: format!("unknown variable `{name}` in native main"),
                 })
         }
@@ -239,7 +239,7 @@ fn lower_expression(
             subjects, clauses, ..
         } => lower_case(module, subjects, clauses, ctx),
 
-        _ => Err(crate::Error::CraneliftCodegen {
+        _ => Err(crate::Error::NativeCodegen {
             message: format!("unsupported expression in main function: {expression:?}"),
         }),
     }
@@ -251,7 +251,7 @@ fn lower_assignment(
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<()> {
     if assignment.kind.is_assert() {
-        return Err(crate::Error::CraneliftCodegen {
+        return Err(crate::Error::NativeCodegen {
             message: "`let assert` is not yet supported in native main".into(),
         });
     }
@@ -264,7 +264,7 @@ fn lower_assignment(
             Ok(())
         }
         Pattern::Discard { .. } => Ok(()),
-        _ => Err(crate::Error::CraneliftCodegen {
+        _ => Err(crate::Error::NativeCodegen {
             message: "only simple variable patterns are supported in native main".into(),
         }),
     }
@@ -341,7 +341,7 @@ fn lower_call(
         }
     }
 
-    Err(crate::Error::CraneliftCodegen {
+    Err(crate::Error::NativeCodegen {
         message: format!("unsupported call in native main: {fun:?}"),
     })
 }
@@ -398,7 +398,7 @@ fn lower_case(
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<Value> {
     if subjects.len() != 1 || clauses.len() != 1 {
-        return Err(crate::Error::CraneliftCodegen {
+        return Err(crate::Error::NativeCodegen {
             message:
                 "case expressions in native main currently support only a single subject and clause"
                     .into(),
@@ -412,7 +412,7 @@ fn lower_case(
 
     let clause = &clauses[0];
     if clause.pattern.len() != 1 {
-        return Err(crate::Error::CraneliftCodegen {
+        return Err(crate::Error::NativeCodegen {
             message: "case clause must have a single pattern".into(),
         });
     }
@@ -420,7 +420,7 @@ fn lower_case(
     let result = match &clause.pattern[0] {
         Pattern::Discard { .. } => {
             if clause.guard.is_some() {
-                return Err(crate::Error::CraneliftCodegen {
+                return Err(crate::Error::NativeCodegen {
                     message: "case clause guards are not yet supported in native main".into(),
                 });
             }
@@ -428,14 +428,14 @@ fn lower_case(
         }
         Pattern::Variable { name, .. } => {
             if clause.guard.is_some() {
-                return Err(crate::Error::CraneliftCodegen {
+                return Err(crate::Error::NativeCodegen {
                     message: "case clause guards are not yet supported in native main".into(),
                 });
             }
             ctx.define(name, subject_value);
             lower_expression(module, &clause.then, ctx)
         }
-        _ => Err(crate::Error::CraneliftCodegen {
+        _ => Err(crate::Error::NativeCodegen {
             message: "case patterns other than `_` are not yet supported in native main".into(),
         }),
     }?;
@@ -517,12 +517,12 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
             let name = format!("gleam$str_{}", self.string_data.len());
             let id = module
                 .declare_data(&name, Linkage::Local, false, false)
-                .map_err(|err| crate::Error::CraneliftCodegen {
+                .map_err(|err| crate::Error::NativeCodegen {
                     message: err.to_string(),
                 })?;
             module
                 .define_data(id, &description)
-                .map_err(|err| crate::Error::CraneliftCodegen {
+                .map_err(|err| crate::Error::NativeCodegen {
                     message: err.to_string(),
                 })?;
             let _ = self.string_data.insert(key.clone(), id);
@@ -543,7 +543,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("gleam_list_nil", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_nil = Some(id);
@@ -562,7 +562,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("gleam_alloc_tuple", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_alloc_tuple = Some(id);
@@ -581,7 +581,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("gleam_binary_from_slice", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_binary_from_slice = Some(id);
@@ -599,7 +599,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("io_print", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_print = Some(id);
@@ -617,7 +617,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("io_println", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_println = Some(id);
@@ -635,7 +635,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("io_print_error", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_print_error = Some(id);
@@ -653,7 +653,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("io_println_error", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_println_error = Some(id);
@@ -670,7 +670,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("gleeunit_main", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_gleeunit_main = Some(id);
@@ -687,7 +687,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
         let id = module
             .declare_function("gleeunit_do_main", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
+            .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
         self.runtime_gleeunit_do_main = Some(id);
@@ -704,7 +704,7 @@ fn encode_small_int(value: i64) -> Result<i64, crate::Error> {
     const MAX_I63: i64 = (1i64 << 61) - 1;
 
     if value < MIN_I63 || value > MAX_I63 {
-        return Err(crate::Error::CraneliftCodegen {
+        return Err(crate::Error::NativeCodegen {
             message: format!("integer literal out of range for Gleam immediate: {value}"),
         });
     }
@@ -720,21 +720,21 @@ pub fn emit_object(
     output_path: &Utf8Path,
 ) -> Result<()> {
     let isa_builder =
-        cranelift_native::builder().map_err(|err| crate::Error::CraneliftCodegen {
+        cranelift_native::builder().map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
     let mut flag_builder = settings::builder();
     flag_builder
         .set("is_pic", "true")
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
     let flags = settings::Flags::new(flag_builder);
 
     let isa = isa_builder
         .finish(flags)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
@@ -743,7 +743,7 @@ pub fn emit_object(
         format!("gleam_{}", config.module.name.replace("/", "_")),
         cranelift_module::default_libcall_names(),
     )
-    .map_err(|err| crate::Error::CraneliftCodegen {
+    .map_err(|err| crate::Error::NativeCodegen {
         message: err.to_string(),
     })?;
 
@@ -757,7 +757,7 @@ pub fn emit_object(
     let product = module.finish();
     let bytes = product
         .emit()
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
@@ -781,7 +781,7 @@ fn build_entrypoint(module: &mut ObjectModule, main_func: FuncId) -> Result<()> 
     let init_signature = module.make_signature();
     let runtime_init = module
         .declare_function("gleam_runtime_init", Linkage::Import, &init_signature)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
     let runtime_init_ref = module.declare_func_in_func(runtime_init, &mut builder.func);
@@ -796,13 +796,13 @@ fn build_entrypoint(module: &mut ObjectModule, main_func: FuncId) -> Result<()> 
 
     let func_id = module
         .declare_function("main", Linkage::Export, &ctx.func.signature)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
     module
         .define_function(func_id, &mut ctx)
-        .map_err(|err| crate::Error::CraneliftCodegen {
+        .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
 
