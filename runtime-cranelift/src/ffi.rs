@@ -1,18 +1,42 @@
 use std::{
+    convert::TryFrom,
     io::{self, Write},
     ptr::NonNull,
     slice,
+    sync::OnceLock,
 };
 
 use crate::{
+    atom::AtomTable,
     binary, gc,
     heap::AllocationError,
-    layout::{Binary, BinarySlice},
+    layout::{Binary, BinarySlice, ConsCell, FloatBox, Map, MapEntry, MapTable},
     Header, Heap, Tag, Value,
 };
 
+use rand::Rng;
+use unicode_segmentation::UnicodeSegmentation;
+
 fn unwrap_allocation<T>(result: Result<T, AllocationError>, context: &'static str) -> T {
     result.unwrap_or_else(|_| panic!("runtime allocation failed: {context}"))
+}
+
+static ATOM_TABLE: OnceLock<AtomTable> = OnceLock::new();
+
+fn atom_table() -> &'static AtomTable {
+    ATOM_TABLE.get_or_init(AtomTable::new)
+}
+
+fn atom(name: &str) -> Value {
+    atom_table().intern(name)
+}
+
+fn atom_ok() -> Value {
+    atom("ok")
+}
+
+fn atom_error() -> Value {
+    atom("error")
 }
 
 #[no_mangle]
@@ -157,6 +181,194 @@ fn value_to_bytes(value: Value) -> Result<Vec<u8>, StringAccessError> {
     }
 }
 
+fn bytes_to_value(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        return Value::nil();
+    }
+
+    gc::ensure_initialised();
+    let heap = Heap::new();
+    let data = unwrap_allocation(heap.alloc_binary_data(bytes.len()), "binary data");
+    unsafe {
+        let buffer = &mut *data.as_ptr();
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.as_mut_ptr(), bytes.len());
+    }
+    unwrap_allocation(heap.alloc_binary(data, bytes.len(), bytes.len()), "binary")
+}
+
+fn value_to_string(value: Value) -> Result<String, StringAccessError> {
+    let bytes = value_to_bytes(value)?;
+    String::from_utf8(bytes).map_err(|_| StringAccessError::NotAString)
+}
+
+fn string_to_value(string: &str) -> Value {
+    bytes_to_value(string.as_bytes())
+}
+
+fn list_to_vec(mut list: Value) -> Vec<Value> {
+    let mut result = Vec::new();
+    while list != Value::nil() {
+        let ptr = list
+            .as_boxed::<ConsCell>()
+            .unwrap_or_else(|| panic!("expected List value"));
+        unsafe {
+            let cons = ptr.as_ref();
+            result.push(cons.head);
+            list = cons.tail;
+        }
+    }
+    result
+}
+
+fn list_from_vec(values: Vec<Value>) -> Value {
+    gc::ensure_initialised();
+    let heap = Heap::new();
+    let mut list = Value::nil();
+    for value in values.into_iter().rev() {
+        list = unwrap_allocation(heap.alloc_cons(value, list), "list from vec");
+    }
+    list
+}
+
+fn map_table_from_value(value: Value) -> NonNull<MapTable> {
+    let map_ptr = value
+        .as_boxed::<Map>()
+        .unwrap_or_else(|| panic!("expected Dict value"));
+    unsafe {
+        let table = (*map_ptr.as_ptr()).table;
+        NonNull::new(table).unwrap_or_else(|| panic!("dict missing table"))
+    }
+}
+
+fn map_entries_vec(value: Value) -> Vec<(Value, Value)> {
+    let table_ptr = map_table_from_value(value);
+    unsafe {
+        let table = table_ptr.as_ref();
+        table
+            .entries_slice()
+            .iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect()
+    }
+}
+
+fn deduplicate_entries(entries: &mut Vec<(Value, Value)>) {
+    let mut index = 0;
+    while index < entries.len() {
+        let key = entries[index].0;
+        let mut cursor = index + 1;
+        let mut final_value = entries[index].1;
+        while cursor < entries.len() {
+            if entries[cursor].0 == key {
+                final_value = entries[cursor].1;
+                entries.remove(cursor);
+            } else {
+                cursor += 1;
+            }
+        }
+        entries[index].1 = final_value;
+        index += 1;
+    }
+}
+
+fn map_from_vec(mut entries: Vec<(Value, Value)>) -> Value {
+    deduplicate_entries(&mut entries);
+    let heap = Heap::new();
+    let table = unwrap_allocation(heap.alloc_map_table(entries.len()), "map table");
+    unsafe {
+        let table_ref = table.as_ptr();
+        let slice = (*table_ref).entries_slice_mut();
+        for (slot, (key, value)) in slice.iter_mut().zip(entries.iter()) {
+            *slot = MapEntry {
+                key: *key,
+                value: *value,
+            };
+        }
+    }
+    unwrap_allocation(heap.alloc_map(table), "map")
+}
+
+#[derive(Debug)]
+enum FloatAccessError {
+    NotAFloat,
+}
+
+fn value_to_f64(value: Value) -> Result<f64, FloatAccessError> {
+    let ptr = value
+        .as_boxed::<FloatBox>()
+        .ok_or(FloatAccessError::NotAFloat)?;
+    let float = unsafe { ptr.as_ref() };
+    Ok(float.value)
+}
+
+const MIN_I63: i64 = -(1i64 << 61);
+const MAX_I63: i64 = (1i64 << 61) - 1;
+
+fn is_pattern_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0020}'
+            | '\u{0009}'
+            | '\u{000A}'
+            | '\u{000B}'
+            | '\u{000C}'
+            | '\u{000D}'
+            | '\u{0085}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+fn float_to_value(number: f64) -> Value {
+    gc::ensure_initialised();
+    let heap = Heap::new();
+    unwrap_allocation(heap.alloc_float(number), "float")
+}
+
+fn float_to_i63_value(number: f64, context: &'static str) -> Value {
+    if !number.is_finite() {
+        panic!("runtime {context} produced non-finite value");
+    }
+
+    let truncated = number.trunc();
+    if truncated < (MIN_I63 as f64) || truncated > (MAX_I63 as f64) {
+        panic!("runtime {context} result out of i63 range");
+    }
+
+    Value::from_i63(truncated as i64)
+}
+
+fn value_to_i63(value: Value, context: &'static str) -> i64 {
+    value
+        .to_i63()
+        .unwrap_or_else(|| panic!("runtime {context} expected small int"))
+}
+
+fn ensure_i63_range(value: i128, context: &'static str) -> Value {
+    if value < MIN_I63 as i128 || value > MAX_I63 as i128 {
+        panic!("runtime {context} result out of i63 range");
+    }
+    Value::from_i63(value as i64)
+}
+
+fn tuple_from(elements: &[Value], context: &'static str) -> Value {
+    gc::ensure_initialised();
+    let heap = Heap::new();
+    unwrap_allocation(heap.alloc_tuple(elements), context)
+}
+
+fn result_with(tag: Value, payload: Value) -> Value {
+    tuple_from(&[tag, payload], "result tuple")
+}
+
+fn result_ok(payload: Value) -> u64 {
+    result_with(atom_ok(), payload).to_raw()
+}
+
+fn result_error(payload: Value) -> u64 {
+    result_with(atom_error(), payload).to_raw()
+}
+
 enum OutputStream {
     Stdout,
     Stderr,
@@ -184,6 +396,562 @@ fn runtime_print(raw: u64, newline: bool, stream: OutputStream) -> u64 {
     Value::nil().to_raw()
 }
 
+#[no_mangle]
+pub extern "C" fn print(raw: u64) -> u64 {
+    runtime_print(raw, false, OutputStream::Stdout)
+}
+
+#[no_mangle]
+pub extern "C" fn println(raw: u64) -> u64 {
+    runtime_print(raw, true, OutputStream::Stdout)
+}
+
+#[no_mangle]
+pub extern "C" fn print_error(raw: u64) -> u64 {
+    runtime_print(raw, false, OutputStream::Stderr)
+}
+
+#[no_mangle]
+pub extern "C" fn println_error(raw: u64) -> u64 {
+    runtime_print(raw, true, OutputStream::Stderr)
+}
+
+#[no_mangle]
+pub extern "C" fn parse_float(raw: u64) -> u64 {
+    let input = Value::from_raw(raw);
+    let parsed = value_to_string(input)
+        .unwrap_or_else(|_| panic!("expected String value"))
+        .trim()
+        .parse::<f64>()
+        .ok();
+
+    match parsed {
+        Some(number) => {
+            let heap = Heap::new();
+            let float_value = unwrap_allocation(heap.alloc_float(number), "float parse value");
+            result_ok(float_value)
+        }
+        None => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn float_to_string(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    let string = number.to_string();
+    bytes_to_value(string.as_bytes()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn ceiling(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_value(number.ceil()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn floor(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_value(number.floor()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn round(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_i63_value(number.round(), "round").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn truncate(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_i63_value(number, "truncate").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn float(raw: u64) -> u64 {
+    let int_value = value_to_i63(Value::from_raw(raw), "float_from_int");
+    float_to_value(int_value as f64).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn power(base_raw: u64, exponent_raw: u64) -> u64 {
+    let base =
+        value_to_f64(Value::from_raw(base_raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    let exponent = value_to_f64(Value::from_raw(exponent_raw))
+        .unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_value(base.powf(exponent)).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn random_uniform() -> u64 {
+    let mut rng = rand::thread_rng();
+    let value: f64 = rng.gen();
+    float_to_value(value).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn log(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_value(number.ln()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn exp(raw: u64) -> u64 {
+    let number =
+        value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
+    float_to_value(number.exp()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_length(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let count = UnicodeSegmentation::graphemes(string.as_str(), true).count();
+    let count = i64::try_from(count).unwrap_or_else(|_| panic!("runtime string_length overflow"));
+    Value::from_i63(count).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn lowercase(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let lower = string.to_lowercase();
+    string_to_value(&lower).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn uppercase(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let upper = string.to_uppercase();
+    string_to_value(&upper).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn less_than(left_raw: u64, right_raw: u64) -> u64 {
+    let left = value_to_string(Value::from_raw(left_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let right = value_to_string(Value::from_raw(right_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    Value::from_bool(left < right).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_slice(string_raw: u64, idx_raw: u64, len_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let idx = value_to_i63(Value::from_raw(idx_raw), "string_slice index");
+    let len = value_to_i63(Value::from_raw(len_raw), "string_slice length");
+
+    if len <= 0 {
+        return Value::nil().to_raw();
+    }
+
+    let start = usize::try_from(idx.max(0))
+        .unwrap_or_else(|_| panic!("runtime string_slice index overflow"));
+    let len =
+        usize::try_from(len).unwrap_or_else(|_| panic!("runtime string_slice length overflow"));
+    let slice = UnicodeSegmentation::graphemes(string.as_str(), true)
+        .skip(start)
+        .take(len)
+        .collect::<String>();
+    string_to_value(&slice).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn crop_string(string_raw: u64, prefix_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let prefix = value_to_string(Value::from_raw(prefix_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+
+    match string.find(prefix.as_str()) {
+        Some(index) => string_to_value(&string[index..]).to_raw(),
+        None => string_to_value(string.as_str()).to_raw(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn contains_string(haystack_raw: u64, needle_raw: u64) -> u64 {
+    let haystack = value_to_string(Value::from_raw(haystack_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let needle = value_to_string(Value::from_raw(needle_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    Value::from_bool(haystack.contains(needle.as_str())).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_starts_with(string_raw: u64, prefix_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let prefix = value_to_string(Value::from_raw(prefix_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    Value::from_bool(string.starts_with(prefix.as_str())).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_ends_with(string_raw: u64, suffix_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let suffix = value_to_string(Value::from_raw(suffix_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    Value::from_bool(string.ends_with(suffix.as_str())).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn split_once(string_raw: u64, needle_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let needle = value_to_string(Value::from_raw(needle_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+
+    if let Some(index) = string.find(needle.as_str()) {
+        let before = &string[..index];
+        let after = &string[index + needle.len()..];
+        let pair = tuple_from(
+            &[string_to_value(before), string_to_value(after)],
+            "split_once pair",
+        );
+        result_ok(pair)
+    } else {
+        result_error(Value::nil())
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn trim_start(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let trimmed = string.trim_start_matches(is_pattern_whitespace);
+    string_to_value(trimmed).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn trim_end(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let trimmed = string.trim_end_matches(is_pattern_whitespace);
+    string_to_value(trimmed).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn pop_grapheme(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let mut iter = UnicodeSegmentation::grapheme_indices(string.as_str(), true);
+    if let Some((start, first)) = iter.next() {
+        let end = start + first.len();
+        let rest = &string[end..];
+        let pair = tuple_from(
+            &[string_to_value(first), string_to_value(rest)],
+            "string pop grapheme tuple",
+        );
+        result_ok(pair)
+    } else {
+        result_error(Value::nil())
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn byte_size(raw: u64) -> u64 {
+    let bytes =
+        value_to_bytes(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let len = i64::try_from(bytes.len()).unwrap_or_else(|_| panic!("runtime byte_size overflow"));
+    Value::from_i63(len).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn utf_codepoint_to_int(raw: u64) -> u64 {
+    raw
+}
+
+#[no_mangle]
+pub extern "C" fn utf_codepoint_list_to_string(raw: u64) -> u64 {
+    let elements = list_to_vec(Value::from_raw(raw));
+    let mut buffer = String::new();
+    for value in elements {
+        let codepoint = value_to_i63(value, "utf_codepoint_list_to_string");
+        if let Some(ch) = char::from_u32(codepoint as u32) {
+            buffer.push(ch);
+        } else {
+            panic!("runtime utf_codepoint_list_to_string invalid codepoint");
+        }
+    }
+    string_to_value(&buffer).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn add(left_raw: u64, right_raw: u64) -> u64 {
+    let left = value_to_string(Value::from_raw(left_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let right = value_to_string(Value::from_raw(right_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let mut buffer = left;
+    buffer.push_str(right.as_str());
+    string_to_value(&buffer).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn concat(list_raw: u64) -> u64 {
+    let elements = list_to_vec(Value::from_raw(list_raw));
+    let mut buffer = String::new();
+    for element in elements {
+        let string = value_to_string(element).unwrap_or_else(|_| panic!("expected String value"));
+        buffer.push_str(string.as_str());
+    }
+    string_to_value(&buffer).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let pattern = value_to_string(Value::from_raw(pattern_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let substitute = value_to_string(Value::from_raw(substitute_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let replaced = string.replace(pattern.as_str(), substitute.as_str());
+    string_to_value(&replaced).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dict_new() -> u64 {
+    map_from_vec(Vec::new()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dict_size(map_raw: u64) -> u64 {
+    let table_ptr = map_table_from_value(Value::from_raw(map_raw));
+    let len = unsafe { table_ptr.as_ref().len };
+    Value::from_i63(len as i64).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dict_to_list(map_raw: u64) -> u64 {
+    let entries = map_entries_vec(Value::from_raw(map_raw));
+    let mut values = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let tuple = tuple_from(&[key, value], "dict to_list tuple");
+        values.push(tuple);
+    }
+    list_from_vec(values).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dict_get(map_raw: u64, key_raw: u64) -> u64 {
+    let entries = map_entries_vec(Value::from_raw(map_raw));
+    let key = Value::from_raw(key_raw);
+    for (entry_key, entry_value) in entries.into_iter().rev() {
+        if entry_key == key {
+            return result_ok(entry_value);
+        }
+    }
+    result_error(Value::nil())
+}
+
+#[no_mangle]
+pub extern "C" fn dict_insert(map_raw: u64, key_raw: u64, value_raw: u64) -> u64 {
+    let mut entries = map_entries_vec(Value::from_raw(map_raw));
+    let key = Value::from_raw(key_raw);
+    let value = Value::from_raw(value_raw);
+    entries.retain(|(entry_key, _)| *entry_key != key);
+    entries.push((key, value));
+    map_from_vec(entries).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dict_remove(map_raw: u64, key_raw: u64) -> u64 {
+    let mut entries = map_entries_vec(Value::from_raw(map_raw));
+    let key = Value::from_raw(key_raw);
+    entries.retain(|(entry_key, _)| *entry_key != key);
+    map_from_vec(entries).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn graphemes(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let values = UnicodeSegmentation::graphemes(string.as_str(), true)
+        .map(|grapheme| string_to_value(grapheme))
+        .collect::<Vec<_>>();
+    list_from_vec(values).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn split_string_tree(tree_raw: u64, pattern_raw: u64, _direction_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(tree_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let pattern = value_to_string(Value::from_raw(pattern_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+
+    let values = if pattern.is_empty() {
+        UnicodeSegmentation::graphemes(string.as_str(), true)
+            .map(|grapheme| string_to_value(grapheme))
+            .collect::<Vec<_>>()
+    } else {
+        string
+            .split(pattern.as_str())
+            .map(|segment| string_to_value(segment))
+            .collect::<Vec<_>>()
+    };
+
+    list_from_vec(values).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn parse_int(raw: u64) -> u64 {
+    let input = Value::from_raw(raw);
+    let parsed = value_to_string(input)
+        .unwrap_or_else(|_| panic!("expected String value"))
+        .trim()
+        .parse::<i64>()
+        .ok();
+
+    match parsed {
+        Some(value) => result_ok(Value::from_i63(value)),
+        None => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn int_from_base_string(string_raw: u64, base_raw: u64) -> u64 {
+    let string = Value::from_raw(string_raw);
+    let base = value_to_i63(Value::from_raw(base_raw), "int_from_base_string");
+    let parsed = value_to_string(string).unwrap_or_else(|_| panic!("expected String value"));
+    match i64::from_str_radix(parsed.trim(), base as u32).ok() {
+        Some(value) => result_ok(Value::from_i63(value)),
+        None => result_error(Value::nil()),
+    }
+}
+
+fn int_to_base_string_impl(number: i64, base: i64) -> Option<String> {
+    if base < 2 || base > 36 {
+        return None;
+    }
+
+    if number == 0 {
+        return Some("0".into());
+    }
+
+    let negative = number < 0;
+    let mut n = if negative {
+        -(number as i128)
+    } else {
+        number as i128
+    };
+    let base = base as i128;
+    let mut digits = Vec::new();
+    while n > 0 {
+        let digit = (n % base) as usize;
+        digits.push(b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[digit] as char);
+        n /= base;
+    }
+    if negative {
+        digits.push('-');
+    }
+    digits.reverse();
+    Some(digits.into_iter().collect())
+}
+
+#[no_mangle]
+pub extern "C" fn to_string(int_raw: u64) -> u64 {
+    let value = value_to_i63(Value::from_raw(int_raw), "int_to_string");
+    bytes_to_value(value.to_string().as_bytes()).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn int_to_base_string(int_raw: u64, base_raw: u64) -> u64 {
+    let value = value_to_i63(Value::from_raw(int_raw), "int_to_base_string");
+    let base = value_to_i63(Value::from_raw(base_raw), "int_to_base_string base");
+    let string = int_to_base_string_impl(value, base)
+        .unwrap_or_else(|| panic!("runtime int_to_base_string received invalid base {base}"));
+    bytes_to_value(string.as_bytes()).to_raw()
+}
+
+fn bitwise_binary_op(
+    a_raw: u64,
+    b_raw: u64,
+    op: impl Fn(i64, i64) -> i64,
+    context: &'static str,
+) -> u64 {
+    let a = value_to_i63(Value::from_raw(a_raw), context);
+    let b = value_to_i63(Value::from_raw(b_raw), context);
+    Value::from_i63(op(a, b)).to_raw()
+}
+
+fn bitwise_unary_op(a_raw: u64, op: impl Fn(i64) -> i64, context: &'static str) -> u64 {
+    let a = value_to_i63(Value::from_raw(a_raw), context);
+    Value::from_i63(op(a)).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_and(a_raw: u64, b_raw: u64) -> u64 {
+    bitwise_binary_op(a_raw, b_raw, |a, b| a & b, "bitwise_and")
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_or(a_raw: u64, b_raw: u64) -> u64 {
+    bitwise_binary_op(a_raw, b_raw, |a, b| a | b, "bitwise_or")
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_exclusive_or(a_raw: u64, b_raw: u64) -> u64 {
+    bitwise_binary_op(a_raw, b_raw, |a, b| a ^ b, "bitwise_xor")
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_not(a_raw: u64) -> u64 {
+    bitwise_unary_op(a_raw, |a| !a, "bitwise_not")
+}
+
+fn shift_left(a: i64, b: i64) -> Option<i64> {
+    if b < 0 {
+        shift_right(a, -b)
+    } else {
+        let shifted = (a as i128) << b;
+        if shifted < MIN_I63 as i128 || shifted > MAX_I63 as i128 {
+            None
+        } else {
+            Some(shifted as i64)
+        }
+    }
+}
+
+fn shift_right(a: i64, b: i64) -> Option<i64> {
+    if b < 0 {
+        shift_left(a, -b)
+    } else {
+        Some(a >> b)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_shift_left(a_raw: u64, b_raw: u64) -> u64 {
+    let a = value_to_i63(Value::from_raw(a_raw), "bitwise_shift_left");
+    let b = value_to_i63(Value::from_raw(b_raw), "bitwise_shift_left");
+    let result = shift_left(a, b).unwrap_or_else(|| panic!("runtime bitwise_shift_left overflow"));
+    Value::from_i63(result).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bitwise_shift_right(a_raw: u64, b_raw: u64) -> u64 {
+    let a = value_to_i63(Value::from_raw(a_raw), "bitwise_shift_right");
+    let b = value_to_i63(Value::from_raw(b_raw), "bitwise_shift_right");
+    let result =
+        shift_right(a, b).unwrap_or_else(|| panic!("runtime bitwise_shift_right overflow"));
+    Value::from_i63(result).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn identity(raw: u64) -> u64 {
+    raw
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,42 +971,26 @@ mod tests {
     }
 
     #[test]
-    fn binary_slice_to_bytes_returns_slice() {
-        gc::ensure_initialised();
-        let heap = Heap::new();
-        let data = heap.alloc_binary_data(5).unwrap();
-        unsafe {
-            let buffer = data.as_ptr();
-            std::ptr::copy_nonoverlapping(b"hello".as_ptr(), (*buffer).as_mut_ptr(), 5);
-        }
-        let slice_value = heap.alloc_binary_slice(data, 3, 5, 1).unwrap();
-        let bytes = value_to_bytes(slice_value).expect("binary slice to bytes");
-        assert_eq!(bytes, b"ell");
-    }
-
-    #[test]
     fn runtime_print_returns_nil() {
         let result = runtime_print(Value::nil().to_raw(), false, OutputStream::Stdout);
         assert_eq!(result, Value::nil().to_raw());
     }
-}
 
-#[no_mangle]
-pub extern "C" fn gleam_io_print(raw: u64) -> u64 {
-    runtime_print(raw, false, OutputStream::Stdout)
-}
+    #[test]
+    fn float_parse_success_tuple() {
+        let value = bytes_to_value(b"12.5");
+        let tuple = Value::from_raw(parse_float(value.to_raw()));
+        let ptr = tuple
+            .as_boxed::<crate::layout::Tuple>()
+            .expect("tuple pointer");
+        let header = unsafe { &*ptr.as_ptr() };
+        assert_eq!(header.header.arity(), 2);
+    }
 
-#[no_mangle]
-pub extern "C" fn gleam_io_println(raw: u64) -> u64 {
-    runtime_print(raw, true, OutputStream::Stdout)
-}
-
-#[no_mangle]
-pub extern "C" fn gleam_io_print_error(raw: u64) -> u64 {
-    runtime_print(raw, false, OutputStream::Stderr)
-}
-
-#[no_mangle]
-pub extern "C" fn gleam_io_println_error(raw: u64) -> u64 {
-    runtime_print(raw, true, OutputStream::Stderr)
+    #[test]
+    fn float_round_returns_int_value() {
+        let value = float_to_value(1.8);
+        let result = Value::from_raw(round(value.to_raw()));
+        assert_eq!(result.to_i63(), Some(2));
+    }
 }

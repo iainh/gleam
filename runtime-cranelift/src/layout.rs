@@ -151,8 +151,43 @@ impl Map {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MapEntry {
+    pub key: Value,
+    pub value: Value,
+}
+
+#[repr(C)]
 #[derive(Debug)]
-pub struct MapTable;
+pub struct MapTable {
+    pub len: usize,
+    pub entries: [MapEntry; 0],
+}
+
+impl MapTable {
+    pub fn layout_for(len: usize) -> Result<Layout, LayoutError> {
+        let (layout, _) = Layout::new::<MapTable>().extend(Layout::array::<MapEntry>(len)?)?;
+        Ok(layout)
+    }
+
+    pub unsafe fn entries_ptr(&self) -> *const MapEntry {
+        self.entries.as_ptr()
+    }
+
+    pub unsafe fn entries_mut_ptr(&mut self) -> *mut MapEntry {
+        self.entries.as_mut_ptr()
+    }
+
+    pub unsafe fn entries_slice(&self) -> &[MapEntry] {
+        let ptr = unsafe { self.entries_ptr() };
+        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    }
+
+    pub unsafe fn entries_slice_mut(&mut self) -> &mut [MapEntry] {
+        let ptr = unsafe { self.entries_mut_ptr() };
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug)]

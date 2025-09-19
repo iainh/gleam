@@ -162,6 +162,23 @@ impl Heap {
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }
 
+    pub fn alloc_map_table(&self, len: usize) -> Result<NonNull<MapTable>, AllocationError> {
+        gc::ensure_initialised();
+        let layout = MapTable::layout_for(len).map_err(AllocationError::from)?;
+        let ptr = unsafe { gc::malloc(layout.size()) } as *mut u8;
+        let ptr = NonNull::new(ptr).ok_or(AllocationError::OutOfMemory)?;
+        unsafe {
+            let table = ptr.cast::<MapTable>().as_ptr();
+            core::ptr::addr_of_mut!((*table).len).write(len);
+            let entries = (*table).entries_slice_mut();
+            for entry in entries {
+                core::ptr::addr_of_mut!(entry.key).write(Value::nil());
+                core::ptr::addr_of_mut!(entry.value).write(Value::nil());
+            }
+        }
+        Ok(ptr.cast())
+    }
+
     pub fn alloc_map(&self, table: NonNull<MapTable>) -> Result<Value, AllocationError> {
         let ptr = self.allocate_box(Map::HEADER)?;
         unsafe {
