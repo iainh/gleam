@@ -1,5 +1,6 @@
 use std::{
     convert::TryFrom,
+    fs,
     io::{self, Write},
     mem,
     ptr::NonNull,
@@ -23,6 +24,10 @@ use base64::Engine;
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
+
+const HEX_DIGITS: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
+];
 
 fn unwrap_allocation<T>(result: Result<T, AllocationError>, context: &'static str) -> T {
     result.unwrap_or_else(|_| panic!("runtime allocation failed: {context}"))
@@ -603,6 +608,205 @@ fn result_ok(payload: Value) -> u64 {
 
 fn result_error(payload: Value) -> u64 {
     result_with(atom_error(), payload).to_raw()
+}
+
+fn is_percent_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'$' | b'\'' | b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'_' | b'~'
+        )
+}
+
+fn percent_encode_string(input: &str) -> String {
+    let mut buffer = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if is_percent_unreserved(byte) {
+            buffer.push(byte as char);
+        } else {
+            buffer.push('%');
+            buffer.push(HEX_DIGITS[(byte >> 4) as usize]);
+            buffer.push(HEX_DIGITS[(byte & 0x0F) as usize]);
+        }
+    }
+    buffer
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_string(input: &str, plus_to_space: bool) -> Result<String, ()> {
+    let mut bytes = Vec::with_capacity(input.len());
+    let input_bytes = input.as_bytes();
+    let mut index = 0;
+    while index < input_bytes.len() {
+        let byte = input_bytes[index];
+        if byte == b'%' {
+            if index + 2 >= input_bytes.len() {
+                return Err(());
+            }
+            let hi = hex_value(input_bytes[index + 1]).ok_or(())?;
+            let lo = hex_value(input_bytes[index + 2]).ok_or(())?;
+            bytes.push((hi << 4) | lo);
+            index += 3;
+        } else {
+            if plus_to_space && byte == b'+' {
+                bytes.push(b' ');
+            } else {
+                bytes.push(byte);
+            }
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| ())
+}
+
+fn value_to_text(value: Value) -> Option<String> {
+    if let Ok(text) = value_to_string(value) {
+        Some(text)
+    } else if let Some(index) = value.atom_index() {
+        atom_table()
+            .resolve(index)
+            .map(|atom| atom.as_ref().to_string())
+    } else {
+        None
+    }
+}
+
+fn map_get_field(entries: &[(Value, Value)], name: &str) -> Option<Value> {
+    let atom_key = atom(name);
+    for (key, value) in entries {
+        if *key == atom_key {
+            return Some(*value);
+        }
+        if let Ok(text) = value_to_string(*key) {
+            if text == name {
+                return Some(*value);
+            }
+        } else if let Some(index) = key.atom_index() {
+            if let Some(atom_name) = atom_table().resolve(index) {
+                if atom_name.as_ref() == name {
+                    return Some(*value);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn map_get_text(entries: &[(Value, Value)], name: &str) -> Result<String, ()> {
+    let value = map_get_field(entries, name).ok_or(())?;
+    value_to_text(value).ok_or(())
+}
+
+fn map_get_int(entries: &[(Value, Value)], name: &str) -> Result<i64, ()> {
+    let value = map_get_field(entries, name).ok_or(())?;
+    value.to_i63().ok_or(())
+}
+
+fn map_get_list(entries: &[(Value, Value)], name: &str) -> Result<Vec<Value>, ()> {
+    let value = map_get_field(entries, name).ok_or(())?;
+    if !is_list_value(value) {
+        return Err(());
+    }
+    Ok(list_to_vec(value))
+}
+
+fn build_expression(value: Value) -> Result<Value, ()> {
+    if !matches!(header_tag(value), Some(Tag::Map)) {
+        return Err(());
+    }
+    let entries = map_entries_vec(value);
+    let start = map_get_int(&entries, "start")?;
+    let end = map_get_int(&entries, "end")?;
+    let kind_name = map_get_text(&entries, "kind")?;
+    let kind_value = match kind_name.as_str() {
+        "literal" => {
+            let literal = map_get_field(&entries, "value").ok_or(())?;
+            tuple_from(&[atom("literal"), literal], "assert expression literal")
+        }
+        "expression" => {
+            let expr = map_get_field(&entries, "value").ok_or(())?;
+            tuple_from(&[atom("expression"), expr], "assert expression value")
+        }
+        "unevaluated" => atom("unevaluated"),
+        _ => return Err(()),
+    };
+    Ok(tuple_from(
+        &[
+            atom("asserted_expression"),
+            Value::from_i63(start),
+            Value::from_i63(end),
+            kind_value,
+        ],
+        "asserted expression",
+    ))
+}
+
+fn build_assert_kind(entries: &[(Value, Value)]) -> Result<Value, ()> {
+    let kind_name = map_get_text(entries, "kind")?;
+    match kind_name.as_str() {
+        "binary_operator" => {
+            let operator = map_get_text(entries, "operator")?;
+            let left = map_get_field(entries, "left").ok_or(())?;
+            let right = map_get_field(entries, "right").ok_or(())?;
+            let left_expr = build_expression(left)?;
+            let right_expr = build_expression(right)?;
+            Ok(tuple_from(
+                &[
+                    atom("binary_operator"),
+                    string_to_value(&operator),
+                    left_expr,
+                    right_expr,
+                ],
+                "assert binary operator",
+            ))
+        }
+        "function_call" => {
+            let arguments = map_get_list(entries, "arguments")?;
+            let mut expressions = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                expressions.push(build_expression(argument)?);
+            }
+            let list_value = list_from_vec(expressions);
+            Ok(tuple_from(
+                &[atom("function_call"), list_value],
+                "assert function call",
+            ))
+        }
+        _ => {
+            let expression_value = map_get_field(entries, "expression").ok_or(())?;
+            let expression = build_expression(expression_value)?;
+            Ok(tuple_from(
+                &[atom("other_expression"), expression],
+                "assert other expression",
+            ))
+        }
+    }
+}
+
+fn wrap_gleam_panic(entries: &[(Value, Value)], kind: Value) -> Result<Value, ()> {
+    let message = map_get_text(entries, "message")?;
+    let file = map_get_text(entries, "file")?;
+    let module = map_get_text(entries, "module")?;
+    let function_name = map_get_text(entries, "function")?;
+    let line = map_get_int(entries, "line")?;
+    let elements = [
+        atom("gleam_panic"),
+        string_to_value(&message),
+        string_to_value(&file),
+        string_to_value(&module),
+        string_to_value(&function_name),
+        Value::from_i63(line),
+        kind,
+    ];
+    Ok(tuple_from(&elements, "gleeunit panic"))
 }
 
 fn option_some(value: Value) -> Value {
@@ -1334,6 +1538,235 @@ pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_r
 }
 
 #[no_mangle]
+pub extern "C" fn string_pop_codeunit(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let mut bytes = string.into_bytes();
+    if bytes.is_empty() {
+        let tuple = tuple_from(
+            &[Value::from_i63(0), string_to_value("")],
+            "string pop codeunit tuple",
+        );
+        return tuple.to_raw();
+    }
+    let first = bytes[0];
+    let rest_bytes = bytes.split_off(1);
+    let rest = String::from_utf8(rest_bytes)
+        .unwrap_or_else(|_| panic!("runtime string_pop_codeunit produced invalid UTF-8"));
+    let tuple = tuple_from(
+        &[Value::from_i63(first as i64), string_to_value(&rest)],
+        "string pop codeunit tuple",
+    );
+    tuple.to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn string_codeunit_slice(string_raw: u64, from_raw: u64, length_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let len = string.len() as i64;
+    let from = value_to_i63(Value::from_raw(from_raw), "string codeunit slice from");
+    let length = value_to_i63(Value::from_raw(length_raw), "string codeunit slice length");
+
+    if length <= 0 {
+        return string_to_value("").to_raw();
+    }
+
+    let mut start = if from < 0 { len + from } else { from };
+    if start < 0 {
+        start = 0;
+    }
+    if start > len {
+        start = len;
+    }
+
+    let mut end = start.saturating_add(length);
+    if end > len {
+        end = len;
+    }
+
+    let start_usize = start as usize;
+    let end_usize = end as usize;
+    let slice = string.as_bytes()[start_usize..end_usize].to_vec();
+    let result = String::from_utf8(slice)
+        .unwrap_or_else(|_| panic!("runtime string_codeunit_slice produced invalid UTF-8"));
+    string_to_value(&result).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn percent_encode(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let encoded = percent_encode_string(&string);
+    string_to_value(&encoded).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn percent_decode(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    match percent_decode_string(&string, false) {
+        Ok(decoded) => result_ok(string_to_value(&decoded)),
+        Err(()) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn parse_query(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    let mut pairs = Vec::new();
+    for section in string.split('&') {
+        if section.is_empty() {
+            continue;
+        }
+        let mut parts = section.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let value = parts.next().unwrap_or("");
+        let decoded_key = match percent_decode_string(key, true) {
+            Ok(key) => key,
+            Err(()) => return result_error(Value::nil()),
+        };
+        let decoded_value = match percent_decode_string(value, true) {
+            Ok(value) => value,
+            Err(()) => return result_error(Value::nil()),
+        };
+        let tuple = tuple_from(
+            &[
+                string_to_value(&decoded_key),
+                string_to_value(&decoded_value),
+            ],
+            "parse_query pair",
+        );
+        pairs.push(tuple);
+    }
+    let list = list_from_vec(pairs);
+    result_ok(list)
+}
+
+#[no_mangle]
+pub extern "C" fn from_dynamic(raw: u64) -> u64 {
+    let value = Value::from_raw(raw);
+    if !matches!(header_tag(value), Some(Tag::Map)) {
+        return result_error(Value::nil());
+    }
+    let entries = map_entries_vec(value);
+    let gleam_error = match map_get_text(&entries, "gleam_error") {
+        Ok(kind) => kind,
+        Err(_) => return result_error(Value::nil()),
+    };
+
+    let kind_value = match gleam_error.as_str() {
+        "todo" => atom("todo"),
+        "panic" => atom("panic"),
+        "let_assert" => {
+            let start = match map_get_int(&entries, "start") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let end = match map_get_int(&entries, "end") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let pattern_start = match map_get_int(&entries, "pattern_start") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let pattern_end = match map_get_int(&entries, "pattern_end") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let value_field = match map_get_field(&entries, "value") {
+                Some(field) => field,
+                None => return result_error(Value::nil()),
+            };
+            tuple_from(
+                &[
+                    atom("let_assert"),
+                    Value::from_i63(start),
+                    Value::from_i63(end),
+                    Value::from_i63(pattern_start),
+                    Value::from_i63(pattern_end),
+                    value_field,
+                ],
+                "panic let_assert",
+            )
+        }
+        "assert" => {
+            let start = match map_get_int(&entries, "start") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let end = match map_get_int(&entries, "end") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let expression_start = match map_get_int(&entries, "expression_start") {
+                Ok(value) => value,
+                Err(_) => return result_error(Value::nil()),
+            };
+            let assert_kind = match build_assert_kind(&entries) {
+                Ok(kind) => kind,
+                Err(_) => return result_error(Value::nil()),
+            };
+            tuple_from(
+                &[
+                    atom("assert"),
+                    Value::from_i63(start),
+                    Value::from_i63(end),
+                    Value::from_i63(expression_start),
+                    assert_kind,
+                ],
+                "panic assert",
+            )
+        }
+        _ => return result_error(Value::nil()),
+    };
+
+    let panic_value = match wrap_gleam_panic(&entries, kind_value) {
+        Ok(value) => value,
+        Err(_) => return result_error(Value::nil()),
+    };
+    result_ok(panic_value)
+}
+
+#[no_mangle]
+pub extern "C" fn read_file(path_raw: u64) -> u64 {
+    let path = value_to_string(Value::from_raw(path_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let bit_array = bit_array_from_bytes(&bytes, bytes.len() * 8);
+            result_ok(bit_array)
+        }
+        Err(_) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn read_file_text(path_raw: u64) -> u64 {
+    let path = value_to_string(Value::from_raw(path_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    match fs::read_to_string(&path) {
+        Ok(contents) => result_ok(string_to_value(&contents)),
+        Err(_) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleeunit_main() -> u64 {
+    Value::nil().to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleeunit_do_main() -> u64 {
+    Value::nil().to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn dict_new() -> u64 {
     map_from_vec(Vec::new()).to_raw()
 }
@@ -1384,6 +1817,52 @@ pub extern "C" fn dict_remove(map_raw: u64, key_raw: u64) -> u64 {
     let key = Value::from_raw(key_raw);
     entries.retain(|(entry_key, _)| *entry_key != key);
     map_from_vec(entries).to_raw()
+}
+
+fn map_from_key_value_list(list_raw: u64, context: &str) -> Value {
+    let pairs = list_to_vec(Value::from_raw(list_raw));
+    let mut entries = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let elements = tuple_to_vec(pair);
+        if elements.len() != 2 {
+            panic!("runtime {context} expected key/value tuple");
+        }
+        let key = elements[0];
+        value_to_string(key).unwrap_or_else(|_| panic!("runtime {context} expected String key"));
+        let value = elements[1];
+        entries.push((key, value));
+    }
+    map_from_vec(entries)
+}
+
+#[no_mangle]
+pub extern "C" fn make_object(items_raw: u64) -> u64 {
+    map_from_key_value_list(items_raw, "make_object").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn make_map(items_raw: u64) -> u64 {
+    map_from_key_value_list(items_raw, "make_map").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn unsupported_zero_arity() -> u64 {
+    panic!("erlang-only helper invoked on Cranelift runtime")
+}
+
+#[no_mangle]
+pub extern "C" fn unsupported_one_arity(_arg0: u64) -> u64 {
+    panic!("erlang-only helper invoked on Cranelift runtime")
+}
+
+#[no_mangle]
+pub extern "C" fn unsupported_two_arity(_arg0: u64, _arg1: u64) -> u64 {
+    panic!("erlang-only helper invoked on Cranelift runtime")
+}
+
+#[no_mangle]
+pub extern "C" fn unsupported_three_arity(_arg0: u64, _arg1: u64, _arg2: u64) -> u64 {
+    panic!("erlang-only helper invoked on Cranelift runtime")
 }
 
 #[no_mangle]
