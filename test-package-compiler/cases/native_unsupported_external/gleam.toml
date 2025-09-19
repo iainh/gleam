@@ -1,4 +1,4 @@
-name = "cranelift_unsupported_external"
+name = "native_unsupported_external"
 version = "0.1.0"
 target = "native"
 
