@@ -22,7 +22,7 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use ecow::EcoString;
 use num_traits::ToPrimitive;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, convert::TryFrom, sync::Arc};
 use tracing::instrument;
 
 #[derive(Debug)]
@@ -165,6 +165,21 @@ fn lower_expression(
             Ok(ctx.builder.ins().iconst(ir::types::I64, encoded))
         }
 
+        TypedExpr::String { value, .. } => {
+            let data_ptr = ctx.string_constant(module, value.as_str())?;
+            let len = i64::try_from(value.as_str().len()).map_err(|_| {
+                crate::Error::CraneliftCodegen {
+                    message: "string literal too long".into(),
+                }
+            })?;
+            let len_value = ctx.builder.ins().iconst(ctx.pointer_type, len);
+            let func_id = ctx.declare_runtime_binary_from_slice(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[data_ptr, len_value]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
+        }
+
         TypedExpr::Var { name, .. } => {
             ctx.lookup(name)
                 .copied()
@@ -256,13 +271,42 @@ fn lower_call(
         if module_name == "gleeunit" && label == "do_main" && arguments.is_empty() {
             return skip_gleeunit_do_main(module, ctx);
         }
-        if module_name == "gleam/io" && label == "println" && arguments.len() == 1 {
-            lower_print_call(module, &arguments[0].value, ctx, true)?;
-            return Ok(ctx.builder.ins().iconst(ir::types::I64, 0));
-        }
-        if module_name == "gleam/io" && label == "print" && arguments.len() == 1 {
-            lower_print_call(module, &arguments[0].value, ctx, false)?;
-            return Ok(ctx.builder.ins().iconst(ir::types::I64, 0));
+        if module_name == "gleam/io" && arguments.len() == 1 {
+            let result = match label.as_str() {
+                "print" => Some(lower_print_call(
+                    module,
+                    &arguments[0].value,
+                    ctx,
+                    false,
+                    false,
+                )?),
+                "println" => Some(lower_print_call(
+                    module,
+                    &arguments[0].value,
+                    ctx,
+                    true,
+                    false,
+                )?),
+                "print_error" => Some(lower_print_call(
+                    module,
+                    &arguments[0].value,
+                    ctx,
+                    false,
+                    true,
+                )?),
+                "println_error" => Some(lower_print_call(
+                    module,
+                    &arguments[0].value,
+                    ctx,
+                    true,
+                    true,
+                )?),
+                _ => None,
+            };
+
+            if let Some(value) = result {
+                return Ok(value);
+            }
         }
     }
 
@@ -301,39 +345,21 @@ fn lower_print_call(
     argument: &TypedExpr,
     ctx: &mut LoweringContext<'_, '_>,
     newline: bool,
-) -> Result<()> {
-    let text = match argument {
-        TypedExpr::String { value, .. } => {
-            let mut s = value.as_str().to_string();
-            if newline && !s.ends_with('\n') {
-                s.push('\n');
-            }
-            s
-        }
-        TypedExpr::Int { int_value, .. } => {
-            let mut s = int_value
-                .to_i64()
-                .ok_or_else(|| crate::Error::CraneliftCodegen {
-                    message: "integer literal out of range for print".into(),
-                })?
-                .to_string();
-            if newline {
-                s.push('\n');
-            }
-            s
-        }
-        _ => {
-            return Err(crate::Error::CraneliftCodegen {
-                message: "println currently supports only string or integer literals".into(),
-            });
-        }
+    stderr: bool,
+) -> Result<Value> {
+    let value = lower_expression(module, argument, ctx)?;
+
+    let func_id = match (stderr, newline) {
+        (false, false) => ctx.declare_runtime_print(module)?,
+        (false, true) => ctx.declare_runtime_println(module)?,
+        (true, false) => ctx.declare_runtime_print_error(module)?,
+        (true, true) => ctx.declare_runtime_println_error(module)?,
     };
 
-    let pointer = ctx.string_constant(module, &text)?;
-    let puts = ctx.declare_puts(module)?;
-    let func_ref = module.declare_func_in_func(puts, &mut ctx.builder.func);
-    let _ = ctx.builder.ins().call(func_ref, &[pointer]);
-    Ok(())
+    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let call = ctx.builder.ins().call(func_ref, &[value]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
 }
 
 fn lower_case(
@@ -394,9 +420,13 @@ struct LoweringContext<'a, 'b> {
     pointer_type: ir::Type,
     scopes: Vec<HashMap<EcoString, Value>>,
     string_data: HashMap<EcoString, DataId>,
-    puts: Option<FuncId>,
     runtime_nil: Option<FuncId>,
     runtime_alloc_tuple: Option<FuncId>,
+    runtime_binary_from_slice: Option<FuncId>,
+    runtime_print: Option<FuncId>,
+    runtime_println: Option<FuncId>,
+    runtime_print_error: Option<FuncId>,
+    runtime_println_error: Option<FuncId>,
     pointer_bytes: u8,
 }
 
@@ -411,9 +441,13 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
             pointer_type,
             scopes: vec![HashMap::new()],
             string_data: HashMap::new(),
-            puts: None,
             runtime_nil: None,
             runtime_alloc_tuple: None,
+            runtime_binary_from_slice: None,
+            runtime_print: None,
+            runtime_println: None,
+            runtime_print_error: None,
+            runtime_println_error: None,
             pointer_bytes,
         }
     }
@@ -466,24 +500,6 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         Ok(self.builder.ins().global_value(self.pointer_type, gv))
     }
 
-    fn declare_puts(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
-        if let Some(id) = self.puts {
-            return Ok(id);
-        }
-
-        let mut signature = module.make_signature();
-        signature.params.push(ir::AbiParam::new(self.pointer_type));
-        signature.returns.push(ir::AbiParam::new(ir::types::I32));
-
-        let id = module
-            .declare_function("puts", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::CraneliftCodegen {
-                message: err.to_string(),
-            })?;
-        self.puts = Some(id);
-        Ok(id)
-    }
-
     fn declare_runtime_nil(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
         if let Some(id) = self.runtime_nil {
             return Ok(id);
@@ -517,6 +533,97 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
                 message: err.to_string(),
             })?;
         self.runtime_alloc_tuple = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_binary_from_slice(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_binary_from_slice {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleam_binary_from_slice", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_binary_from_slice = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_print(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_print {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_io_print", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_print = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_println(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_println {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_io_println", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_println = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_print_error(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_print_error {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_io_print_error", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_print_error = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_println_error(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_println_error {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_io_println_error", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_println_error = Some(id);
         Ok(id)
     }
 
