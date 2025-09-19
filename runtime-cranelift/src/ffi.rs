@@ -845,22 +845,22 @@ fn runtime_print(raw: u64, newline: bool, stream: OutputStream) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn print(raw: u64) -> u64 {
+pub extern "C" fn io_print(raw: u64) -> u64 {
     runtime_print(raw, false, OutputStream::Stdout)
 }
 
 #[no_mangle]
-pub extern "C" fn println(raw: u64) -> u64 {
+pub extern "C" fn io_println(raw: u64) -> u64 {
     runtime_print(raw, true, OutputStream::Stdout)
 }
 
 #[no_mangle]
-pub extern "C" fn print_error(raw: u64) -> u64 {
+pub extern "C" fn io_print_error(raw: u64) -> u64 {
     runtime_print(raw, false, OutputStream::Stderr)
 }
 
 #[no_mangle]
-pub extern "C" fn println_error(raw: u64) -> u64 {
+pub extern "C" fn io_println_error(raw: u64) -> u64 {
     runtime_print(raw, true, OutputStream::Stderr)
 }
 

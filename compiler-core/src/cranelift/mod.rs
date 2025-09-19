@@ -34,17 +34,29 @@ pub struct ModuleConfig<'a> {
 }
 
 impl<'a> ModuleConfig<'a> {
-    pub fn new(module: &'a GleamModule, project_root: &'a Utf8Path) -> Self {
+    pub fn with_entrypoint(
+        module: &'a GleamModule,
+        project_root: &'a Utf8Path,
+        has_entrypoint: bool,
+    ) -> Self {
         Self {
             line_numbers: LineNumbers::new(&module.code),
             module,
             project_root,
-            has_entrypoint: module_contains_public_main(&module.ast),
+            has_entrypoint,
         }
+    }
+
+    pub fn new(module: &'a GleamModule, project_root: &'a Utf8Path) -> Self {
+        Self::with_entrypoint(
+            module,
+            project_root,
+            module_contains_public_main(&module.ast),
+        )
     }
 }
 
-fn module_contains_public_main(module: &crate::ast::TypedModule) -> bool {
+pub(crate) fn module_contains_public_main(module: &crate::ast::TypedModule) -> bool {
     module
         .definitions
         .iter()
@@ -586,7 +598,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         signature.returns.push(ir::AbiParam::new(self.pointer_type));
 
         let id = module
-            .declare_function("gleam_io_print", Linkage::Import, &signature)
+            .declare_function("io_print", Linkage::Import, &signature)
             .map_err(|err| crate::Error::CraneliftCodegen {
                 message: err.to_string(),
             })?;
@@ -604,7 +616,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         signature.returns.push(ir::AbiParam::new(self.pointer_type));
 
         let id = module
-            .declare_function("gleam_io_println", Linkage::Import, &signature)
+            .declare_function("io_println", Linkage::Import, &signature)
             .map_err(|err| crate::Error::CraneliftCodegen {
                 message: err.to_string(),
             })?;
@@ -622,7 +634,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         signature.returns.push(ir::AbiParam::new(self.pointer_type));
 
         let id = module
-            .declare_function("gleam_io_print_error", Linkage::Import, &signature)
+            .declare_function("io_print_error", Linkage::Import, &signature)
             .map_err(|err| crate::Error::CraneliftCodegen {
                 message: err.to_string(),
             })?;
@@ -640,7 +652,7 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         signature.returns.push(ir::AbiParam::new(self.pointer_type));
 
         let id = module
-            .declare_function("gleam_io_println_error", Linkage::Import, &signature)
+            .declare_function("io_println_error", Linkage::Import, &signature)
             .map_err(|err| crate::Error::CraneliftCodegen {
                 message: err.to_string(),
             })?;
