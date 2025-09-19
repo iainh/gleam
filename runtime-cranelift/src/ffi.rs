@@ -10,10 +10,13 @@ use crate::{
     atom::AtomTable,
     binary, gc,
     heap::AllocationError,
-    layout::{Binary, BinarySlice, ConsCell, FloatBox, Map, MapEntry, MapTable},
+    layout::{Binary, BinaryData, BinarySlice, ConsCell, FloatBox, Map, MapEntry, MapTable},
     Header, Heap, Tag, Value,
 };
 
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine;
+use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -228,6 +231,126 @@ fn list_from_vec(values: Vec<Value>) -> Value {
         list = unwrap_allocation(heap.alloc_cons(value, list), "list from vec");
     }
     list
+}
+
+struct BitArrayView {
+    data: NonNull<BinaryData>,
+    bit_offset: usize,
+    bit_len: usize,
+    capacity_bits: usize,
+}
+
+fn bit_array_view(value: Value, context: &'static str) -> BitArrayView {
+    let ptr = value
+        .as_boxed::<crate::layout::BitArray>()
+        .unwrap_or_else(|| panic!("runtime {context} expected BitArray value"));
+    unsafe {
+        let bit_array = ptr.as_ref();
+        let data = NonNull::new(bit_array.data)
+            .unwrap_or_else(|| panic!("runtime {context} missing bit array data"));
+        BitArrayView {
+            data,
+            bit_offset: bit_array.bit_offset,
+            bit_len: bit_array.bit_len,
+            capacity_bits: bit_array.capacity_bits,
+        }
+    }
+}
+
+fn bit_array_data_slice(view: &BitArrayView) -> &[u8] {
+    unsafe {
+        let data = view.data.as_ref();
+        let len = (view.capacity_bits + 7) / 8;
+        slice::from_raw_parts(data.as_ptr(), len)
+    }
+}
+
+fn read_bit(view: &BitArrayView, index: usize) -> u8 {
+    let bit_index = view.bit_offset + index;
+    let byte_index = bit_index / 8;
+    let bit_position = 7 - (bit_index % 8);
+    let data = bit_array_data_slice(view);
+    if byte_index >= data.len() {
+        0
+    } else {
+        (data[byte_index] >> bit_position) & 1
+    }
+}
+
+fn copy_bits(view: &BitArrayView, start: usize, len: usize) -> Vec<u8> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut bytes = vec![0u8; (len + 7) / 8];
+    copy_bits_into(view, start, len, &mut bytes, 0);
+    bytes
+}
+
+fn copy_bits_into(
+    view: &BitArrayView,
+    start: usize,
+    len: usize,
+    dest: &mut [u8],
+    dest_offset: usize,
+) {
+    for i in 0..len {
+        let bit = read_bit(view, start + i);
+        if bit == 0 {
+            continue;
+        }
+        let bit_index = dest_offset + i;
+        let byte_index = bit_index / 8;
+        let bit_position = 7 - (bit_index % 8);
+        if let Some(byte) = dest.get_mut(byte_index) {
+            *byte |= 1 << bit_position;
+        }
+    }
+}
+
+fn bit_array_from_bytes(bytes: &[u8], bit_len: usize) -> Value {
+    gc::ensure_initialised();
+    let heap = Heap::new();
+    let data = unwrap_allocation(heap.alloc_binary_data(bytes.len()), "bit array data");
+    unsafe {
+        let buffer = &mut *data.as_ptr();
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.as_mut_ptr(), bytes.len());
+    }
+    unwrap_allocation(
+        heap.alloc_bit_array(data, 0, bit_len, bytes.len() * 8),
+        "bit array",
+    )
+}
+
+fn bit_array_bytes(view: &BitArrayView) -> Vec<u8> {
+    copy_bits(view, 0, view.bit_len)
+}
+
+fn read_byte(view: &BitArrayView, index: usize) -> u8 {
+    let start = index * 8;
+    let bits_to_read = if start + 8 <= view.bit_len {
+        8
+    } else {
+        view.bit_len.saturating_sub(start)
+    };
+    let mut value = 0u8;
+    for i in 0..bits_to_read {
+        let bit = read_bit(view, start + i);
+        value |= bit << (7 - i);
+    }
+    value
+}
+
+fn padded_bytes(view: &BitArrayView) -> (Vec<u8>, usize) {
+    let padding = (8 - (view.bit_len % 8)) % 8;
+    let mut bytes = bit_array_bytes(view);
+    let total_bits = view.bit_len + padding;
+    if padding != 0 {
+        let required_len = (total_bits + 7) / 8;
+        if bytes.len() < required_len {
+            bytes.resize(required_len, 0);
+        }
+    }
+    (bytes, total_bits)
 }
 
 fn map_table_from_value(value: Value) -> NonNull<MapTable> {
@@ -668,6 +791,196 @@ pub extern "C" fn byte_size(raw: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn utf_codepoint_to_int(raw: u64) -> u64 {
     raw
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_bit_size(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_bit_size");
+    let size = i64::try_from(view.bit_len)
+        .unwrap_or_else(|_| panic!("runtime bit_array_bit_size overflow"));
+    Value::from_i63(size).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_byte_size(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_byte_size");
+    let bytes = (view.bit_len + 7) / 8;
+    let size =
+        i64::try_from(bytes).unwrap_or_else(|_| panic!("runtime bit_array_byte_size overflow"));
+    Value::from_i63(size).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_pad_to_bytes(raw: u64) -> u64 {
+    let value = Value::from_raw(raw);
+    let view = bit_array_view(value, "bit_array_pad_to_bytes");
+    let padding = (8 - (view.bit_len % 8)) % 8;
+    if padding == 0 && view.bit_offset == 0 {
+        return raw;
+    }
+    let (bytes, total_bits) = padded_bytes(&view);
+    bit_array_from_bytes(&bytes, total_bits).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_slice(bits_raw: u64, pos_raw: u64, len_raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(bits_raw), "bit_array_slice bits");
+    let pos = value_to_i63(Value::from_raw(pos_raw), "bit_array_slice position");
+    let len = value_to_i63(Value::from_raw(len_raw), "bit_array_slice length");
+    let start = pos.min(pos + len);
+    let end = pos.max(pos + len);
+    if start < 0 || end < 0 {
+        return result_error(Value::nil());
+    }
+    let start_usize =
+        usize::try_from(start).unwrap_or_else(|_| panic!("runtime bit_array_slice start overflow"));
+    let end_usize =
+        usize::try_from(end).unwrap_or_else(|_| panic!("runtime bit_array_slice end overflow"));
+    if end_usize.saturating_mul(8) > view.bit_len {
+        return result_error(Value::nil());
+    }
+    let start_bits = start_usize * 8;
+    let len_bits = (end_usize - start_usize) * 8;
+    let bytes = copy_bits(&view, start_bits, len_bits);
+    let slice_value = bit_array_from_bytes(&bytes, len_bits);
+    result_ok(slice_value)
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_to_string(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_to_string");
+    if view.bit_len % 8 != 0 {
+        return result_error(Value::nil());
+    }
+    let bytes = bit_array_bytes(&view);
+    match String::from_utf8(bytes) {
+        Ok(string) => result_ok(string_to_value(&string)),
+        Err(_) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_unsafe_to_string(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_unsafe_to_string");
+    if view.bit_len % 8 != 0 {
+        panic!("runtime bit_array_unsafe_to_string expected byte-aligned bit array");
+    }
+    let bytes = bit_array_bytes(&view);
+    let string = String::from_utf8(bytes)
+        .unwrap_or_else(|_| panic!("runtime bit_array_unsafe_to_string invalid utf-8"));
+    string_to_value(&string).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_concat(list_raw: u64) -> u64 {
+    let values = list_to_vec(Value::from_raw(list_raw));
+    let mut total_bits: usize = 0;
+    for value in &values {
+        let view = bit_array_view(*value, "bit_array_concat input");
+        total_bits = total_bits
+            .checked_add(view.bit_len)
+            .unwrap_or_else(|| panic!("runtime bit_array_concat overflow"));
+    }
+    if total_bits == 0 {
+        return bit_array_from_bytes(&[], 0).to_raw();
+    }
+    let mut bytes = vec![0u8; (total_bits + 7) / 8];
+    let mut offset = 0usize;
+    for value in values {
+        let view = bit_array_view(value, "bit_array_concat entry");
+        copy_bits_into(&view, 0, view.bit_len, &mut bytes, offset);
+        offset += view.bit_len;
+    }
+    bit_array_from_bytes(&bytes, total_bits).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn base64_encode(bits_raw: u64, padding_raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(bits_raw), "base64_encode bits");
+    let padding = Value::from_raw(padding_raw) == Value::from_bool(true);
+    let (bytes, _) = padded_bytes(&view);
+    let engine = if padding { &STANDARD } else { &STANDARD_NO_PAD };
+    let encoded = engine.encode(&bytes);
+    string_to_value(&encoded).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn base64_decode(string_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("runtime base64_decode expected String value"));
+    let decoded = STANDARD
+        .decode(string.as_bytes())
+        .or_else(|_| STANDARD_NO_PAD.decode(string.as_bytes()));
+    match decoded {
+        Ok(bytes) => {
+            let value = bit_array_from_bytes(&bytes, bytes.len() * 8);
+            result_ok(value)
+        }
+        Err(_) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn base16_encode(bits_raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(bits_raw), "base16_encode bits");
+    let (bytes, _) = padded_bytes(&view);
+    let encoded = encode_upper(bytes);
+    string_to_value(&encoded).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn base16_decode(string_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("runtime base16_decode expected String value"));
+    if string.len() % 2 != 0 {
+        return result_error(Value::nil());
+    }
+    match hex_decode(string.as_bytes()) {
+        Ok(bytes) => {
+            let value = bit_array_from_bytes(&bytes, bytes.len() * 8);
+            result_ok(value)
+        }
+        Err(_) => result_error(Value::nil()),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_to_int_and_size(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_to_int_and_size");
+    let first_byte = if view.bit_len == 0 {
+        0
+    } else {
+        read_byte(&view, 0)
+    };
+    let trailing_bits = view.bit_len % 8;
+    let unused_bits = if trailing_bits == 0 {
+        0
+    } else {
+        8 - trailing_bits
+    };
+    let value = (first_byte >> unused_bits) as i64;
+    let size = i64::try_from(view.bit_len)
+        .unwrap_or_else(|_| panic!("runtime bit_array_to_int_and_size overflow"));
+    let tuple = tuple_from(
+        &[Value::from_i63(value), Value::from_i63(size)],
+        "bit array to int tuple",
+    );
+    tuple.to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_starts_with(bits_raw: u64, prefix_raw: u64) -> u64 {
+    let bits_view = bit_array_view(Value::from_raw(bits_raw), "bit_array_starts_with bits");
+    let prefix_view = bit_array_view(Value::from_raw(prefix_raw), "bit_array_starts_with prefix");
+    if prefix_view.bit_len > bits_view.bit_len {
+        return Value::from_bool(false).to_raw();
+    }
+    for index in 0..prefix_view.bit_len {
+        if read_bit(&prefix_view, index) != read_bit(&bits_view, index) {
+            return Value::from_bool(false).to_raw();
+        }
+    }
+    Value::from_bool(true).to_raw()
 }
 
 #[no_mangle]
