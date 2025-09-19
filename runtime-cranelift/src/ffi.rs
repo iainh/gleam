@@ -1,6 +1,7 @@
 use std::{
     convert::TryFrom,
     io::{self, Write},
+    mem,
     ptr::NonNull,
     slice,
     sync::OnceLock,
@@ -10,7 +11,10 @@ use crate::{
     atom::AtomTable,
     binary, gc,
     heap::AllocationError,
-    layout::{Binary, BinaryData, BinarySlice, ConsCell, FloatBox, Map, MapEntry, MapTable},
+    layout::{
+        Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ConsCell, FloatBox,
+        Map, MapEntry, MapTable,
+    },
     Header, Heap, Tag, Value,
 };
 
@@ -242,7 +246,7 @@ struct BitArrayView {
 
 fn bit_array_view(value: Value, context: &'static str) -> BitArrayView {
     let ptr = value
-        .as_boxed::<crate::layout::BitArray>()
+        .as_boxed::<BitArrayLayout>()
         .unwrap_or_else(|| panic!("runtime {context} expected BitArray value"));
     unsafe {
         let bit_array = ptr.as_ref();
@@ -411,6 +415,115 @@ fn map_from_vec(mut entries: Vec<(Value, Value)>) -> Value {
     unwrap_allocation(heap.alloc_map(table), "map")
 }
 
+fn call_function(function: Value, args: &[Value]) -> Value {
+    let closure_ptr = function
+        .as_boxed::<Closure>()
+        .unwrap_or_else(|| panic!("expected function value"));
+    unsafe {
+        let closure = closure_ptr.as_ptr();
+        let func = (*closure).code_ptr;
+        func(closure, args.as_ptr(), args.len())
+    }
+}
+
+fn tuple_to_vec(value: Value) -> Vec<Value> {
+    let header_ptr = value
+        .as_boxed::<Header>()
+        .unwrap_or_else(|| panic!("expected tuple value"));
+    let header = unsafe { header_ptr.as_ref() };
+    if header.tag() != Tag::Tuple {
+        panic!("expected tuple value");
+    }
+    let len = header.arity() as usize;
+    let payload_ptr =
+        unsafe { (header_ptr.as_ptr() as *const u8).add(mem::size_of::<Header>()) as *const Value };
+    unsafe { slice::from_raw_parts(payload_ptr, len) }.to_vec()
+}
+
+fn header_tag(value: Value) -> Option<Tag> {
+    value
+        .as_boxed::<Header>()
+        .map(|ptr| unsafe { ptr.as_ref().tag() })
+}
+
+fn is_bool_value(value: Value) -> bool {
+    value == Value::from_bool(true) || value == Value::from_bool(false)
+}
+
+#[allow(unreachable_patterns)]
+fn classify_value(value: Value) -> &'static str {
+    if value == Value::nil() {
+        "Nil"
+    } else if is_bool_value(value) {
+        "Bool"
+    } else if value.is_atom() {
+        "Atom"
+    } else if value.is_i63() {
+        "Int"
+    } else if let Some(tag) = header_tag(value) {
+        match tag {
+            Tag::Binary | Tag::BinarySlice => "String",
+            Tag::BitArray => "BitArray",
+            Tag::Float => "Float",
+            Tag::List => "List",
+            Tag::Map => "Dict",
+            Tag::Tuple => "Array",
+            Tag::Record => "Record",
+            Tag::Closure => "Function",
+            Tag::Resource => "Resource",
+            Tag::Mailbox => "Mailbox",
+            Tag::Boolean => "Bool",
+            Tag::Nil => "Nil",
+            _ => "Unknown",
+        }
+    } else {
+        "Unknown"
+    }
+}
+
+fn is_list_value(value: Value) -> bool {
+    if value == Value::nil() {
+        true
+    } else {
+        matches!(header_tag(value), Some(Tag::List))
+    }
+}
+
+fn is_empty_list(value: Value) -> bool {
+    value == Value::nil()
+}
+
+fn decode_error_record(expected: &str, found: &str, path: Value) -> Value {
+    let expected_value = string_to_value(expected);
+    let found_value = string_to_value(found);
+    let elements = [expected_value, found_value, path];
+    tuple_from(&elements, "decode error tuple")
+}
+
+fn decode_error_list(expected: &str, data: Value) -> Value {
+    let found = classify_value(data);
+    let error = decode_error_record(expected, found, Value::nil());
+    list_from_vec(vec![error])
+}
+
+#[no_mangle]
+pub extern "C" fn classify_dynamic(raw: u64) -> u64 {
+    let value = Value::from_raw(raw);
+    string_to_value(classify_value(value)).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn list_to_array(list_raw: u64) -> u64 {
+    let elements = list_to_vec(Value::from_raw(list_raw));
+    tuple_from(&elements, "list_to_array tuple").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn is_null(raw: u64) -> u64 {
+    let value = Value::from_raw(raw);
+    Value::from_bool(value == Value::nil()).to_raw()
+}
+
 #[derive(Debug)]
 enum FloatAccessError {
     NotAFloat,
@@ -490,6 +603,14 @@ fn result_ok(payload: Value) -> u64 {
 
 fn result_error(payload: Value) -> u64 {
     result_with(atom_error(), payload).to_raw()
+}
+
+fn option_some(value: Value) -> Value {
+    tuple_from(&[atom("some"), value], "option some")
+}
+
+fn option_none() -> Value {
+    atom("none")
 }
 
 enum OutputStream {
@@ -981,6 +1102,186 @@ pub extern "C" fn bit_array_starts_with(bits_raw: u64, prefix_raw: u64) -> u64 {
         }
     }
     Value::from_bool(true).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn index(data_raw: u64, key_raw: u64) -> u64 {
+    let data = Value::from_raw(data_raw);
+    let key = Value::from_raw(key_raw);
+
+    if matches!(header_tag(data), Some(Tag::Map)) {
+        let entries = map_entries_vec(data);
+        for (entry_key, entry_value) in entries {
+            if entry_key == key {
+                return result_ok(option_some(entry_value));
+            }
+        }
+        return result_ok(option_none());
+    }
+
+    if key.is_i63() {
+        let index = value_to_i63(key, "index key");
+        if index < 0 {
+            return result_error(string_to_value("Indexable"));
+        }
+        let target = index as usize;
+
+        if is_list_value(data) {
+            let mut current = data;
+            let mut current_index = 0usize;
+            while current != Value::nil() {
+                let cons_ptr = current
+                    .as_boxed::<ConsCell>()
+                    .unwrap_or_else(|| panic!("expected List value"));
+                let cons = unsafe { cons_ptr.as_ref() };
+                if current_index == target {
+                    return result_ok(option_some(cons.head));
+                }
+                current = cons.tail;
+                current_index += 1;
+            }
+            return result_ok(option_none());
+        }
+
+        if matches!(header_tag(data), Some(Tag::Tuple)) {
+            let elements = tuple_to_vec(data);
+            if let Some(value) = elements.get(target) {
+                return result_ok(option_some(*value));
+            } else {
+                return result_ok(option_none());
+            }
+        }
+
+        return result_error(string_to_value("Indexable"));
+    }
+
+    result_error(string_to_value("Dict"))
+}
+
+#[no_mangle]
+pub extern "C" fn dynamic_string(data_raw: u64) -> u64 {
+    let value = Value::from_raw(data_raw);
+    match header_tag(value) {
+        Some(Tag::Binary) | Some(Tag::BinarySlice) => result_ok(value),
+        Some(Tag::BitArray) => {
+            let view = bit_array_view(value, "string bit array view");
+            if view.bit_len % 8 != 0 {
+                return result_error(string_to_value(""));
+            }
+            let bytes = bit_array_bytes(&view);
+            match String::from_utf8(bytes) {
+                Ok(text) => result_ok(string_to_value(&text)),
+                Err(_) => result_error(string_to_value("")),
+            }
+        }
+        _ => result_error(string_to_value("")),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dynamic_int(data_raw: u64) -> u64 {
+    let value = Value::from_raw(data_raw);
+    if value.is_i63() {
+        result_ok(value)
+    } else {
+        result_error(Value::from_i63(0))
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dynamic_float(data_raw: u64) -> u64 {
+    let value = Value::from_raw(data_raw);
+    if matches!(header_tag(value), Some(Tag::Float)) {
+        result_ok(value)
+    } else {
+        result_error(float_to_value(0.0))
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dynamic_bit_array(data_raw: u64) -> u64 {
+    let value = Value::from_raw(data_raw);
+    if matches!(header_tag(value), Some(Tag::BitArray)) {
+        result_ok(value)
+    } else {
+        let empty = bit_array_from_bytes(&[], 0);
+        result_error(empty)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn decode_list(
+    data_raw: u64,
+    item_raw: u64,
+    push_path_raw: u64,
+    index_raw: u64,
+    acc_raw: u64,
+) -> u64 {
+    let data = Value::from_raw(data_raw);
+    let item_fn = Value::from_raw(item_raw);
+    let push_path_fn = Value::from_raw(push_path_raw);
+    let mut index = value_to_i63(Value::from_raw(index_raw), "list index");
+    if index < 0 {
+        index = 0;
+    }
+
+    let mut acc_vec = list_to_vec(Value::from_raw(acc_raw));
+
+    let elements_opt = if data == Value::nil() {
+        Some(Vec::new())
+    } else if matches!(header_tag(data), Some(Tag::Tuple)) {
+        Some(tuple_to_vec(data))
+    } else if is_list_value(data) {
+        Some(list_to_vec(data))
+    } else {
+        None
+    };
+
+    if let Some(elements) = elements_opt {
+        let mut current_index = index as usize;
+        for element in elements {
+            let decoded = call_function(item_fn, &[element]);
+            let parts = tuple_to_vec(decoded);
+            if parts.len() != 2 {
+                panic!("decoder tuple expected two elements");
+            }
+            let value = parts[0];
+            let errors = parts[1];
+            if is_empty_list(errors) {
+                acc_vec.push(value);
+                current_index += 1;
+            } else {
+                let tuple_arg = tuple_from(&[Value::nil(), errors], "list push tuple");
+                let index_text = current_index.to_string();
+                let index_string = string_to_value(index_text.as_str());
+                let result = call_function(push_path_fn, &[tuple_arg, index_string]);
+                return result.to_raw();
+            }
+        }
+        let result_list = list_from_vec(acc_vec);
+        let result = tuple_from(&[result_list, Value::nil()], "list result tuple");
+        return result.to_raw();
+    }
+
+    if acc_vec.is_empty() {
+        let errors = decode_error_list("List", data);
+        let tuple = tuple_from(&[list_from_vec(Vec::new()), errors], "list invalid tuple");
+        tuple.to_raw()
+    } else {
+        let result_list = list_from_vec(acc_vec);
+        let tuple = tuple_from(&[result_list, Value::nil()], "list partial tuple");
+        tuple.to_raw()
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dynamic_dict(data_raw: u64) -> u64 {
+    let value = Value::from_raw(data_raw);
+    if matches!(header_tag(value), Some(Tag::Map)) {
+        result_ok(value)
+    } else {
+        result_error(Value::nil())
+    }
 }
 
 #[no_mangle]
