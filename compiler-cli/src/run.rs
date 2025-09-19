@@ -1,6 +1,6 @@
-use std::sync::OnceLock;
+use std::{env, sync::OnceLock};
 
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use ecow::EcoString;
 use gleam_core::{
     analyse::TargetSupport,
@@ -166,9 +166,18 @@ fn run_cranelift_command(
     arguments: Vec<String>,
 ) -> Result<Command, Error> {
     let package_dir = paths.build_directory_for_package(Mode::Dev, Target::Cranelift, package);
+    let mut binary_name = package.replace('/', "__");
+    if binary_name.is_empty() {
+        binary_name = "module".into();
+    }
+    let exe_suffix = env::consts::EXE_SUFFIX;
+    if !exe_suffix.is_empty() && !binary_name.ends_with(exe_suffix) {
+        binary_name.push_str(exe_suffix);
+    }
+
     let binary = package_dir
         .join(paths::ARTEFACT_DIRECTORY_NAME)
-        .join("module");
+        .join(Utf8Path::new(&binary_name));
 
     if !binary.is_file() {
         return Err(Error::CraneliftExecutableMissing {
