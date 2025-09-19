@@ -268,6 +268,9 @@ fn lower_call(
         module_name, label, ..
     } = fun
     {
+        if module_name == "gleeunit" && label == "main" && arguments.is_empty() {
+            return lower_gleeunit_main(module, ctx);
+        }
         if module_name == "gleeunit" && label == "do_main" && arguments.is_empty() {
             return skip_gleeunit_do_main(module, ctx);
         }
@@ -317,6 +320,9 @@ fn lower_call(
             ..
         } = &constructor.variant
         {
+            if module_name == "gleeunit" && name == "main" && arguments.is_empty() {
+                return lower_gleeunit_main(module, ctx);
+            }
             if module_name == "gleeunit" && name == "do_main" && arguments.is_empty() {
                 return skip_gleeunit_do_main(module, ctx);
             }
@@ -328,12 +334,23 @@ fn lower_call(
     })
 }
 
+fn lower_gleeunit_main(
+    module: &mut ObjectModule,
+    ctx: &mut LoweringContext<'_, '_>,
+) -> Result<Value> {
+    let func_id = ctx.declare_runtime_gleeunit_main(module)?;
+    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let call = ctx.builder.ins().call(func_ref, &[]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
+}
+
 fn skip_gleeunit_do_main(
     module: &mut ObjectModule,
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<Value> {
     tracing::warn!("Skipping gleeunit.do_main; test runner not yet supported on Cranelift");
-    let func_id = ctx.declare_runtime_nil(module)?;
+    let func_id = ctx.declare_runtime_gleeunit_do_main(module)?;
     let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[]);
     let results = ctx.builder.inst_results(call);
@@ -427,6 +444,8 @@ struct LoweringContext<'a, 'b> {
     runtime_println: Option<FuncId>,
     runtime_print_error: Option<FuncId>,
     runtime_println_error: Option<FuncId>,
+    runtime_gleeunit_main: Option<FuncId>,
+    runtime_gleeunit_do_main: Option<FuncId>,
     pointer_bytes: u8,
 }
 
@@ -448,6 +467,8 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
             runtime_println: None,
             runtime_print_error: None,
             runtime_println_error: None,
+            runtime_gleeunit_main: None,
+            runtime_gleeunit_do_main: None,
             pointer_bytes,
         }
     }
@@ -624,6 +645,40 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
                 message: err.to_string(),
             })?;
         self.runtime_println_error = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_gleeunit_main(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_gleeunit_main {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleeunit_main", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_gleeunit_main = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_gleeunit_do_main(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_gleeunit_do_main {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleeunit_do_main", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::CraneliftCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_gleeunit_do_main = Some(id);
         Ok(id)
     }
 
