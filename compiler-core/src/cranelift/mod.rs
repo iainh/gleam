@@ -71,68 +71,149 @@ pub(crate) fn module_contains_public_main(module: &crate::ast::TypedModule) -> b
         })
 }
 
-fn lower_main_function(module: &mut ObjectModule, config: &ModuleConfig<'_>) -> Result<FuncId> {
-    let main_fn =
-        find_main_function(&config.module.ast).ok_or_else(|| crate::Error::NativeCodegen {
-            message: format!("module `{}` is missing public main/0", config.module.name),
-        })?;
+type FunctionIdMap = HashMap<(EcoString, usize), FuncId>;
+
+fn function_symbol_name(module: &str, name: &EcoString, arity: usize) -> String {
+    format!(
+        "gleam${}_{}__{}",
+        module.replace('/', "$"),
+        name,
+        arity
+    )
+}
+
+fn collect_module_functions(
+    module: &crate::ast::TypedModule,
+) -> Vec<&Function<Arc<Type>, TypedExpr>> {
+    module
+        .definitions
+        .iter()
+        .filter_map(|definition| match definition {
+            TypedDefinition::Function(function) if function.name.is_some() => Some(function),
+            _ => None,
+        })
+        .collect()
+}
+
+fn declare_module_functions(
+    module: &mut ObjectModule,
+    module_name: &EcoString,
+    functions: &[&Function<Arc<Type>, TypedExpr>],
+) -> Result<FunctionIdMap> {
+    let mut ids = FunctionIdMap::with_capacity(functions.len());
+    let pointer_type = module.target_config().pointer_type();
+
+    for function in functions {
+        let Some((_, name)) = &function.name else { continue };
+        let arity = function.arguments.len();
+        let symbol = function_symbol_name(module_name, name, arity);
+
+        let mut signature = module.make_signature();
+        for _ in 0..arity {
+            signature.params.push(ir::AbiParam::new(pointer_type));
+        }
+        signature.returns.push(ir::AbiParam::new(pointer_type));
+
+        let func_id = module
+            .declare_function(&symbol, Linkage::Local, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+
+        let key = (name.clone(), arity);
+        let _ = ids.insert(key, func_id);
+    }
+
+    Ok(ids)
+}
+
+fn lower_module_functions(
+    module: &mut ObjectModule,
+    config: &ModuleConfig<'_>,
+) -> Result<Option<FuncId>> {
+    let functions = collect_module_functions(&config.module.ast);
+    if functions.is_empty() {
+        return Ok(None);
+    }
+
+    let function_ids = declare_module_functions(module, &config.module.name, &functions)?;
+
+    for function in functions {
+        let Some((_, name)) = &function.name else { continue };
+        let arity = function.arguments.len();
+        let key = (name.clone(), arity);
+        let Some(&func_id) = function_ids.get(&key) else { continue };
+        lower_function(
+            module,
+            &config.module.name,
+            function,
+            func_id,
+            &function_ids,
+        )?;
+    }
+
+    let main_key = (EcoString::from("main"), 0);
+    Ok(function_ids.get(&main_key).copied())
+}
+
+fn lower_function(
+    module: &mut ObjectModule,
+    module_name: &EcoString,
+    function: &Function<Arc<Type>, TypedExpr>,
+    func_id: FuncId,
+    functions: &FunctionIdMap,
+) -> Result<()> {
+    let pointer_type = module.target_config().pointer_type();
+    let pointer_bytes = module.target_config().pointer_bytes();
 
     let mut ctx = module.make_context();
+    for _ in &function.arguments {
+        ctx.func
+            .signature
+            .params
+            .push(ir::AbiParam::new(pointer_type));
+    }
     ctx.func
         .signature
         .returns
-        .push(ir::AbiParam::new(ir::types::I64));
+        .push(ir::AbiParam::new(pointer_type));
 
     let mut func_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
-        let block = builder.create_block();
-        builder.switch_to_block(block);
-        builder.seal_block(block);
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+    let block_params: Vec<Value> = builder.block_params(block).to_vec();
 
+    {
         let mut lowering = LoweringContext::new(
             &mut builder,
-            module.target_config().pointer_type(),
-            module.target_config().pointer_bytes(),
+            pointer_type,
+            pointer_bytes,
+            functions,
+            module_name,
         );
-        let value = lower_block(module, main_fn.body.as_slice(), &mut lowering)?;
-        let _ = builder.ins().return_(&[value]);
-        builder.finalize();
+
+        for (value, arg) in block_params.iter().zip(function.arguments.iter()) {
+            if let Some(name) = arg.get_variable_name() {
+                lowering.define(name, *value);
+            }
+        }
+
+        let value = lower_block(module, function.body.as_slice(), &mut lowering)?;
+        let _ = lowering.builder.ins().return_(&[value]);
     }
 
-    let func_id = module
-        .declare_function("gleam$main_impl", Linkage::Local, &ctx.func.signature)
-        .map_err(|err| crate::Error::NativeCodegen {
-            message: err.to_string(),
-        })?;
+    builder.finalize();
 
     module
         .define_function(func_id, &mut ctx)
         .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
-
     module.clear_context(&mut ctx);
-    Ok(func_id)
-}
-
-fn find_main_function(module: &crate::ast::TypedModule) -> Option<&Function<Arc<Type>, TypedExpr>> {
-    module
-        .definitions
-        .iter()
-        .find_map(|definition| match definition {
-            TypedDefinition::Function(function)
-                if function.publicity == Publicity::Public
-                    && function
-                        .name
-                        .as_ref()
-                        .is_some_and(|(_, name)| name == "main")
-                    && function.arguments.is_empty() =>
-            {
-                Some(function)
-            }
-            _ => None,
-        })
+    Ok(())
 }
 
 fn lower_block(
@@ -341,9 +422,46 @@ fn lower_call(
         }
     }
 
+    if let Some(value) = try_lower_defined_function(module, fun, arguments, ctx)? {
+        return Ok(value);
+    }
+
     Err(crate::Error::NativeCodegen {
         message: format!("unsupported call in native main: {fun:?}"),
     })
+}
+
+fn try_lower_defined_function(
+    module: &mut ObjectModule,
+    fun: &TypedExpr,
+    arguments: &[crate::ast::CallArg<TypedExpr>],
+    ctx: &mut LoweringContext<'_, '_>,
+) -> Result<Option<Value>> {
+    if let TypedExpr::Var { constructor, .. } = fun {
+        if let ValueConstructorVariant::ModuleFn {
+            module: function_module,
+            name,
+            ..
+        } = &constructor.variant
+        {
+            if function_module == ctx.module_name {
+                return ctx.try_call_function(module, name, arguments);
+            }
+        }
+    }
+
+    if let TypedExpr::ModuleSelect {
+        module_name,
+        label,
+        ..
+    } = fun
+    {
+        if module_name == ctx.module_name {
+            return ctx.try_call_function(module, label, arguments);
+        }
+    }
+
+    Ok(None)
 }
 
 fn lower_gleeunit_main(
@@ -459,6 +577,8 @@ struct LoweringContext<'a, 'b> {
     runtime_gleeunit_main: Option<FuncId>,
     runtime_gleeunit_do_main: Option<FuncId>,
     pointer_bytes: u8,
+    functions: &'a FunctionIdMap,
+    module_name: &'a EcoString,
 }
 
 impl<'a, 'b> LoweringContext<'a, 'b> {
@@ -466,6 +586,8 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
         builder: &'a mut FunctionBuilder<'b>,
         pointer_type: ir::Type,
         pointer_bytes: u8,
+        functions: &'a FunctionIdMap,
+        module_name: &'a EcoString,
     ) -> Self {
         Self {
             builder,
@@ -482,6 +604,8 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
             runtime_gleeunit_main: None,
             runtime_gleeunit_do_main: None,
             pointer_bytes,
+            functions,
+            module_name,
         }
     }
 
@@ -501,6 +625,28 @@ impl<'a, 'b> LoweringContext<'a, 'b> {
 
     fn lookup(&self, name: &EcoString) -> Option<&Value> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn try_call_function(
+        &mut self,
+        module: &mut ObjectModule,
+        name: &EcoString,
+        arguments: &[crate::ast::CallArg<TypedExpr>],
+    ) -> Result<Option<Value>> {
+        let key = (name.clone(), arguments.len());
+        let Some(&func_id) = self.functions.get(&key) else {
+            return Ok(None);
+        };
+
+        let mut args = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            args.push(lower_expression(module, &argument.value, self)?);
+        }
+
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &args);
+        let results = self.builder.inst_results(call);
+        Ok(Some(results[0]))
     }
 
     fn string_constant(&mut self, module: &mut ObjectModule, text: &str) -> Result<Value> {
@@ -749,8 +895,14 @@ pub fn emit_object(
 
     let mut module = ObjectModule::new(object_builder);
 
+    let main_func = lower_module_functions(&mut module, &config)?;
+
     if config.has_entrypoint {
-        let main_func = lower_main_function(&mut module, &config)?;
+        let Some(main_func) = main_func else {
+            return Err(crate::Error::NativeCodegen {
+                message: format!("module `{}` is missing public main/0", config.module.name),
+            });
+        };
         build_entrypoint(&mut module, main_func)?;
     }
 
