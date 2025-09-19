@@ -381,15 +381,22 @@ where
         }
 
         let mut object_paths = Vec::with_capacity(modules.len());
-        let mut has_entrypoint = false;
+        let primary_entry_index = modules
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, module)| cranelift::module_contains_public_main(&module.ast))
+            .map(|(index, _)| index);
+        let mut has_entrypoint = primary_entry_index.is_some();
 
-        for module in modules {
+        for (index, module) in modules.iter().enumerate() {
             let object_name = format!("{}.o", module.name.replace("/", "__"));
             let output_path = artefact_dir.join(&object_name);
-            let module_config = cranelift::ModuleConfig::new(module, self.root);
-            if module_config.has_entrypoint {
-                has_entrypoint = true;
-            }
+            let module_config = cranelift::ModuleConfig::with_entrypoint(
+                module,
+                self.root,
+                primary_entry_index == Some(index),
+            );
             cranelift::emit_object(&self.io, module_config, &output_path)?;
             object_paths.push(output_path);
         }

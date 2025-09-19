@@ -7863,12 +7863,20 @@ pub mod implementations {
       self.reader.get_bool_field(2)
     }
     #[inline]
+    pub fn get_uses_cranelift_externals(self) -> bool {
+      self.reader.get_bool_field(5)
+    }
+    #[inline]
     pub fn get_can_run_on_erlang(self) -> bool {
       self.reader.get_bool_field(3)
     }
     #[inline]
     pub fn get_can_run_on_javascript(self) -> bool {
       self.reader.get_bool_field(4)
+    }
+    #[inline]
+    pub fn get_can_run_on_cranelift(self) -> bool {
+      self.reader.get_bool_field(6)
     }
   }
 
@@ -7949,6 +7957,14 @@ pub mod implementations {
       self.builder.set_bool_field(2, value);
     }
     #[inline]
+    pub fn get_uses_cranelift_externals(self) -> bool {
+      self.builder.get_bool_field(5)
+    }
+    #[inline]
+    pub fn set_uses_cranelift_externals(&mut self, value: bool)  {
+      self.builder.set_bool_field(5, value);
+    }
+    #[inline]
     pub fn get_can_run_on_erlang(self) -> bool {
       self.builder.get_bool_field(3)
     }
@@ -7963,6 +7979,14 @@ pub mod implementations {
     #[inline]
     pub fn set_can_run_on_javascript(&mut self, value: bool)  {
       self.builder.set_bool_field(4, value);
+    }
+    #[inline]
+    pub fn get_can_run_on_cranelift(self) -> bool {
+      self.builder.get_bool_field(6)
+    }
+    #[inline]
+    pub fn set_can_run_on_cranelift(&mut self, value: bool)  {
+      self.builder.set_bool_field(6, value);
     }
   }
 
@@ -8191,7 +8215,7 @@ pub mod value_constructor_variant {
 
   pub struct Builder<'a> { builder: ::capnp::private::layout::StructBuilder<'a> }
   impl <> ::capnp::traits::HasStructSize for Builder<'_,>  {
-    const STRUCT_SIZE: ::capnp::private::layout::StructSize = ::capnp::private::layout::StructSize { data: 1, pointers: 9 };
+    const STRUCT_SIZE: ::capnp::private::layout::StructSize = ::capnp::private::layout::StructSize { data: 1, pointers: 10 };
   }
   impl <> ::capnp::traits::HasTypeId for Builder<'_,>  {
     const TYPE_ID: u64 = _private::TYPE_ID;
@@ -8265,6 +8289,7 @@ pub mod value_constructor_variant {
       self.builder.reborrow().get_pointer_field(6).clear();
       self.builder.reborrow().get_pointer_field(7).clear();
       self.builder.reborrow().get_pointer_field(8).clear();
+      self.builder.reborrow().get_pointer_field(9).clear();
       self.builder.into()
     }
     #[inline]
@@ -8502,7 +8527,7 @@ pub mod value_constructor_variant {
 
     pub struct Builder<'a> { builder: ::capnp::private::layout::StructBuilder<'a> }
     impl <> ::capnp::traits::HasStructSize for Builder<'_,>  {
-      const STRUCT_SIZE: ::capnp::private::layout::StructSize = ::capnp::private::layout::StructSize { data: 1, pointers: 9 };
+      const STRUCT_SIZE: ::capnp::private::layout::StructSize = ::capnp::private::layout::StructSize { data: 1, pointers: 10 };
     }
     impl <> ::capnp::traits::HasTypeId for Builder<'_,>  {
       const TYPE_ID: u64 = _private::TYPE_ID;
@@ -8940,6 +8965,14 @@ pub mod value_constructor_variant {
         !self.reader.get_pointer_field(7).is_null()
       }
       #[inline]
+      pub fn get_external_cranelift(self) -> ::capnp::Result<crate::schema_capnp::option::Reader<'a,crate::schema_capnp::external::Owned>> {
+        ::capnp::traits::FromPointerReader::get_from_pointer(&self.reader.get_pointer_field(9), ::core::option::Option::None)
+      }
+      #[inline]
+      pub fn has_external_cranelift(&self) -> bool {
+        !self.reader.get_pointer_field(9).is_null()
+      }
+      #[inline]
       pub fn get_purity(self) -> ::capnp::Result<crate::schema_capnp::purity::Reader<'a>> {
         ::capnp::traits::FromPointerReader::get_from_pointer(&self.reader.get_pointer_field(8), ::core::option::Option::None)
       }
@@ -9138,6 +9171,22 @@ pub mod value_constructor_variant {
         !self.builder.is_pointer_field_null(7)
       }
       #[inline]
+      pub fn get_external_cranelift(self) -> ::capnp::Result<crate::schema_capnp::option::Builder<'a,crate::schema_capnp::external::Owned>> {
+        ::capnp::traits::FromPointerBuilder::get_from_pointer(self.builder.get_pointer_field(9), ::core::option::Option::None)
+      }
+      #[inline]
+      pub fn set_external_cranelift(&mut self, value: crate::schema_capnp::option::Reader<'_,crate::schema_capnp::external::Owned>) -> ::capnp::Result<()> {
+        ::capnp::traits::SetterInput::set_pointer_builder(self.builder.reborrow().get_pointer_field(9), value, false)
+      }
+      #[inline]
+      pub fn init_external_cranelift(self, ) -> crate::schema_capnp::option::Builder<'a,crate::schema_capnp::external::Owned> {
+        ::capnp::traits::FromPointerBuilder::init_pointer(self.builder.get_pointer_field(9), 0)
+      }
+      #[inline]
+      pub fn has_external_cranelift(&self) -> bool {
+        !self.builder.is_pointer_field_null(9)
+      }
+      #[inline]
       pub fn get_purity(self) -> ::capnp::Result<crate::schema_capnp::purity::Builder<'a>> {
         ::capnp::traits::FromPointerBuilder::get_from_pointer(self.builder.get_pointer_field(8), ::core::option::Option::None)
       }
@@ -9176,6 +9225,9 @@ pub mod value_constructor_variant {
       }
       pub fn get_external_javascript(&self) -> crate::schema_capnp::option::Pipeline<crate::schema_capnp::external::Owned> {
         ::capnp::capability::FromTypelessPipeline::new(self._typeless.get_pointer_field(7))
+      }
+      pub fn get_external_cranelift(&self) -> crate::schema_capnp::option::Pipeline<crate::schema_capnp::external::Owned> {
+        ::capnp::capability::FromTypelessPipeline::new(self._typeless.get_pointer_field(9))
       }
       pub fn get_purity(&self) -> crate::schema_capnp::purity::Pipeline {
         ::capnp::capability::FromTypelessPipeline::new(self._typeless.get_pointer_field(8))
