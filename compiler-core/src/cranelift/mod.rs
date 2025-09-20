@@ -14,7 +14,7 @@ use crate::{
 };
 use camino::Utf8Path;
 use cranelift_codegen::{
-    ir::{self, InstBuilder, StackSlotData, StackSlotKind, Value},
+    ir::{self, condcodes::IntCC, InstBuilder, StackSlotData, StackSlotKind, Value},
     settings::{self, Configurable},
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -515,50 +515,131 @@ fn lower_case(
     clauses: &[crate::ast::Clause<TypedExpr, Arc<Type>, EcoString>],
     ctx: &mut LoweringContext<'_, '_>,
 ) -> Result<Value> {
-    if subjects.len() != 1 || clauses.len() != 1 {
+    if subjects.len() != 1 {
         return Err(crate::Error::NativeCodegen {
-            message:
-                "case expressions in native main currently support only a single subject and clause"
-                    .into(),
+            message: "case expressions currently support only a single subject when targeting native".into(),
         });
     }
 
-    let subject = &subjects[0];
-    let subject_value = lower_expression(module, subject, ctx)?;
-
-    ctx.push_scope();
-
-    let clause = &clauses[0];
-    if clause.pattern.len() != 1 {
+    if clauses.is_empty() {
         return Err(crate::Error::NativeCodegen {
-            message: "case clause must have a single pattern".into(),
+            message: "case expressions must have at least one clause".into(),
         });
     }
 
-    let result = match &clause.pattern[0] {
-        Pattern::Discard { .. } => {
-            if clause.guard.is_some() {
-                return Err(crate::Error::NativeCodegen {
-                    message: "case clause guards are not yet supported in native main".into(),
-                });
-            }
-            lower_expression(module, &clause.then, ctx)
+    for clause in clauses {
+        if clause.guard.is_some() {
+            return Err(crate::Error::NativeCodegen {
+                message: "case clause guards are not yet supported in native functions".into(),
+            });
         }
-        Pattern::Variable { name, .. } => {
-            if clause.guard.is_some() {
-                return Err(crate::Error::NativeCodegen {
-                    message: "case clause guards are not yet supported in native main".into(),
-                });
-            }
-            ctx.define(name, subject_value);
-            lower_expression(module, &clause.then, ctx)
+        if clause.pattern.len() != 1 {
+            return Err(crate::Error::NativeCodegen {
+                message: "case clauses with multiple patterns are not yet supported in native functions".into(),
+            });
         }
-        _ => Err(crate::Error::NativeCodegen {
-            message: "case patterns other than `_` are not yet supported in native main".into(),
-        }),
-    }?;
+    }
 
-    ctx.pop_scope();
+    let last_pattern = &clauses.last().unwrap().pattern[0];
+    if !matches!(last_pattern, Pattern::Variable { .. } | Pattern::Discard { .. }) {
+        return Err(crate::Error::NativeCodegen {
+            message: "native case expressions must end with a variable or discard pattern".into(),
+        });
+    }
+
+    let subject_value = lower_expression(module, &subjects[0], ctx)?;
+
+    let exit_block = ctx.builder.create_block();
+    let _ = ctx
+        .builder
+        .append_block_param(exit_block, ctx.pointer_type);
+
+    let mut current_block = ctx.builder.create_block();
+    let _ = ctx
+        .builder
+        .append_block_param(current_block, ctx.pointer_type);
+    let _ = ctx.builder.ins().jump(current_block, &[subject_value]);
+    ctx.builder.seal_block(current_block);
+
+    for (index, clause) in clauses.iter().enumerate() {
+        ctx.builder.switch_to_block(current_block);
+        let subject_param = ctx.builder.block_params(current_block)[0];
+        let pattern = &clause.pattern[0];
+        let is_last = index + 1 == clauses.len();
+
+        match pattern {
+            Pattern::Discard { .. } => {
+                ctx.push_scope();
+                let value = lower_expression(module, &clause.then, ctx)?;
+                ctx.pop_scope();
+                let _ = ctx.builder.ins().jump(exit_block, &[value]);
+                break;
+            }
+            Pattern::Variable { name, .. } => {
+                ctx.push_scope();
+                ctx.define(name, subject_param);
+                let value = lower_expression(module, &clause.then, ctx)?;
+                ctx.pop_scope();
+                let _ = ctx.builder.ins().jump(exit_block, &[value]);
+                break;
+            }
+            Pattern::Int { int_value, .. } => {
+                if is_last {
+                    return Err(crate::Error::NativeCodegen {
+                        message: "final native case clause must be a catch-all pattern".into(),
+                    });
+                }
+
+                let next_block = ctx.builder.create_block();
+                let _ = ctx
+                    .builder
+                    .append_block_param(next_block, ctx.pointer_type);
+                let body_block = ctx.builder.create_block();
+
+                let int = int_value.to_i64().ok_or_else(|| crate::Error::NativeCodegen {
+                    message: format!(
+                        "integer literal out of range for Gleam immediate: {int_value}"
+                    ),
+                })?;
+                let encoded = encode_small_int(int)?;
+                let literal = ctx
+                    .builder
+                    .ins()
+                    .iconst(ctx.pointer_type, encoded);
+                let cmp = ctx
+                    .builder
+                    .ins()
+                    .icmp(IntCC::Equal, subject_param, literal);
+
+                let _ = ctx
+                    .builder
+                    .ins()
+                    .brif(cmp, body_block, &[], next_block, &[subject_param]);
+
+                ctx.builder.seal_block(body_block);
+                ctx.builder.seal_block(next_block);
+
+                ctx.builder.switch_to_block(body_block);
+                ctx.push_scope();
+                let value = lower_expression(module, &clause.then, ctx)?;
+                ctx.pop_scope();
+                let _ = ctx.builder.ins().jump(exit_block, &[value]);
+
+                current_block = next_block;
+            }
+            other => {
+                return Err(crate::Error::NativeCodegen {
+                    message: format!(
+                        "case pattern `{other:?}` is not yet supported in native functions"
+                    ),
+                });
+            }
+        }
+    }
+
+    ctx.builder.seal_block(exit_block);
+    ctx.builder.switch_to_block(exit_block);
+    let result = ctx.builder.block_params(exit_block)[0];
     Ok(result)
 }
 
