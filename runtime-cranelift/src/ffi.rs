@@ -77,6 +77,17 @@ pub extern "C" fn gleam_bool_false() -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn gleam_float_from_f64(number: f64) -> u64 {
+    float_to_value(number).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_int_negate(raw: u64) -> u64 {
+    let int = value_to_i63(Value::from_raw(raw), "int_negate");
+    Value::from_i63(-int).to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn gleam_alloc_closure(code_ptr: u64, env_ptr: *const u64, env_len: usize) -> u64 {
     let code = unsafe { std::mem::transmute::<usize, ClosureFn>(code_ptr as usize) };
     let env_values = env_ptr as *const Value;
@@ -112,6 +123,20 @@ pub extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -> u64 {
     let values: Vec<Value> = slice.iter().copied().map(Value::from_raw).collect();
     let heap = Heap::new();
     unwrap_allocation(heap.alloc_tuple(&values), "tuple").to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_alloc_record(
+    constructor_index: u64,
+    fields_ptr: *const u64,
+    len: usize,
+) -> u64 {
+    gc::ensure_initialised();
+    let index = u32::try_from(constructor_index)
+        .unwrap_or_else(|_| panic!("record constructor index out of range"));
+    let values = unsafe { slice::from_raw_parts(fields_ptr as *const Value, len) };
+    let heap = Heap::new();
+    unwrap_allocation(heap.alloc_record(index, values), "record").to_raw()
 }
 
 #[no_mangle]

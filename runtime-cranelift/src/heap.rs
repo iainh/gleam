@@ -6,7 +6,7 @@ use crate::gc;
 use crate::header::{Header, Tag};
 use crate::layout::{
     Binary, BinaryData, BinarySlice, BitArray, Closure, ClosureFn, ConsCell, FloatBox, Map,
-    MapTable,
+    MapTable, Record,
 };
 use crate::value::Value;
 
@@ -109,6 +109,25 @@ impl Heap {
                 .cast::<u8>()
                 .add(core::mem::size_of::<Header>()) as *mut Value;
             core::ptr::copy_nonoverlapping(elements.as_ptr(), payload, arity);
+        }
+        Ok(Value::from_raw(ptr.as_ptr() as u64))
+    }
+
+    pub fn alloc_record(
+        &self,
+        constructor_index: u32,
+        fields: &[Value],
+    ) -> Result<Value, AllocationError> {
+        let field_count = fields.len();
+        let arity = u16::try_from(field_count).map_err(|_| AllocationError::InvalidLayout)?;
+        let header = Record::header_for_field_count(arity);
+        let ptr = self.allocate_box(header)?;
+        unsafe {
+            let record = ptr.cast::<Record>().as_ptr();
+            core::ptr::addr_of_mut!((*record).constructor_index).write(constructor_index);
+            core::ptr::addr_of_mut!((*record).flags).write(0);
+            let fields_ptr = (record as *mut u8).add(core::mem::size_of::<Record>()) as *mut Value;
+            core::ptr::copy_nonoverlapping(fields.as_ptr(), fields_ptr, field_count);
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }

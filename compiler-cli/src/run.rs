@@ -153,9 +153,7 @@ pub fn setup(
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
         },
-        Target::Native => {
-            run_native_command(paths, &main_function.package, &module, arguments)
-        }
+        Target::Native => run_native_command(paths, &main_function.package, &module, arguments),
     }
 }
 

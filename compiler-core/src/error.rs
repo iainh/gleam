@@ -4444,9 +4444,9 @@ satisfying {required_version} but you are using v{gleam_version}.",
                         "You can not set a runtime for Erlang. Did you mean to target JavaScript?"
                             .into(),
                     ),
-                    Target::Native => Some(
-                        "Native targets do not support selecting a runtime.".into(),
-                    ),
+                    Target::Native => {
+                        Some("Native targets do not support selecting a runtime.".into())
+                    }
                 };
 
                 vec![Diagnostic {

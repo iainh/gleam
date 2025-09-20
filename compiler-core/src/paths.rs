@@ -93,7 +93,8 @@ impl ProjectPaths {
     }
 
     pub fn build_directory_for_target(&self, mode: Mode, target: Target) -> Utf8PathBuf {
-        self.build_directory_for_mode(mode).join(target.folder_name())
+        self.build_directory_for_mode(mode)
+            .join(target.folder_name())
     }
 
     /// Note this uses the "application name", not the name of this package.
