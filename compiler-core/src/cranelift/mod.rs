@@ -857,19 +857,24 @@ fn lower_case(
                 Pattern::List { elements, tail, .. } => {
                     let mut capture_heads = Vec::with_capacity(elements.len());
                     let mut head_names = Vec::with_capacity(elements.len());
-                    let mut head_constructors: Vec<Option<(&PatternConstructor, &Arc<Type>)>> =
+                    let mut head_constructors: Vec<Option<ListConstructorInfo<'_>>> =
                         Vec::with_capacity(elements.len());
+                    let mut head_constructor_bindings: Vec<Option<Vec<Option<EcoString>>>> =
+                        Vec::with_capacity(elements.len());
+
                     for element in elements {
                         match element {
                             Pattern::Variable { name, .. } => {
                                 capture_heads.push(true);
                                 head_names.push(Some(name.clone()));
                                 head_constructors.push(None);
+                                head_constructor_bindings.push(None);
                             }
                             Pattern::Discard { .. } => {
                                 capture_heads.push(false);
                                 head_names.push(None);
                                 head_constructors.push(None);
+                                head_constructor_bindings.push(None);
                             }
                             Pattern::Constructor {
                                 constructor,
@@ -877,13 +882,42 @@ fn lower_case(
                                 spread,
                                 type_,
                                 ..
-                            } if arguments.is_empty() && spread.is_none() => {
+                            } if spread.is_none() => {
                                 let constructor = constructor.expect_ref(
                                     "pattern constructor must be known during native code generation",
                                 );
+
+                                let mut capture_flags = Vec::with_capacity(arguments.len());
+                                let mut binding_names = Vec::with_capacity(arguments.len());
+
+                                for argument in arguments {
+                                    match &argument.value {
+                                        Pattern::Variable { name, .. } => {
+                                            capture_flags.push(true);
+                                            binding_names.push(Some(name.clone()));
+                                        }
+                                        Pattern::Discard { .. } => {
+                                            capture_flags.push(false);
+                                            binding_names.push(None);
+                                        }
+                                        other => {
+                                            return Err(crate::Error::NativeCodegen {
+                                                message: format!(
+                                                    "constructor list head pattern argument `{other:?}` is not yet supported in native functions"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+
                                 capture_heads.push(false);
                                 head_names.push(None);
-                                head_constructors.push(Some((constructor, type_)));
+                                head_constructors.push(Some(ListConstructorInfo {
+                                    constructor,
+                                    type_,
+                                    capture_flags,
+                                }));
+                                head_constructor_bindings.push(Some(binding_names));
                             }
                             other => {
                                 return Err(crate::Error::NativeCodegen {
@@ -924,7 +958,12 @@ fn lower_case(
                     pattern_subjects = params;
 
                     let mut extra_iter = extras.into_iter();
-                    for (capture, name) in capture_heads.iter().zip(head_names.iter()) {
+                    for (index, ((capture, name), constructor_bindings)) in capture_heads
+                        .iter()
+                        .zip(head_names.iter())
+                        .zip(head_constructor_bindings.iter())
+                        .enumerate()
+                    {
                         if *capture {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
@@ -935,6 +974,42 @@ fn lower_case(
                             };
                             if let Some(name) = name {
                                 bindings.push((name.clone(), BindingSource::Value(value)));
+                            }
+                        }
+
+                        if let Some(binding_names) = constructor_bindings {
+                            let Some(info) =
+                                head_constructors.get(index).and_then(|opt| opt.as_ref())
+                            else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "missing constructor info for list head bindings in native lowering"
+                                            .into(),
+                                });
+                            };
+
+                            if info.capture_flags.len() != binding_names.len() {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: "constructor binding length mismatch in native list pattern lowering"
+                                        .into(),
+                                });
+                            }
+
+                            for (capture_flag, binding_name) in
+                                info.capture_flags.iter().zip(binding_names.iter())
+                            {
+                                if *capture_flag {
+                                    let Some(value) = extra_iter.next() else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message:
+                                                "missing captured constructor field in native case lowering"
+                                                    .into(),
+                                        });
+                                    };
+                                    if let Some(name) = binding_name {
+                                        bindings.push((name.clone(), BindingSource::Value(value)));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1455,6 +1530,13 @@ fn lower_function_literal(
         .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
     let results = ctx.builder.inst_results(call);
     Ok(results[0])
+}
+
+#[derive(Debug)]
+struct ListConstructorInfo<'a> {
+    constructor: &'a PatternConstructor,
+    type_: &'a Arc<Type>,
+    capture_flags: Vec<bool>,
 }
 
 struct LoweringContext<'a, 'b, 'c> {
@@ -2491,7 +2573,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         current_block: ir::Block,
         subject_index: usize,
         capture_heads: &[bool],
-        head_constructors: &[Option<(&PatternConstructor, &Arc<Type>)>],
+        head_constructors: &[Option<ListConstructorInfo<'_>>],
         capture_tail: bool,
         ensure_exact: bool,
         failure_block: ir::Block,
@@ -2499,7 +2581,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
         let head_capture_count = capture_heads.iter().filter(|capture| **capture).count();
-        let extra_count = head_capture_count + if capture_tail { 1 } else { 0 };
+        let constructor_capture_count: usize = head_constructors
+            .iter()
+            .filter_map(|info| info.as_ref())
+            .map(|info| info.capture_flags.iter().filter(|flag| **flag).count())
+            .sum();
+        let extra_count =
+            head_capture_count + constructor_capture_count + if capture_tail { 1 } else { 0 };
 
         let success_block = self.builder.create_block();
         for _ in 0..subject_count {
@@ -2631,9 +2719,17 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .ins()
                     .load(self.pointer_type, mem_flags, current_subject, tail_offset);
 
-            if let Some((constructor, type_)) = head_constructors[index] {
-                let expected = if type_.is_bool() {
-                    match constructor.name.as_str() {
+            let constructor_info = head_constructors[index].as_ref();
+            if let Some(info) = constructor_info {
+                if info.type_.is_bool() {
+                    if !info.capture_flags.is_empty() {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "boolean constructors in list patterns cannot capture fields in native functions"
+                                .into(),
+                        });
+                    }
+
+                    let expected = match info.constructor.name.as_str() {
                         "True" => self.bool_constant(module, true)?,
                         "False" => self.bool_constant(module, false)?,
                         other => {
@@ -2643,46 +2739,173 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                 ),
                             });
                         }
-                    }
-                } else {
-                    self.zero_arity_record_constant(
-                        module,
-                        &constructor.module,
-                        constructor.constructor_index,
-                    )?
-                };
+                    };
 
-                let cmp = self.builder.ins().icmp(IntCC::Equal, head, expected);
-                let match_block = self.builder.create_block();
-                for _ in 0..subject_count {
+                    let cmp = self.builder.ins().icmp(IntCC::Equal, head, expected);
+                    let match_block = self.builder.create_block();
+                    for _ in 0..subject_count {
+                        let _ = self
+                            .builder
+                            .append_block_param(match_block, self.pointer_type);
+                    }
+                    let args = subjects.clone();
                     let _ = self
                         .builder
-                        .append_block_param(match_block, self.pointer_type);
+                        .ins()
+                        .brif(cmp, match_block, &args, failure_block, &args);
+                    self.builder.seal_block(current_block);
+
+                    self.builder.switch_to_block(match_block);
+                    current_block = match_block;
+                    subjects = self.builder.block_params(current_block).to_vec();
+                    current_subject = subjects[subject_index];
+                    head = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        HEADER_SIZE,
+                    );
+                    tail = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        tail_offset,
+                    );
+                } else {
+                    let value_tag_mask =
+                        self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+                    let boxed_check = self.builder.ins().band(head, value_tag_mask);
+                    let zero = self.builder.ins().iconst(self.pointer_type, 0);
+                    let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+                    let pointer_block = self.builder.create_block();
+                    for _ in 0..subject_count {
+                        let _ = self
+                            .builder
+                            .append_block_param(pointer_block, self.pointer_type);
+                    }
+                    let args = subjects.clone();
+                    let _ = self.builder.ins().brif(
+                        is_boxed,
+                        pointer_block,
+                        &args,
+                        failure_block,
+                        &args,
+                    );
+                    self.builder.seal_block(current_block);
+
+                    self.builder.switch_to_block(pointer_block);
+                    current_block = pointer_block;
+                    subjects = self.builder.block_params(current_block).to_vec();
+                    current_subject = subjects[subject_index];
+                    head = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        HEADER_SIZE,
+                    );
+                    tail = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        tail_offset,
+                    );
+
+                    let header = self
+                        .builder
+                        .ins()
+                        .load(self.pointer_type, mem_flags, head, 0);
+                    let header_mask = self
+                        .builder
+                        .ins()
+                        .iconst(self.pointer_type, HEADER_FIELD_MASK);
+                    let header_tag = self.builder.ins().band(header, header_mask);
+                    let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
+                    let is_record = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::Equal, header_tag, record_tag);
+
+                    let record_block = self.builder.create_block();
+                    for _ in 0..subject_count {
+                        let _ = self
+                            .builder
+                            .append_block_param(record_block, self.pointer_type);
+                    }
+                    let args = subjects.clone();
+                    let _ = self.builder.ins().brif(
+                        is_record,
+                        record_block,
+                        &args,
+                        failure_block,
+                        &args,
+                    );
+                    self.builder.seal_block(current_block);
+
+                    self.builder.switch_to_block(record_block);
+                    current_block = record_block;
+                    subjects = self.builder.block_params(current_block).to_vec();
+                    current_subject = subjects[subject_index];
+                    head = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        HEADER_SIZE,
+                    );
+                    tail = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        tail_offset,
+                    );
+
+                    let constructor_offset = self.pointer_bytes() as i32;
+                    let ctor_index = self.builder.ins().load(
+                        ir::types::I32,
+                        mem_flags,
+                        head,
+                        constructor_offset,
+                    );
+                    let ctor_index = self.builder.ins().uextend(self.pointer_type, ctor_index);
+                    let expected = self.builder.ins().iconst(
+                        self.pointer_type,
+                        i64::from(info.constructor.constructor_index),
+                    );
+                    let index_matches = self.builder.ins().icmp(IntCC::Equal, ctor_index, expected);
+
+                    let match_block = self.builder.create_block();
+                    for _ in 0..subject_count {
+                        let _ = self
+                            .builder
+                            .append_block_param(match_block, self.pointer_type);
+                    }
+                    let args = subjects.clone();
+                    let _ = self.builder.ins().brif(
+                        index_matches,
+                        match_block,
+                        &args,
+                        failure_block,
+                        &args,
+                    );
+                    self.builder.seal_block(current_block);
+
+                    self.builder.switch_to_block(match_block);
+                    current_block = match_block;
+                    subjects = self.builder.block_params(current_block).to_vec();
+                    current_subject = subjects[subject_index];
+                    head = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        HEADER_SIZE,
+                    );
+                    tail = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        current_subject,
+                        tail_offset,
+                    );
                 }
-                let args = subjects.clone();
-                let _ = self
-                    .builder
-                    .ins()
-                    .brif(cmp, match_block, &args, failure_block, &args);
-                self.builder.seal_block(current_block);
-
-                self.builder.switch_to_block(match_block);
-                current_block = match_block;
-                subjects = self.builder.block_params(current_block).to_vec();
-                current_subject = subjects[subject_index];
-
-                head = self.builder.ins().load(
-                    self.pointer_type,
-                    mem_flags,
-                    current_subject,
-                    HEADER_SIZE,
-                );
-                tail = self.builder.ins().load(
-                    self.pointer_type,
-                    mem_flags,
-                    current_subject,
-                    tail_offset,
-                );
             }
 
             if *capture {
@@ -2691,6 +2914,29 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     let _ = self.builder.ins().stack_store(head, slot, offset);
                 }
                 stored += 1;
+            }
+
+            if let Some(info) = constructor_info {
+                if !info.type_.is_bool() {
+                    let field_base = HEADER_SIZE + self.pointer_bytes() as i32;
+                    for (field_index, capture_flag) in info.capture_flags.iter().enumerate() {
+                        if *capture_flag {
+                            let field_offset =
+                                field_base + (field_index as i32) * self.pointer_bytes() as i32;
+                            let field_value = self.builder.ins().load(
+                                self.pointer_type,
+                                mem_flags,
+                                head,
+                                field_offset,
+                            );
+                            if let Some(slot) = storage_slot {
+                                let offset = (stored * pointer_bytes) as i32;
+                                let _ = self.builder.ins().stack_store(field_value, slot, offset);
+                            }
+                            stored += 1;
+                        }
+                    }
+                }
             }
 
             subjects[subject_index] = tail;
