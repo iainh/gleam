@@ -7,8 +7,9 @@
 use crate::{
     Result,
     ast::{
-        BinOp, ClauseGuard, Constant, Function, Pattern, Publicity, Statement, TypedArg,
-        TypedClauseGuard, TypedConstant, TypedDefinition, TypedExpr, TypedStatement,
+        BinOp, ClauseGuard, Constant, Function, Pattern, PipelineAssignmentKind, Publicity,
+        Statement, TypedArg, TypedClauseGuard, TypedConstant, TypedDefinition, TypedExpr,
+        TypedPipelineAssignment, TypedStatement,
     },
     build::Module as GleamModule,
     io::FileSystemWriter,
@@ -394,6 +395,13 @@ fn lower_expression(
         TypedExpr::BinOp {
             name, left, right, ..
         } => lower_bin_op(module, name, left, right, ctx),
+
+        TypedExpr::Pipeline {
+            first_value,
+            assignments,
+            finally,
+            ..
+        } => lower_pipeline(module, first_value, assignments, finally, ctx),
 
         TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
 
@@ -866,6 +874,53 @@ fn lower_bin_op(
             message: format!("binary operator `{op:?}` is not yet supported in native main"),
         }),
     }
+}
+
+fn lower_pipeline(
+    module: &mut ObjectModule,
+    first_value: &TypedPipelineAssignment,
+    assignments: &[(TypedPipelineAssignment, PipelineAssignmentKind)],
+    finally: &TypedExpr,
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Value> {
+    ctx.push_scope();
+    let result = (|| {
+        let mut current = lower_expression(module, &first_value.value, ctx)?;
+        ctx.define(&first_value.name, current);
+
+        for (assignment, kind) in assignments {
+            current = lower_pipeline_step(module, current, assignment, *kind, ctx)?;
+        }
+
+        let binding_name = assignments
+            .last()
+            .map(|(assignment, _)| &assignment.name)
+            .unwrap_or(&first_value.name);
+        ctx.define(binding_name, current);
+
+        lower_expression(module, finally, ctx)
+    })();
+    ctx.pop_scope();
+    result
+}
+
+fn lower_pipeline_step(
+    module: &mut ObjectModule,
+    current: Value,
+    assignment: &TypedPipelineAssignment,
+    kind: PipelineAssignmentKind,
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Value> {
+    if matches!(kind, PipelineAssignmentKind::Echo) {
+        return Err(crate::Error::NativeCodegen {
+            message: "pipeline `echo` expressions are not yet supported in native functions".into(),
+        });
+    }
+
+    ctx.define(&assignment.name, current);
+    let new_value = lower_expression(module, &assignment.value, ctx)?;
+    ctx.define(&assignment.name, new_value);
+    Ok(new_value)
 }
 
 fn lower_closure_function(
