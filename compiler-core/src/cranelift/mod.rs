@@ -33,6 +33,7 @@ use num_traits::ToPrimitive;
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,
+    mem::size_of,
     sync::Arc,
 };
 use tracing::instrument;
@@ -822,14 +823,6 @@ fn lower_case(
                     type_,
                     ..
                 } => {
-                    if !arguments.is_empty() {
-                        return Err(crate::Error::NativeCodegen {
-                            message:
-                                "constructor patterns with arguments are not yet supported in native functions"
-                                    .into(),
-                        });
-                    }
-
                     if spread.is_some() {
                         return Err(crate::Error::NativeCodegen {
                             message:
@@ -842,17 +835,63 @@ fn lower_case(
                         "pattern constructor must be known during native code generation",
                     );
 
-                    let (block, params) = ctx.branch_on_constructor_pattern(
+                    let mut capture_flags = Vec::with_capacity(arguments.len());
+                    let mut binding_names = Vec::with_capacity(arguments.len());
+                    for argument in arguments {
+                        if argument.label.is_some() {
+                            return Err(crate::Error::NativeCodegen {
+                                message: "labelled constructor pattern arguments are not yet supported in native functions"
+                                    .into(),
+                            });
+                        }
+
+                        match &argument.value {
+                            Pattern::Variable { name, .. } => {
+                                capture_flags.push(true);
+                                binding_names.push(Some(name.clone()));
+                            }
+                            Pattern::Discard { .. } => {
+                                capture_flags.push(false);
+                                binding_names.push(None);
+                            }
+                            other => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: format!(
+                                        "constructor pattern argument `{other:?}` is not yet supported in native functions"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
+                    let (block, params, extras) = ctx.branch_on_constructor_pattern(
                         pattern_block,
                         pattern_subjects[subject_index],
                         constructor,
                         type_,
+                        &capture_flags,
                         next_block,
                         &pattern_subjects,
                         subject_count,
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
+
+                    let mut extra_iter = extras.into_iter();
+                    for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
+                        if *capture {
+                            let Some(value) = extra_iter.next() else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "missing captured constructor argument in native case lowering"
+                                            .into(),
+                                });
+                            };
+                            if let Some(name) = name {
+                                bindings.push((name.clone(), BindingSource::Value(value)));
+                            }
+                        }
+                    }
                 }
                 Pattern::List { elements, tail, .. } => {
                     let mut capture_heads = Vec::with_capacity(elements.len());
@@ -2435,11 +2474,26 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         subject: Value,
         constructor: &PatternConstructor,
         type_: &Arc<Type>,
+        capture_flags: &[bool],
         failure_block: ir::Block,
         failure_args: &[Value],
         subject_count: usize,
-    ) -> Result<(ir::Block, Vec<Value>)> {
-        let success_block = self.create_subject_block(subject_count);
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extra_count = capture_flags.iter().filter(|flag| **flag).count();
+
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..extra_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        let mut success_args = failure_args.to_vec();
         let args = failure_args.to_vec();
         let mem_flags = MemFlags::trusted();
 
@@ -2488,6 +2542,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .iconst(self.pointer_type, HEADER_FIELD_MASK);
 
         if type_.is_bool() {
+            if extra_count > 0 {
+                return Err(crate::Error::NativeCodegen {
+                    message:
+                        "boolean constructors with arguments are not yet supported in native functions"
+                            .into(),
+                });
+            }
+
             let expected_arity = match constructor.name.as_str() {
                 "True" => BOOLEAN_TRUE_ARITY,
                 "False" => BOOLEAN_FALSE_ARITY,
@@ -2513,10 +2575,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let arity_matches = self.builder.ins().icmp(IntCC::Equal, arity, expected);
 
             let both_match = self.builder.ins().band(tag_matches, arity_matches);
-            let _ = self
-                .builder
-                .ins()
-                .brif(both_match, success_block, &args, failure_block, &args);
+            let _ = self.builder.ins().brif(
+                both_match,
+                success_block,
+                &success_args,
+                failure_block,
+                &args,
+            );
             self.builder.seal_block(tag_block);
         } else {
             let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
@@ -2555,15 +2620,42 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .iconst(self.pointer_type, i64::from(constructor.constructor_index));
             let index_matches = self.builder.ins().icmp(IntCC::Equal, ctor_index, expected);
 
-            let _ =
-                self.builder
-                    .ins()
-                    .brif(index_matches, success_block, &args, failure_block, &args);
+            let mut captured_fields = Vec::with_capacity(extra_count);
+            if extra_count > 0 {
+                let field_base = HEADER_SIZE + (2 * size_of::<u32>() as i32);
+                let pointer_stride = self.pointer_bytes() as i32;
+                for (field_index, capture) in capture_flags.iter().enumerate() {
+                    if *capture {
+                        let field_offset = field_base + (field_index as i32) * pointer_stride;
+                        let field_value = self.builder.ins().load(
+                            self.pointer_type,
+                            mem_flags,
+                            record_subject,
+                            field_offset,
+                        );
+                        captured_fields.push(field_value);
+                    }
+                }
+            }
+
+            success_args.extend(captured_fields.iter().copied());
+
+            let _ = self.builder.ins().brif(
+                index_matches,
+                success_block,
+                &success_args,
+                failure_block,
+                &args,
+            );
             self.builder.seal_block(record_block);
         }
 
+        self.builder.switch_to_block(success_block);
+
         let params = self.builder.block_params(success_block).to_vec();
-        Ok((success_block, params))
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2709,232 +2801,65 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             subjects = self.builder.block_params(current_block).to_vec();
             current_subject = subjects[subject_index];
 
+            let constructor_info = head_constructors[index].as_ref();
+            let mut constructor_extras: Vec<Value> = Vec::new();
+            if let Some(info) = constructor_info {
+                let head_value = self.builder.ins().load(
+                    self.pointer_type,
+                    mem_flags,
+                    current_subject,
+                    HEADER_SIZE,
+                );
+                let (block, params, extras) = self.branch_on_constructor_pattern(
+                    current_block,
+                    head_value,
+                    info.constructor,
+                    info.type_,
+                    &info.capture_flags,
+                    failure_block,
+                    &subjects,
+                    subject_count,
+                )?;
+                current_block = block;
+                subjects = params;
+                current_subject = subjects[subject_index];
+                constructor_extras = extras;
+            }
+
             let tail_offset = HEADER_SIZE + pointer_bytes as i32;
-            let mut head =
+            let head_value =
                 self.builder
                     .ins()
                     .load(self.pointer_type, mem_flags, current_subject, HEADER_SIZE);
-            let mut tail =
+            let tail =
                 self.builder
                     .ins()
                     .load(self.pointer_type, mem_flags, current_subject, tail_offset);
 
-            let constructor_info = head_constructors[index].as_ref();
-            if let Some(info) = constructor_info {
-                if info.type_.is_bool() {
-                    if !info.capture_flags.is_empty() {
-                        return Err(crate::Error::NativeCodegen {
-                            message: "boolean constructors in list patterns cannot capture fields in native functions"
-                                .into(),
-                        });
-                    }
-
-                    let expected = match info.constructor.name.as_str() {
-                        "True" => self.bool_constant(module, true)?,
-                        "False" => self.bool_constant(module, false)?,
-                        other => {
-                            return Err(crate::Error::NativeCodegen {
-                                message: format!(
-                                    "unsupported boolean constructor `{other}` in native functions"
-                                ),
-                            });
-                        }
-                    };
-
-                    let cmp = self.builder.ins().icmp(IntCC::Equal, head, expected);
-                    let match_block = self.builder.create_block();
-                    for _ in 0..subject_count {
-                        let _ = self
-                            .builder
-                            .append_block_param(match_block, self.pointer_type);
-                    }
-                    let args = subjects.clone();
-                    let _ = self
-                        .builder
-                        .ins()
-                        .brif(cmp, match_block, &args, failure_block, &args);
-                    self.builder.seal_block(current_block);
-
-                    self.builder.switch_to_block(match_block);
-                    current_block = match_block;
-                    subjects = self.builder.block_params(current_block).to_vec();
-                    current_subject = subjects[subject_index];
-                    head = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        HEADER_SIZE,
-                    );
-                    tail = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        tail_offset,
-                    );
-                } else {
-                    let value_tag_mask =
-                        self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
-                    let boxed_check = self.builder.ins().band(head, value_tag_mask);
-                    let zero = self.builder.ins().iconst(self.pointer_type, 0);
-                    let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
-
-                    let pointer_block = self.builder.create_block();
-                    for _ in 0..subject_count {
-                        let _ = self
-                            .builder
-                            .append_block_param(pointer_block, self.pointer_type);
-                    }
-                    let args = subjects.clone();
-                    let _ = self.builder.ins().brif(
-                        is_boxed,
-                        pointer_block,
-                        &args,
-                        failure_block,
-                        &args,
-                    );
-                    self.builder.seal_block(current_block);
-
-                    self.builder.switch_to_block(pointer_block);
-                    current_block = pointer_block;
-                    subjects = self.builder.block_params(current_block).to_vec();
-                    current_subject = subjects[subject_index];
-                    head = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        HEADER_SIZE,
-                    );
-                    tail = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        tail_offset,
-                    );
-
-                    let header = self
-                        .builder
-                        .ins()
-                        .load(self.pointer_type, mem_flags, head, 0);
-                    let header_mask = self
-                        .builder
-                        .ins()
-                        .iconst(self.pointer_type, HEADER_FIELD_MASK);
-                    let header_tag = self.builder.ins().band(header, header_mask);
-                    let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
-                    let is_record = self
-                        .builder
-                        .ins()
-                        .icmp(IntCC::Equal, header_tag, record_tag);
-
-                    let record_block = self.builder.create_block();
-                    for _ in 0..subject_count {
-                        let _ = self
-                            .builder
-                            .append_block_param(record_block, self.pointer_type);
-                    }
-                    let args = subjects.clone();
-                    let _ = self.builder.ins().brif(
-                        is_record,
-                        record_block,
-                        &args,
-                        failure_block,
-                        &args,
-                    );
-                    self.builder.seal_block(current_block);
-
-                    self.builder.switch_to_block(record_block);
-                    current_block = record_block;
-                    subjects = self.builder.block_params(current_block).to_vec();
-                    current_subject = subjects[subject_index];
-                    head = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        HEADER_SIZE,
-                    );
-                    tail = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        tail_offset,
-                    );
-
-                    let constructor_offset = self.pointer_bytes() as i32;
-                    let ctor_index = self.builder.ins().load(
-                        ir::types::I32,
-                        mem_flags,
-                        head,
-                        constructor_offset,
-                    );
-                    let ctor_index = self.builder.ins().uextend(self.pointer_type, ctor_index);
-                    let expected = self.builder.ins().iconst(
-                        self.pointer_type,
-                        i64::from(info.constructor.constructor_index),
-                    );
-                    let index_matches = self.builder.ins().icmp(IntCC::Equal, ctor_index, expected);
-
-                    let match_block = self.builder.create_block();
-                    for _ in 0..subject_count {
-                        let _ = self
-                            .builder
-                            .append_block_param(match_block, self.pointer_type);
-                    }
-                    let args = subjects.clone();
-                    let _ = self.builder.ins().brif(
-                        index_matches,
-                        match_block,
-                        &args,
-                        failure_block,
-                        &args,
-                    );
-                    self.builder.seal_block(current_block);
-
-                    self.builder.switch_to_block(match_block);
-                    current_block = match_block;
-                    subjects = self.builder.block_params(current_block).to_vec();
-                    current_subject = subjects[subject_index];
-                    head = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        HEADER_SIZE,
-                    );
-                    tail = self.builder.ins().load(
-                        self.pointer_type,
-                        mem_flags,
-                        current_subject,
-                        tail_offset,
-                    );
-                }
-            }
-
             if *capture {
                 if let Some(slot) = storage_slot {
                     let offset = (stored * pointer_bytes) as i32;
-                    let _ = self.builder.ins().stack_store(head, slot, offset);
+                    let _ = self.builder.ins().stack_store(head_value, slot, offset);
                 }
                 stored += 1;
             }
 
             if let Some(info) = constructor_info {
-                if !info.type_.is_bool() {
-                    let field_base = HEADER_SIZE + self.pointer_bytes() as i32;
-                    for (field_index, capture_flag) in info.capture_flags.iter().enumerate() {
-                        if *capture_flag {
-                            let field_offset =
-                                field_base + (field_index as i32) * self.pointer_bytes() as i32;
-                            let field_value = self.builder.ins().load(
-                                self.pointer_type,
-                                mem_flags,
-                                head,
-                                field_offset,
-                            );
-                            if let Some(slot) = storage_slot {
-                                let offset = (stored * pointer_bytes) as i32;
-                                let _ = self.builder.ins().stack_store(field_value, slot, offset);
-                            }
-                            stored += 1;
+                let mut extras_iter = constructor_extras.into_iter();
+                for capture_flag in &info.capture_flags {
+                    if *capture_flag {
+                        let Some(value) = extras_iter.next() else {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "missing constructor capture value in native list pattern lowering"
+                                        .into(),
+                            });
+                        };
+                        if let Some(slot) = storage_slot {
+                            let offset = (stored * pointer_bytes) as i32;
+                            let _ = self.builder.ins().stack_store(value, slot, offset);
                         }
+                        stored += 1;
                     }
                 }
             }
