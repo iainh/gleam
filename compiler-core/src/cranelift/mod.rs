@@ -13,7 +13,7 @@ use crate::{
     build::Module as GleamModule,
     io::FileSystemWriter,
     line_numbers::LineNumbers,
-    type_::{PatternConstructor, Type, ValueConstructorVariant},
+    type_::{ModuleValueConstructor, PatternConstructor, Type, ValueConstructorVariant},
 };
 use camino::Utf8Path;
 use cranelift_codegen::{
@@ -384,6 +384,12 @@ fn lower_expression(
         TypedExpr::Fn {
             arguments, body, ..
         } => lower_function_literal(module, arguments, body, ctx),
+
+        TypedExpr::ModuleSelect {
+            constructor: ModuleValueConstructor::Record { variant_index, .. },
+            module_name,
+            ..
+        } => ctx.zero_arity_record_constant(module, module_name, *variant_index),
 
         TypedExpr::BinOp {
             name, left, right, ..
