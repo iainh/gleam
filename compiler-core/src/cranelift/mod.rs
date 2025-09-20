@@ -7,7 +7,7 @@
 use crate::{
     Result,
     ast::{
-        ClauseGuard, Constant, Function, Pattern, Publicity, Statement, TypedClauseGuard,
+        ClauseGuard, Constant, Function, Pattern, Publicity, Statement, TypedArg, TypedClauseGuard,
         TypedConstant, TypedDefinition, TypedExpr, TypedStatement,
     },
     build::Module as GleamModule,
@@ -29,7 +29,11 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use ecow::EcoString;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::{collections::HashMap, convert::TryFrom, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::TryFrom,
+    sync::Arc,
+};
 use tracing::instrument;
 
 #[derive(Debug)]
@@ -150,6 +154,7 @@ fn lower_module_functions(
 
     let function_ids = declare_module_functions(module, &config.module.name, &functions)?;
     let mut zero_arity_records = HashMap::new();
+    let mut closure_counter = 0usize;
 
     for function in functions {
         let Some((_, name)) = &function.name else {
@@ -167,6 +172,7 @@ fn lower_module_functions(
             func_id,
             &function_ids,
             &mut zero_arity_records,
+            &mut closure_counter,
         )?;
     }
 
@@ -181,6 +187,7 @@ fn lower_function(
     func_id: FuncId,
     functions: &FunctionIdMap,
     zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    closure_counter: &mut usize,
 ) -> Result<()> {
     let pointer_type = module.target_config().pointer_type();
     let pointer_bytes = module.target_config().pointer_bytes();
@@ -213,6 +220,7 @@ fn lower_function(
             functions,
             module_name,
             zero_arity_records,
+            closure_counter,
         );
 
         for (value, arg) in block_params.iter().zip(function.arguments.iter()) {
@@ -372,6 +380,10 @@ fn lower_expression(
             Ok(results[0])
         }
 
+        TypedExpr::Fn {
+            arguments, body, ..
+        } => lower_function_literal(module, arguments, body, ctx),
+
         TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
 
         TypedExpr::Case {
@@ -484,9 +496,40 @@ fn lower_call(
         return Ok(value);
     }
 
-    Err(crate::Error::NativeCodegen {
-        message: format!("unsupported call in native main: {fun:?}"),
-    })
+    let fun_value = lower_expression(module, fun, ctx)?;
+    let pointer_bytes = ctx.pointer_bytes();
+    let mut argument_values = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        argument_values.push(lower_expression(module, &argument.value, ctx)?);
+    }
+
+    let args_ptr = if argument_values.is_empty() {
+        ctx.builder.ins().iconst(ctx.pointer_type, 0)
+    } else {
+        let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (argument_values.len() * pointer_bytes) as u32,
+        ));
+        for (index, value) in argument_values.iter().enumerate() {
+            let offset = (index * pointer_bytes) as i32;
+            let _ = ctx.builder.ins().stack_store(*value, slot, offset);
+        }
+        ctx.builder.ins().stack_addr(ctx.pointer_type, slot, 0)
+    };
+
+    let arg_count = ctx
+        .builder
+        .ins()
+        .iconst(ctx.pointer_type, arguments.len() as i64);
+
+    let apply_func = ctx.declare_runtime_apply_closure(module)?;
+    let apply_ref = module.declare_func_in_func(apply_func, &mut ctx.builder.func);
+    let call = ctx
+        .builder
+        .ins()
+        .call(apply_ref, &[fun_value, args_ptr, arg_count]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
 }
 
 fn try_lower_defined_function(
@@ -749,12 +792,167 @@ fn lower_case(
     Ok(result)
 }
 
+fn lower_closure_function(
+    module: &mut ObjectModule,
+    pointer_type: ir::Type,
+    pointer_bytes: usize,
+    functions: &FunctionIdMap,
+    module_name: &EcoString,
+    zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    closure_counter: &mut usize,
+    closure_id: usize,
+    capture_names: &[EcoString],
+    arguments: &[TypedArg],
+    body: &[TypedStatement],
+) -> Result<FuncId> {
+    let mut signature = module.make_signature();
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.returns.push(ir::AbiParam::new(pointer_type));
+
+    let symbol = format!("{}$closure_{}", module_name.replace("/", "$"), closure_id);
+
+    let func_id = module
+        .declare_function(&symbol, Linkage::Local, &signature)
+        .map_err(|err| crate::Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = signature;
+
+    let mut func_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+
+    let env_ptr = builder.block_params(block)[0];
+    let args_ptr = builder.block_params(block)[1];
+    let _arg_count = builder.block_params(block)[2];
+
+    {
+        let mut lowering = LoweringContext::new(
+            &mut builder,
+            pointer_type,
+            pointer_bytes as u8,
+            functions,
+            module_name,
+            zero_arity_records,
+            closure_counter,
+        );
+
+        let mem_flags = MemFlags::trusted();
+
+        for (index, name) in capture_names.iter().enumerate() {
+            let offset = (index * pointer_bytes) as i32;
+            let value = lowering
+                .builder
+                .ins()
+                .load(pointer_type, mem_flags, env_ptr, offset);
+            lowering.define(name, value);
+        }
+
+        for (index, argument) in arguments.iter().enumerate() {
+            let offset = (index * pointer_bytes) as i32;
+            let value = lowering
+                .builder
+                .ins()
+                .load(pointer_type, mem_flags, args_ptr, offset);
+            if let Some(name) = argument.get_variable_name() {
+                lowering.define(name, value);
+            }
+        }
+
+        let value = lower_block(module, body, &mut lowering)?;
+        let _ = lowering.builder.ins().return_(&[value]);
+    }
+
+    builder.finalize();
+
+    module
+        .define_function(func_id, &mut ctx)
+        .map_err(|err| crate::Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+    module.clear_context(&mut ctx);
+
+    Ok(func_id)
+}
+
+fn lower_function_literal(
+    module: &mut ObjectModule,
+    arguments: &[TypedArg],
+    body: &[TypedStatement],
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Value> {
+    let captures = ctx.capture_environment_values();
+    let capture_names: Vec<EcoString> = captures.iter().map(|(name, _)| name.clone()).collect();
+    let closure_id = ctx.next_closure_id();
+
+    let pointer_type = ctx.pointer_type;
+    let pointer_bytes = ctx.pointer_bytes();
+    let module_name = ctx.module_name.clone();
+    let functions = ctx.functions;
+    let closure_func_id = {
+        let zero_arity_records = &mut *ctx.zero_arity_records;
+        let closure_counter_ref = &mut *ctx.closure_counter;
+        lower_closure_function(
+            module,
+            pointer_type,
+            pointer_bytes,
+            functions,
+            &module_name,
+            zero_arity_records,
+            closure_counter_ref,
+            closure_id,
+            &capture_names,
+            arguments,
+            body,
+        )?
+    };
+
+    let func_ref = module.declare_func_in_func(closure_func_id, &mut ctx.builder.func);
+    let code_ptr = ctx.builder.ins().func_addr(ctx.pointer_type, func_ref);
+
+    let env_ptr = if captures.is_empty() {
+        ctx.builder.ins().iconst(ctx.pointer_type, 0)
+    } else {
+        let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (captures.len() * pointer_bytes) as u32,
+        ));
+        for (index, (_, value)) in captures.iter().enumerate() {
+            let offset = (index * pointer_bytes) as i32;
+            let _ = ctx.builder.ins().stack_store(*value, slot, offset);
+        }
+        ctx.builder.ins().stack_addr(ctx.pointer_type, slot, 0)
+    };
+
+    let env_len = ctx
+        .builder
+        .ins()
+        .iconst(ctx.pointer_type, captures.len() as i64);
+
+    let alloc_func = ctx.declare_runtime_alloc_closure(module)?;
+    let alloc_ref = module.declare_func_in_func(alloc_func, &mut ctx.builder.func);
+    let call = ctx
+        .builder
+        .ins()
+        .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
+}
+
 struct LoweringContext<'a, 'b, 'c> {
     builder: &'a mut FunctionBuilder<'b>,
     pointer_type: ir::Type,
     scopes: Vec<HashMap<EcoString, Value>>,
     string_data: HashMap<EcoString, DataId>,
     zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
+    closure_counter: &'c mut usize,
     runtime_nil: Option<FuncId>,
     runtime_alloc_tuple: Option<FuncId>,
     runtime_binary_from_slice: Option<FuncId>,
@@ -764,6 +962,8 @@ struct LoweringContext<'a, 'b, 'c> {
     runtime_println_error: Option<FuncId>,
     runtime_bool_true: Option<FuncId>,
     runtime_bool_false: Option<FuncId>,
+    runtime_alloc_closure: Option<FuncId>,
+    runtime_apply_closure: Option<FuncId>,
     runtime_gleeunit_main: Option<FuncId>,
     runtime_gleeunit_do_main: Option<FuncId>,
     pointer_bytes: u8,
@@ -779,6 +979,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         functions: &'a FunctionIdMap,
         module_name: &'a EcoString,
         zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
+        closure_counter: &'c mut usize,
     ) -> Self {
         Self {
             builder,
@@ -786,6 +987,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             scopes: vec![HashMap::new()],
             string_data: HashMap::new(),
             zero_arity_records,
+            closure_counter,
             runtime_nil: None,
             runtime_alloc_tuple: None,
             runtime_binary_from_slice: None,
@@ -795,6 +997,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println_error: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
+            runtime_alloc_closure: None,
+            runtime_apply_closure: None,
             runtime_gleeunit_main: None,
             runtime_gleeunit_do_main: None,
             pointer_bytes,
@@ -819,6 +1023,22 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
     fn lookup(&self, name: &EcoString) -> Option<&Value> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn capture_environment_values(&self) -> Vec<(EcoString, Value)> {
+        let mut map = BTreeMap::new();
+        for scope in self.scopes.iter().rev() {
+            for (name, value) in scope {
+                let _ = map.entry(name.clone()).or_insert(*value);
+            }
+        }
+        map.into_iter().collect()
+    }
+
+    fn next_closure_id(&mut self) -> usize {
+        let id = *self.closure_counter;
+        *self.closure_counter += 1;
+        id
     }
 
     fn try_call_function(
@@ -1031,6 +1251,46 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_bool_false = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_alloc_closure(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_alloc_closure {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_alloc_closure", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_alloc_closure = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_apply_closure(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_apply_closure {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_apply_closure", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_apply_closure = Some(id);
         Ok(id)
     }
 

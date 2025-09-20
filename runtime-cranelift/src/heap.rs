@@ -4,7 +4,10 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::gc;
 use crate::header::{Header, Tag};
-use crate::layout::{Binary, BinaryData, BinarySlice, BitArray, ConsCell, FloatBox, Map, MapTable};
+use crate::layout::{
+    Binary, BinaryData, BinarySlice, BitArray, Closure, ClosureFn, ConsCell, FloatBox, Map,
+    MapTable,
+};
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +187,26 @@ impl Heap {
         unsafe {
             let map = ptr.cast::<Map>().as_ptr();
             (*map).table = table.as_ptr();
+        }
+        Ok(Value::from_raw(ptr.as_ptr() as u64))
+    }
+
+    pub fn alloc_closure(
+        &self,
+        code_ptr: ClosureFn,
+        env_ptr: *const Value,
+        env_len: usize,
+    ) -> Result<Value, AllocationError> {
+        let header = Closure::header_for_env(env_len as u16);
+        let ptr = self.allocate_box(header)?;
+        unsafe {
+            let closure = ptr.cast::<Closure>().as_ptr();
+            (*closure).code_ptr = code_ptr;
+            (*closure).env_size = env_len;
+            if env_len > 0 {
+                let dst = (*closure).env.as_ptr() as *mut Value;
+                std::ptr::copy_nonoverlapping(env_ptr, dst, env_len);
+            }
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }

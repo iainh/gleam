@@ -9,18 +9,18 @@ use std::{
 };
 
 use crate::{
+    Header, Heap, Tag, Value,
     atom::AtomTable,
     binary, gc,
     heap::AllocationError,
     layout::{
-        Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ConsCell, FloatBox,
-        Map, MapEntry, MapTable,
+        Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ClosureFn, ConsCell,
+        FloatBox, Map, MapEntry, MapTable,
     },
-    Header, Heap, Tag, Value,
 };
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
@@ -74,6 +74,31 @@ pub extern "C" fn gleam_bool_true() -> u64 {
 #[no_mangle]
 pub extern "C" fn gleam_bool_false() -> u64 {
     Value::from_bool(false).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_alloc_closure(code_ptr: u64, env_ptr: *const u64, env_len: usize) -> u64 {
+    let code = unsafe { std::mem::transmute::<usize, ClosureFn>(code_ptr as usize) };
+    let env_values = env_ptr as *const Value;
+    let heap = Heap::new();
+    let value = unwrap_allocation(heap.alloc_closure(code, env_values, env_len), "closure");
+    value.to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_apply_closure(closure_raw: u64, args_ptr: *const u64, argc: usize) -> u64 {
+    let closure_value = Value::from_raw(closure_raw);
+    let closure_ptr = closure_value
+        .as_boxed::<Closure>()
+        .expect("closure value must be boxed");
+
+    unsafe {
+        let closure = closure_ptr.as_ref();
+        let env_ptr = closure.env.as_ptr();
+        let args = args_ptr as *const Value;
+        let result = (closure.code_ptr)(env_ptr, args, argc);
+        result.to_raw()
+    }
 }
 
 #[no_mangle]
@@ -427,7 +452,8 @@ fn call_function(function: Value, args: &[Value]) -> Value {
     unsafe {
         let closure = closure_ptr.as_ptr();
         let func = (*closure).code_ptr;
-        func(closure, args.as_ptr(), args.len())
+        let env_ptr = (*closure).env.as_ptr();
+        func(env_ptr, args.as_ptr(), args.len())
     }
 }
 
@@ -937,7 +963,7 @@ pub extern "C" fn power(base_raw: u64, exponent_raw: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn random_uniform() -> u64 {
     let mut rng = rand::thread_rng();
-    let value: f64 = rng.gen();
+    let value: f64 = rng.r#gen::<f64>();
     float_to_value(value).to_raw()
 }
 

@@ -122,7 +122,7 @@ impl Record {
     }
 }
 
-pub type ClosureFn = unsafe extern "C" fn(*const Closure, *const Value, usize) -> Value;
+pub type ClosureFn = unsafe extern "C" fn(*const Value, *const Value, usize) -> Value;
 
 #[repr(C)]
 #[derive(Debug)]
