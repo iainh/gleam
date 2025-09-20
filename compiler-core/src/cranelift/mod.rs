@@ -89,13 +89,31 @@ const VALUE_TAG_MASK: i64 = 0b11;
 const HEADER_FIELD_MASK: i64 = 0xFFFF;
 const HEADER_ARITY_SHIFT: i64 = 16;
 const HEADER_SIZE: i32 = 8;
+const TAG_FLOAT: u64 = 1;
+const TAG_LIST: i64 = 4;
 const TAG_RECORD: i64 = 6;
 const TAG_BOOLEAN: i64 = 12;
 const BOOLEAN_FALSE_ARITY: i64 = 0;
 const BOOLEAN_TRUE_ARITY: i64 = 1;
+const FLOAT_HEADER: u64 = (1u64 << 32) | TAG_FLOAT;
 
 fn function_symbol_name(module: &str, name: &EcoString, arity: usize) -> String {
     format!("gleam${}_{}__{}", module.replace('/', "$"), name, arity)
+}
+
+fn record_constructor_symbol(
+    current_module: &EcoString,
+    constructor_module: &EcoString,
+    variant_index: u16,
+    arity: u16,
+) -> String {
+    format!(
+        "gleam${}_record_ctor_{}__{}_{}",
+        current_module.replace("/", "$"),
+        constructor_module.replace("/", "$"),
+        variant_index,
+        arity
+    )
 }
 
 fn collect_module_functions(
@@ -156,6 +174,9 @@ fn lower_module_functions(
 
     let function_ids = declare_module_functions(module, &config.module.name, &functions)?;
     let mut zero_arity_records = HashMap::new();
+    let mut float_constants = HashMap::new();
+    let mut record_constructors = HashMap::new();
+    let mut module_functions = HashMap::new();
     let mut closure_counter = 0usize;
 
     for function in functions {
@@ -174,6 +195,9 @@ fn lower_module_functions(
             func_id,
             &function_ids,
             &mut zero_arity_records,
+            &mut float_constants,
+            &mut record_constructors,
+            &mut module_functions,
             &mut closure_counter,
         )?;
     }
@@ -189,6 +213,9 @@ fn lower_function(
     func_id: FuncId,
     functions: &FunctionIdMap,
     zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    float_constants: &mut HashMap<EcoString, DataId>,
+    record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
+    module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
     closure_counter: &mut usize,
 ) -> Result<()> {
     let pointer_type = module.target_config().pointer_type();
@@ -222,6 +249,9 @@ fn lower_function(
             functions,
             module_name,
             zero_arity_records,
+            float_constants,
+            record_constructors,
+            module_functions,
             closure_counter,
         );
 
@@ -288,6 +318,8 @@ fn lower_expression(
             Ok(ctx.builder.ins().iconst(ir::types::I64, encoded))
         }
 
+        TypedExpr::Float { value, .. } => ctx.float_constant(module, value),
+
         TypedExpr::String { value, .. } => {
             let data_ptr = ctx.string_constant(module, value.as_str())?;
             let len =
@@ -327,11 +359,7 @@ fn lower_expression(
                 } else if *arity == 0 {
                     ctx.zero_arity_record_constant(module, ctor_module, *variant_index)
                 } else {
-                    Err(crate::Error::NativeCodegen {
-                        message: format!(
-                            "constructor functions are not yet supported in native functions: `{name}`"
-                        ),
-                    })
+                    ctx.record_constructor_value(module, ctor_module, *variant_index, *arity)
                 }
             }
             ValueConstructorVariant::LocalVariable { .. } => {
@@ -350,6 +378,15 @@ fn lower_expression(
         },
 
         TypedExpr::Block { statements, .. } => lower_block(module, statements.as_slice(), ctx),
+
+        TypedExpr::NegateInt { value, .. } => {
+            let inner = lower_expression(module, value, ctx)?;
+            let func_id = ctx.declare_runtime_int_negate(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[inner]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
+        }
 
         TypedExpr::Tuple { elements, .. } => {
             if elements.is_empty() {
@@ -381,16 +418,65 @@ fn lower_expression(
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
         }
+        TypedExpr::List { elements, tail, .. } => {
+            let mut values = Vec::with_capacity(elements.len());
+            for element in elements {
+                values.push(lower_expression(module, element, ctx)?);
+            }
+
+            let mut current = if let Some(tail_expr) = tail {
+                lower_expression(module, tail_expr, ctx)?
+            } else {
+                let func_id = ctx.declare_runtime_nil(module)?;
+                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                let call = ctx.builder.ins().call(func_ref, &[]);
+                let results = ctx.builder.inst_results(call);
+                results[0]
+            };
+
+            if !values.is_empty() {
+                let func_id = ctx.declare_runtime_list_cons(module)?;
+                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                for value in values.into_iter().rev() {
+                    let call = ctx.builder.ins().call(func_ref, &[value, current]);
+                    let results = ctx.builder.inst_results(call);
+                    current = results[0];
+                }
+            }
+            Ok(current)
+        }
 
         TypedExpr::Fn {
             arguments, body, ..
         } => lower_function_literal(module, arguments, body, ctx),
 
         TypedExpr::ModuleSelect {
-            constructor: ModuleValueConstructor::Record { variant_index, .. },
+            constructor,
             module_name,
+            type_,
             ..
-        } => ctx.zero_arity_record_constant(module, module_name, *variant_index),
+        } => match constructor {
+            ModuleValueConstructor::Record { variant_index, .. } => {
+                ctx.zero_arity_record_constant(module, module_name, *variant_index)
+            }
+            ModuleValueConstructor::Fn {
+                module: function_module,
+                name,
+                ..
+            } => {
+                let arity = type_
+                    .fn_arity()
+                    .ok_or_else(|| crate::Error::NativeCodegen {
+                        message: format!(
+                            "unable to determine arity for module function `{function_module}.{name}`"
+                        ),
+                    })?;
+                ctx.module_function_value(module, function_module, name, arity)
+            }
+            ModuleValueConstructor::Constant { .. } => Err(crate::Error::NativeCodegen {
+                message: "module constants are not yet supported in native functions".into(),
+            }),
+        },
 
         TypedExpr::BinOp {
             name, left, right, ..
@@ -672,6 +758,12 @@ fn lower_case(
 
     let mut fallthrough = Some(fallthrough_block);
 
+    #[derive(Clone, Copy)]
+    enum BindingSource {
+        Subject(usize),
+        Value(Value),
+    }
+
     for (index, clause) in clauses.iter().enumerate() {
         let Some(current_block) = fallthrough else {
             break;
@@ -682,19 +774,40 @@ fn lower_case(
 
         let mut pattern_block = current_block;
         let mut pattern_subjects = ctx.builder.block_params(current_block).to_vec();
-        let mut bindings: Vec<(EcoString, usize)> = Vec::new();
+        let mut bindings: Vec<(EcoString, BindingSource)> = Vec::new();
 
         for (subject_index, pattern) in clause.pattern.iter().enumerate() {
             match pattern {
                 Pattern::Discard { .. } => {}
                 Pattern::Variable { name, .. } => {
-                    bindings.push((name.clone(), subject_index));
+                    bindings.push((name.clone(), BindingSource::Subject(subject_index)));
                 }
                 Pattern::Int { int_value, .. } => {
                     let (block, params) = ctx.branch_on_int_pattern(
                         pattern_block,
                         pattern_subjects[subject_index],
                         int_value,
+                        next_block,
+                        &pattern_subjects,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+                }
+                Pattern::Float { value, .. } => {
+                    let cleaned = value.replace("_", "");
+                    let float_value =
+                        cleaned
+                            .parse::<f64>()
+                            .map_err(|_| crate::Error::NativeCodegen {
+                                message: format!(
+                                    "invalid float literal `{value}` in native pattern"
+                                ),
+                            })?;
+                    let (block, params) = ctx.branch_on_float_pattern(
+                        pattern_block,
+                        pattern_subjects[subject_index],
+                        float_value,
                         next_block,
                         &pattern_subjects,
                         subject_count,
@@ -741,6 +854,84 @@ fn lower_case(
                     pattern_block = block;
                     pattern_subjects = params;
                 }
+                Pattern::List { elements, tail, .. } => {
+                    let mut capture_heads = Vec::with_capacity(elements.len());
+                    let mut head_names = Vec::with_capacity(elements.len());
+                    for element in elements {
+                        match element {
+                            Pattern::Variable { name, .. } => {
+                                capture_heads.push(true);
+                                head_names.push(Some(name.clone()));
+                            }
+                            Pattern::Discard { .. } => {
+                                capture_heads.push(false);
+                                head_names.push(None);
+                            }
+                            other => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: format!(
+                                        "list pattern element `{other:?}` is not yet supported in native functions"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
+                    let (capture_tail, tail_name) = match tail.as_deref() {
+                        None => (false, None),
+                        Some(Pattern::Variable { name, .. }) => (true, Some(name.clone())),
+                        Some(Pattern::Discard { .. }) => (false, None),
+                        Some(other) => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "list tail pattern `{other:?}` is not yet supported in native functions"
+                                ),
+                            });
+                        }
+                    };
+
+                    let (block, params, extras) = ctx.branch_on_list_pattern(
+                        module,
+                        pattern_block,
+                        subject_index,
+                        &capture_heads,
+                        capture_tail,
+                        tail.is_none(),
+                        next_block,
+                        &pattern_subjects,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+
+                    let mut extra_iter = extras.into_iter();
+                    for (capture, name) in capture_heads.iter().zip(head_names.iter()) {
+                        if *capture {
+                            let Some(value) = extra_iter.next() else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "missing captured list head value in native case lowering"
+                                            .into(),
+                                });
+                            };
+                            if let Some(name) = name {
+                                bindings.push((name.clone(), BindingSource::Value(value)));
+                            }
+                        }
+                    }
+                    if capture_tail {
+                        if let Some(name) = tail_name {
+                            let Some(value) = extra_iter.next() else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "missing captured list tail value in native case lowering"
+                                            .into(),
+                                });
+                            };
+                            bindings.push((name, BindingSource::Value(value)));
+                        }
+                    }
+                }
                 other => {
                     return Err(crate::Error::NativeCodegen {
                         message: format!(
@@ -756,15 +947,25 @@ fn lower_case(
 
         if let Some(guard) = &clause.guard {
             ctx.push_scope();
-            for (name, index) in &bindings {
-                ctx.define(name, final_subjects[*index]);
+            for (name, source) in &bindings {
+                let value = match source {
+                    BindingSource::Subject(index) => final_subjects[*index],
+                    BindingSource::Value(value) => *value,
+                };
+                ctx.define(name, value);
             }
             let guard_condition = ctx.lower_clause_guard_condition(module, guard)?;
             ctx.pop_scope();
 
-            let guard_success_block = ctx.create_subject_block(subject_count);
-            let success_args = final_subjects.clone();
-            let failure_args = final_subjects.clone();
+            let guard_inputs = final_subjects.clone();
+            let guard_success_block = ctx.builder.create_block();
+            for _ in 0..guard_inputs.len() {
+                let _ = ctx
+                    .builder
+                    .append_block_param(guard_success_block, ctx.pointer_type);
+            }
+            let success_args = guard_inputs.clone();
+            let failure_args = pattern_subjects.clone();
             let _ = ctx.builder.ins().brif(
                 guard_condition,
                 guard_success_block,
@@ -775,7 +976,21 @@ fn lower_case(
             ctx.builder.seal_block(pattern_block);
 
             pattern_block = guard_success_block;
-            pattern_subjects = ctx.builder.block_params(pattern_block).to_vec();
+            let guard_params = ctx.builder.block_params(pattern_block).to_vec();
+
+            for (_, source) in &mut bindings {
+                if let BindingSource::Value(value) = source {
+                    let Some(position) = guard_inputs.iter().position(|input| input == value)
+                    else {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "missing captured value in native guard lowering".into(),
+                        });
+                    };
+                    *value = guard_params[position];
+                }
+            }
+
+            pattern_subjects = guard_params[..subject_count].to_vec();
             final_subjects = pattern_subjects.clone();
 
             ctx.builder.switch_to_block(pattern_block);
@@ -784,8 +999,12 @@ fn lower_case(
         }
 
         ctx.push_scope();
-        for (name, index) in &bindings {
-            ctx.define(name, final_subjects[*index]);
+        for (name, source) in &bindings {
+            let value = match source {
+                BindingSource::Subject(index) => final_subjects[*index],
+                BindingSource::Value(value) => *value,
+            };
+            ctx.define(name, value);
         }
         let value = lower_expression(module, &clause.then, ctx)?;
         ctx.pop_scope();
@@ -870,6 +1089,84 @@ fn lower_bin_op(
             let condition = ctx.builder.ins().icmp(cmp, left_value, right_value);
             ctx.bool_from_condition(module, condition)
         }
+        BinOp::And | BinOp::Or => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let true_value = ctx.bool_constant(module, true)?;
+            let false_value = ctx.bool_constant(module, false)?;
+            let condition = ctx.builder.ins().icmp(IntCC::Equal, left_value, true_value);
+
+            let exit_block = ctx.builder.create_block();
+            let _ = ctx.builder.append_block_param(exit_block, ctx.pointer_type);
+            let right_block = ctx.builder.create_block();
+
+            match op {
+                BinOp::And => {
+                    let _ = ctx.builder.ins().brif(
+                        condition,
+                        right_block,
+                        &[],
+                        exit_block,
+                        &[false_value],
+                    );
+                }
+                BinOp::Or => {
+                    let _ = ctx.builder.ins().brif(
+                        condition,
+                        exit_block,
+                        &[true_value],
+                        right_block,
+                        &[],
+                    );
+                }
+                _ => unreachable!(),
+            }
+            ctx.builder.switch_to_block(right_block);
+            let right_value = lower_expression(module, right, ctx)?;
+            let _ = ctx.builder.ins().jump(exit_block, &[right_value]);
+            ctx.builder.seal_block(right_block);
+
+            ctx.builder.switch_to_block(exit_block);
+            ctx.builder.seal_block(exit_block);
+            let result = ctx.builder.block_params(exit_block)[0];
+            Ok(result)
+        }
+        BinOp::AddFloat | BinOp::SubFloat | BinOp::MultFloat | BinOp::DivFloat => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+            let left_float = ctx.load_float(left_value);
+            let right_float = ctx.load_float(right_value);
+            let result = match op {
+                BinOp::AddFloat => ctx.builder.ins().fadd(left_float, right_float),
+                BinOp::SubFloat => ctx.builder.ins().fsub(left_float, right_float),
+                BinOp::MultFloat => ctx.builder.ins().fmul(left_float, right_float),
+                BinOp::DivFloat => ctx.builder.ins().fdiv(left_float, right_float),
+                _ => unreachable!(),
+            };
+            let func_id = ctx.declare_runtime_float_from_f64(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[result]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
+        }
+        BinOp::AddInt | BinOp::SubInt | BinOp::MultInt | BinOp::DivInt | BinOp::RemainderInt => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+
+            let left_int = ctx.builder.ins().sshr_imm(left_value, 2);
+            let right_int = ctx.builder.ins().sshr_imm(right_value, 2);
+            let raw_result = match op {
+                BinOp::AddInt => ctx.builder.ins().iadd(left_int, right_int),
+                BinOp::SubInt => ctx.builder.ins().isub(left_int, right_int),
+                BinOp::MultInt => ctx.builder.ins().imul(left_int, right_int),
+                BinOp::DivInt => ctx.builder.ins().sdiv(left_int, right_int),
+                BinOp::RemainderInt => ctx.builder.ins().srem(left_int, right_int),
+                _ => unreachable!(),
+            };
+            let shifted = ctx.builder.ins().ishl_imm(raw_result, 2);
+            let tag = ctx.builder.ins().iconst(ctx.pointer_type, 1);
+            let result = ctx.builder.ins().bor(shifted, tag);
+            Ok(result)
+        }
         _ => Err(crate::Error::NativeCodegen {
             message: format!("binary operator `{op:?}` is not yet supported in native main"),
         }),
@@ -930,6 +1227,9 @@ fn lower_closure_function(
     functions: &FunctionIdMap,
     module_name: &EcoString,
     zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    float_constants: &mut HashMap<EcoString, DataId>,
+    record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
+    module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
     closure_counter: &mut usize,
     closure_id: usize,
     capture_names: &[EcoString],
@@ -972,6 +1272,9 @@ fn lower_closure_function(
             functions,
             module_name,
             zero_arity_records,
+            float_constants,
+            record_constructors,
+            module_functions,
             closure_counter,
         );
 
@@ -1013,6 +1316,58 @@ fn lower_closure_function(
     Ok(func_id)
 }
 
+fn lower_record_constructor_function(
+    module: &mut ObjectModule,
+    pointer_type: ir::Type,
+    module_name: &EcoString,
+    constructor_module: &EcoString,
+    variant_index: u16,
+    arity: u16,
+    alloc_record: FuncId,
+) -> Result<FuncId> {
+    let mut signature = module.make_signature();
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.params.push(ir::AbiParam::new(pointer_type));
+    signature.returns.push(ir::AbiParam::new(pointer_type));
+
+    let symbol = record_constructor_symbol(module_name, constructor_module, variant_index, arity);
+    let func_id = module
+        .declare_function(&symbol, Linkage::Local, &signature)
+        .map_err(|err| crate::Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = signature;
+
+    let mut func_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+
+    let args_ptr = builder.block_params(block)[1];
+    let argc = builder.block_params(block)[2];
+
+    let ctor_index = builder.ins().iconst(pointer_type, i64::from(variant_index));
+    let alloc_ref = module.declare_func_in_func(alloc_record, &mut builder.func);
+    let call = builder.ins().call(alloc_ref, &[ctor_index, args_ptr, argc]);
+    let result = builder.inst_results(call)[0];
+    let _ = builder.ins().return_(&[result]);
+
+    builder.finalize();
+
+    module
+        .define_function(func_id, &mut ctx)
+        .map_err(|err| crate::Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+    module.clear_context(&mut ctx);
+    Ok(func_id)
+}
+
 fn lower_function_literal(
     module: &mut ObjectModule,
     arguments: &[TypedArg],
@@ -1029,6 +1384,9 @@ fn lower_function_literal(
     let functions = ctx.functions;
     let closure_func_id = {
         let zero_arity_records = &mut *ctx.zero_arity_records;
+        let float_constants = &mut *ctx.float_constants;
+        let record_constructors = &mut *ctx.record_constructors;
+        let module_functions_ref = &mut *ctx.module_functions;
         let closure_counter_ref = &mut *ctx.closure_counter;
         lower_closure_function(
             module,
@@ -1037,6 +1395,9 @@ fn lower_function_literal(
             functions,
             &module_name,
             zero_arity_records,
+            float_constants,
+            record_constructors,
+            module_functions_ref,
             closure_counter_ref,
             closure_id,
             &capture_names,
@@ -1082,7 +1443,10 @@ struct LoweringContext<'a, 'b, 'c> {
     pointer_type: ir::Type,
     scopes: Vec<HashMap<EcoString, Value>>,
     string_data: HashMap<EcoString, DataId>,
+    float_constants: &'c mut HashMap<EcoString, DataId>,
     zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
+    record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
+    module_functions: &'c mut HashMap<(EcoString, EcoString, usize), FuncId>,
     closure_counter: &'c mut usize,
     runtime_nil: Option<FuncId>,
     runtime_alloc_tuple: Option<FuncId>,
@@ -1093,8 +1457,12 @@ struct LoweringContext<'a, 'b, 'c> {
     runtime_println_error: Option<FuncId>,
     runtime_bool_true: Option<FuncId>,
     runtime_bool_false: Option<FuncId>,
+    runtime_list_cons: Option<FuncId>,
+    runtime_int_negate: Option<FuncId>,
+    runtime_float_from_f64: Option<FuncId>,
     runtime_alloc_closure: Option<FuncId>,
     runtime_apply_closure: Option<FuncId>,
+    runtime_alloc_record: Option<FuncId>,
     runtime_gleeunit_main: Option<FuncId>,
     runtime_gleeunit_do_main: Option<FuncId>,
     pointer_bytes: u8,
@@ -1110,6 +1478,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         functions: &'a FunctionIdMap,
         module_name: &'a EcoString,
         zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
+        float_constants: &'c mut HashMap<EcoString, DataId>,
+        record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
+        module_functions: &'c mut HashMap<(EcoString, EcoString, usize), FuncId>,
         closure_counter: &'c mut usize,
     ) -> Self {
         Self {
@@ -1117,7 +1488,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             pointer_type,
             scopes: vec![HashMap::new()],
             string_data: HashMap::new(),
+            float_constants,
             zero_arity_records,
+            record_constructors,
+            module_functions,
             closure_counter,
             runtime_nil: None,
             runtime_alloc_tuple: None,
@@ -1128,8 +1502,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println_error: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
+            runtime_list_cons: None,
+            runtime_int_negate: None,
+            runtime_float_from_f64: None,
             runtime_alloc_closure: None,
             runtime_apply_closure: None,
+            runtime_alloc_record: None,
             runtime_gleeunit_main: None,
             runtime_gleeunit_do_main: None,
             pointer_bytes,
@@ -1193,6 +1571,109 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(result)
     }
 
+    fn ensure_record_constructor_function(
+        &mut self,
+        module: &mut ObjectModule,
+        constructor_module: &EcoString,
+        variant_index: u16,
+        arity: u16,
+    ) -> Result<FuncId> {
+        let key = (constructor_module.clone(), variant_index, arity);
+        if let Some(id) = self.record_constructors.get(&key) {
+            return Ok(*id);
+        }
+
+        let alloc_record = self.declare_runtime_alloc_record(module)?;
+        let func_id = lower_record_constructor_function(
+            module,
+            self.pointer_type,
+            self.module_name,
+            constructor_module,
+            variant_index,
+            arity,
+            alloc_record,
+        )?;
+        let _ = self.record_constructors.insert(key, func_id);
+        Ok(func_id)
+    }
+
+    fn record_constructor_value(
+        &mut self,
+        module: &mut ObjectModule,
+        constructor_module: &EcoString,
+        variant_index: u16,
+        arity: u16,
+    ) -> Result<Value> {
+        let func_id = self.ensure_record_constructor_function(
+            module,
+            constructor_module,
+            variant_index,
+            arity,
+        )?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let code_ptr = self.builder.ins().func_addr(self.pointer_type, func_ref);
+        let env_ptr = self.builder.ins().iconst(self.pointer_type, 0);
+        let env_len = self.builder.ins().iconst(self.pointer_type, 0);
+        let alloc_func = self.declare_runtime_alloc_closure(module)?;
+        let alloc_ref = module.declare_func_in_func(alloc_func, &mut self.builder.func);
+        let call = self
+            .builder
+            .ins()
+            .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
+        let results = self.builder.inst_results(call);
+        Ok(results[0])
+    }
+
+    fn ensure_module_function(
+        &mut self,
+        module: &mut ObjectModule,
+        function_module: &EcoString,
+        function_name: &EcoString,
+        arity: usize,
+    ) -> Result<FuncId> {
+        let key = (function_module.clone(), function_name.clone(), arity);
+        if let Some(id) = self.module_functions.get(&key) {
+            return Ok(*id);
+        }
+
+        let symbol = function_symbol_name(function_module, function_name, arity);
+        let mut signature = module.make_signature();
+        for _ in 0..arity {
+            signature.params.push(ir::AbiParam::new(self.pointer_type));
+        }
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function(&symbol, Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        let _ = self.module_functions.insert(key, id);
+        Ok(id)
+    }
+
+    fn module_function_value(
+        &mut self,
+        module: &mut ObjectModule,
+        function_module: &EcoString,
+        function_name: &EcoString,
+        arity: usize,
+    ) -> Result<Value> {
+        let func_id = self.ensure_module_function(module, function_module, function_name, arity)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let code_ptr = self.builder.ins().func_addr(self.pointer_type, func_ref);
+        let env_ptr = self.builder.ins().iconst(self.pointer_type, 0);
+        let env_len = self.builder.ins().iconst(self.pointer_type, 0);
+        let alloc_func = self.declare_runtime_alloc_closure(module)?;
+        let alloc_ref = module.declare_func_in_func(alloc_func, &mut self.builder.func);
+        let call = self
+            .builder
+            .ins()
+            .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
+        let results = self.builder.inst_results(call);
+        Ok(results[0])
+    }
+
     fn try_call_function(
         &mut self,
         module: &mut ObjectModule,
@@ -1245,6 +1726,43 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(self.builder.ins().global_value(self.pointer_type, gv))
     }
 
+    fn float_constant(&mut self, module: &mut ObjectModule, literal: &str) -> Result<Value> {
+        let key: EcoString = literal.into();
+        let data_id = if let Some(id) = self.float_constants.get(&key) {
+            *id
+        } else {
+            let number = literal
+                .parse::<f64>()
+                .map_err(|err| crate::Error::NativeCodegen {
+                    message: format!("invalid float literal `{literal}`: {err}"),
+                })?;
+
+            let mut bytes = Vec::with_capacity(16);
+            bytes.extend_from_slice(&FLOAT_HEADER.to_le_bytes());
+            bytes.extend_from_slice(&number.to_bits().to_le_bytes());
+
+            let mut description = DataDescription::new();
+            description.define(bytes.into_boxed_slice());
+
+            let name = format!("gleam$float_{}", self.float_constants.len());
+            let id = module
+                .declare_data(&name, Linkage::Local, false, false)
+                .map_err(|err| crate::Error::NativeCodegen {
+                    message: err.to_string(),
+                })?;
+            module
+                .define_data(id, &description)
+                .map_err(|err| crate::Error::NativeCodegen {
+                    message: err.to_string(),
+                })?;
+            let _ = self.float_constants.insert(key.clone(), id);
+            id
+        };
+
+        let gv = module.declare_data_in_func(data_id, &mut self.builder.func);
+        Ok(self.builder.ins().global_value(self.pointer_type, gv))
+    }
+
     fn declare_runtime_nil(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
         if let Some(id) = self.runtime_nil {
             return Ok(id);
@@ -1278,6 +1796,45 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_alloc_tuple = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_list_cons(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_list_cons {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_list_cons", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_list_cons = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_alloc_record(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_alloc_record {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleam_alloc_record", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_alloc_record = Some(id);
         Ok(id)
     }
 
@@ -1403,6 +1960,42 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_bool_false = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_int_negate(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_int_negate {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_int_negate", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_int_negate = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_float_from_f64(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_float_from_f64 {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(ir::types::F64));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("gleam_float_from_f64", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_float_from_f64 = Some(id);
         Ok(id)
     }
 
@@ -1540,6 +2133,81 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok((success_block, params))
     }
 
+    fn branch_on_float_pattern(
+        &mut self,
+        current_block: ir::Block,
+        subject: Value,
+        float_value: f64,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>)> {
+        let success_block = self.create_subject_block(subject_count);
+
+        self.builder.switch_to_block(current_block);
+        let args = failure_args.to_vec();
+        let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+        let boxed_check = self.builder.ins().band(subject, value_tag_mask);
+        let zero = self.builder.ins().iconst(self.pointer_type, 0);
+        let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+        let pointer_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(pointer_block, self.pointer_type);
+        }
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_boxed, pointer_block, &args, failure_block, &args);
+        self.builder.seal_block(current_block);
+
+        self.builder.switch_to_block(pointer_block);
+        let pointer_subject = self.builder.block_params(pointer_block)[0];
+        let header =
+            self.builder
+                .ins()
+                .load(self.pointer_type, MemFlags::trusted(), pointer_subject, 0);
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let header_tag = self.builder.ins().band(header, header_mask);
+        let float_tag = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, TAG_FLOAT as i64);
+        let tag_matches = self.builder.ins().icmp(IntCC::Equal, header_tag, float_tag);
+
+        let float_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(float_block, self.pointer_type);
+        }
+        let _ = self
+            .builder
+            .ins()
+            .brif(tag_matches, float_block, &args, failure_block, &args);
+        self.builder.seal_block(pointer_block);
+
+        self.builder.switch_to_block(float_block);
+        let params = self.builder.block_params(float_block).to_vec();
+        let float_subject = params[0];
+        let loaded = self.load_float(float_subject);
+        let constant = self.builder.ins().f64const(float_value);
+        let cmp = self.builder.ins().fcmp(FloatCC::Equal, loaded, constant);
+        let _ = self
+            .builder
+            .ins()
+            .brif(cmp, success_block, &args, failure_block, &args);
+        self.builder.seal_block(float_block);
+
+        let params = self.builder.block_params(success_block).to_vec();
+        Ok((success_block, params))
+    }
+
     fn lower_clause_guard_condition(
         &mut self,
         module: &mut ObjectModule,
@@ -1556,6 +2224,46 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
                 Ok(self.builder.ins().icmp(IntCC::NotEqual, left, right))
+            }
+            ClauseGuard::GtInt { left, right, .. } => {
+                let left = self.lower_clause_guard_operand(module, left)?;
+                let right = self.lower_clause_guard_operand(module, right)?;
+                let left_int = self.builder.ins().sshr_imm(left, 2);
+                let right_int = self.builder.ins().sshr_imm(right, 2);
+                Ok(self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThan, left_int, right_int))
+            }
+            ClauseGuard::GtEqInt { left, right, .. } => {
+                let left = self.lower_clause_guard_operand(module, left)?;
+                let right = self.lower_clause_guard_operand(module, right)?;
+                let left_int = self.builder.ins().sshr_imm(left, 2);
+                let right_int = self.builder.ins().sshr_imm(right, 2);
+                Ok(self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, left_int, right_int))
+            }
+            ClauseGuard::LtInt { left, right, .. } => {
+                let left = self.lower_clause_guard_operand(module, left)?;
+                let right = self.lower_clause_guard_operand(module, right)?;
+                let left_int = self.builder.ins().sshr_imm(left, 2);
+                let right_int = self.builder.ins().sshr_imm(right, 2);
+                Ok(self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, left_int, right_int))
+            }
+            ClauseGuard::LtEqInt { left, right, .. } => {
+                let left = self.lower_clause_guard_operand(module, left)?;
+                let right = self.lower_clause_guard_operand(module, right)?;
+                let left_int = self.builder.ins().sshr_imm(left, 2);
+                let right_int = self.builder.ins().sshr_imm(right, 2);
+                Ok(self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, left_int, right_int))
             }
             ClauseGuard::Var { .. } | ClauseGuard::Constant(_) => {
                 let value = self.lower_clause_guard_operand(module, guard)?;
@@ -1755,6 +2463,228 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         let params = self.builder.block_params(success_block).to_vec();
         Ok((success_block, params))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn branch_on_list_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject_index: usize,
+        capture_heads: &[bool],
+        capture_tail: bool,
+        ensure_exact: bool,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let head_capture_count = capture_heads.iter().filter(|capture| **capture).count();
+        let extra_count = head_capture_count + if capture_tail { 1 } else { 0 };
+
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..extra_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        let pointer_bytes = self.pointer_bytes();
+        let storage_slot = if extra_count > 0 {
+            Some(self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (extra_count * pointer_bytes) as u32,
+            )))
+        } else {
+            None
+        };
+
+        let mem_flags = MemFlags::trusted();
+        let mut subjects: Vec<Value> = failure_args.to_vec();
+        let mut current_block = current_block;
+        let mut current_subject =
+            subjects
+                .get(subject_index)
+                .copied()
+                .ok_or_else(|| crate::Error::NativeCodegen {
+                    message: "invalid subject index for list pattern".into(),
+                })?;
+        let mut stored = 0usize;
+
+        for capture in capture_heads {
+            self.builder.switch_to_block(current_block);
+
+            let nil_func = self.declare_runtime_nil(module)?;
+            let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
+            let nil_call = self.builder.ins().call(nil_ref, &[]);
+            let nil_value = self.builder.inst_results(nil_call)[0];
+
+            let is_nil = self
+                .builder
+                .ins()
+                .icmp(IntCC::Equal, current_subject, nil_value);
+
+            let non_nil_block = self.builder.create_block();
+            for _ in 0..subject_count {
+                let _ = self
+                    .builder
+                    .append_block_param(non_nil_block, self.pointer_type);
+            }
+            let args = subjects.clone();
+            let _ = self
+                .builder
+                .ins()
+                .brif(is_nil, failure_block, &args, non_nil_block, &args);
+            self.builder.seal_block(current_block);
+
+            self.builder.switch_to_block(non_nil_block);
+            current_block = non_nil_block;
+            subjects = self.builder.block_params(current_block).to_vec();
+            current_subject = subjects[subject_index];
+
+            let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+            let boxed_check = self.builder.ins().band(current_subject, value_tag_mask);
+            let zero = self.builder.ins().iconst(self.pointer_type, 0);
+            let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+            let pointer_block = self.builder.create_block();
+            for _ in 0..subject_count {
+                let _ = self
+                    .builder
+                    .append_block_param(pointer_block, self.pointer_type);
+            }
+            let args = subjects.clone();
+            let _ = self
+                .builder
+                .ins()
+                .brif(is_boxed, pointer_block, &args, failure_block, &args);
+            self.builder.seal_block(current_block);
+
+            self.builder.switch_to_block(pointer_block);
+            current_block = pointer_block;
+            subjects = self.builder.block_params(current_block).to_vec();
+            current_subject = subjects[subject_index];
+
+            let header = self
+                .builder
+                .ins()
+                .load(self.pointer_type, mem_flags, current_subject, 0);
+            let header_mask = self
+                .builder
+                .ins()
+                .iconst(self.pointer_type, HEADER_FIELD_MASK);
+            let header_tag = self.builder.ins().band(header, header_mask);
+            let list_tag = self.builder.ins().iconst(self.pointer_type, TAG_LIST);
+            let is_list = self.builder.ins().icmp(IntCC::Equal, header_tag, list_tag);
+
+            let list_block = self.builder.create_block();
+            for _ in 0..subject_count {
+                let _ = self
+                    .builder
+                    .append_block_param(list_block, self.pointer_type);
+            }
+            let args = subjects.clone();
+            let _ = self
+                .builder
+                .ins()
+                .brif(is_list, list_block, &args, failure_block, &args);
+            self.builder.seal_block(current_block);
+
+            self.builder.switch_to_block(list_block);
+            current_block = list_block;
+            subjects = self.builder.block_params(current_block).to_vec();
+            current_subject = subjects[subject_index];
+
+            let head =
+                self.builder
+                    .ins()
+                    .load(self.pointer_type, mem_flags, current_subject, HEADER_SIZE);
+            let tail_offset = HEADER_SIZE + pointer_bytes as i32;
+            let tail =
+                self.builder
+                    .ins()
+                    .load(self.pointer_type, mem_flags, current_subject, tail_offset);
+
+            if *capture {
+                if let Some(slot) = storage_slot {
+                    let offset = (stored * pointer_bytes) as i32;
+                    let _ = self.builder.ins().stack_store(head, slot, offset);
+                }
+                stored += 1;
+            }
+
+            subjects[subject_index] = tail;
+            current_subject = tail;
+        }
+
+        if ensure_exact {
+            self.builder.switch_to_block(current_block);
+
+            let nil_func = self.declare_runtime_nil(module)?;
+            let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
+            let nil_call = self.builder.ins().call(nil_ref, &[]);
+            let nil_value = self.builder.inst_results(nil_call)[0];
+
+            let is_nil = self
+                .builder
+                .ins()
+                .icmp(IntCC::Equal, current_subject, nil_value);
+            let exact_block = self.builder.create_block();
+            for _ in 0..subject_count {
+                let _ = self
+                    .builder
+                    .append_block_param(exact_block, self.pointer_type);
+            }
+            let args = subjects.clone();
+            let _ = self
+                .builder
+                .ins()
+                .brif(is_nil, exact_block, &args, failure_block, &args);
+            self.builder.seal_block(current_block);
+
+            self.builder.switch_to_block(exact_block);
+            current_block = exact_block;
+            subjects = self.builder.block_params(current_block).to_vec();
+            current_subject = subjects[subject_index];
+        }
+
+        if capture_tail {
+            if let Some(slot) = storage_slot {
+                let offset = (stored * pointer_bytes) as i32;
+                let _ = self
+                    .builder
+                    .ins()
+                    .stack_store(current_subject, slot, offset);
+            }
+            stored += 1;
+        }
+
+        let mut extra_values = Vec::with_capacity(stored);
+        if let Some(slot) = storage_slot {
+            for index in 0..stored {
+                let offset = (index * pointer_bytes) as i32;
+                let value = self
+                    .builder
+                    .ins()
+                    .stack_load(self.pointer_type, slot, offset);
+                extra_values.push(value);
+            }
+        }
+
+        let mut success_args = subjects.clone();
+        success_args.extend(extra_values.iter().copied());
+
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.builder.seal_block(current_block);
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
     }
 
     fn declare_runtime_gleeunit_main(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
