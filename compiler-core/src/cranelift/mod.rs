@@ -834,6 +834,34 @@ fn lower_bin_op(
             };
             ctx.bool_from_condition(module, condition)
         }
+        BinOp::LtFloat | BinOp::LtEqFloat | BinOp::GtFloat | BinOp::GtEqFloat => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+            let left_float = ctx.load_float(left_value);
+            let right_float = ctx.load_float(right_value);
+            let cmp = match op {
+                BinOp::LtFloat => FloatCC::LessThan,
+                BinOp::LtEqFloat => FloatCC::LessThanOrEqual,
+                BinOp::GtFloat => FloatCC::GreaterThan,
+                BinOp::GtEqFloat => FloatCC::GreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            let condition = ctx.builder.ins().fcmp(cmp, left_float, right_float);
+            ctx.bool_from_condition(module, condition)
+        }
+        BinOp::LtInt | BinOp::LtEqInt | BinOp::GtInt | BinOp::GtEqInt => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+            let cmp = match op {
+                BinOp::LtInt => IntCC::SignedLessThan,
+                BinOp::LtEqInt => IntCC::SignedLessThanOrEqual,
+                BinOp::GtInt => IntCC::SignedGreaterThan,
+                BinOp::GtEqInt => IntCC::SignedGreaterThanOrEqual,
+                _ => unreachable!(),
+            };
+            let condition = ctx.builder.ins().icmp(cmp, left_value, right_value);
+            ctx.bool_from_condition(module, condition)
+        }
         _ => Err(crate::Error::NativeCodegen {
             message: format!("binary operator `{op:?}` is not yet supported in native main"),
         }),
