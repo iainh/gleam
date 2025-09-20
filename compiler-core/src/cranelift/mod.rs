@@ -857,15 +857,33 @@ fn lower_case(
                 Pattern::List { elements, tail, .. } => {
                     let mut capture_heads = Vec::with_capacity(elements.len());
                     let mut head_names = Vec::with_capacity(elements.len());
+                    let mut head_constructors: Vec<Option<(&PatternConstructor, &Arc<Type>)>> =
+                        Vec::with_capacity(elements.len());
                     for element in elements {
                         match element {
                             Pattern::Variable { name, .. } => {
                                 capture_heads.push(true);
                                 head_names.push(Some(name.clone()));
+                                head_constructors.push(None);
                             }
                             Pattern::Discard { .. } => {
                                 capture_heads.push(false);
                                 head_names.push(None);
+                                head_constructors.push(None);
+                            }
+                            Pattern::Constructor {
+                                constructor,
+                                arguments,
+                                spread,
+                                type_,
+                                ..
+                            } if arguments.is_empty() && spread.is_none() => {
+                                let constructor = constructor.expect_ref(
+                                    "pattern constructor must be known during native code generation",
+                                );
+                                capture_heads.push(false);
+                                head_names.push(None);
+                                head_constructors.push(Some((constructor, type_)));
                             }
                             other => {
                                 return Err(crate::Error::NativeCodegen {
@@ -895,6 +913,7 @@ fn lower_case(
                         pattern_block,
                         subject_index,
                         &capture_heads,
+                        &head_constructors,
                         capture_tail,
                         tail.is_none(),
                         next_block,
@@ -2472,6 +2491,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         current_block: ir::Block,
         subject_index: usize,
         capture_heads: &[bool],
+        head_constructors: &[Option<(&PatternConstructor, &Arc<Type>)>],
         capture_tail: bool,
         ensure_exact: bool,
         failure_block: ir::Block,
@@ -2515,7 +2535,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 })?;
         let mut stored = 0usize;
 
-        for capture in capture_heads {
+        assert_eq!(capture_heads.len(), head_constructors.len());
+
+        for (index, capture) in capture_heads.iter().enumerate() {
             self.builder.switch_to_block(current_block);
 
             let nil_func = self.declare_runtime_nil(module)?;
@@ -2599,15 +2621,69 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             subjects = self.builder.block_params(current_block).to_vec();
             current_subject = subjects[subject_index];
 
-            let head =
+            let tail_offset = HEADER_SIZE + pointer_bytes as i32;
+            let mut head =
                 self.builder
                     .ins()
                     .load(self.pointer_type, mem_flags, current_subject, HEADER_SIZE);
-            let tail_offset = HEADER_SIZE + pointer_bytes as i32;
-            let tail =
+            let mut tail =
                 self.builder
                     .ins()
                     .load(self.pointer_type, mem_flags, current_subject, tail_offset);
+
+            if let Some((constructor, type_)) = head_constructors[index] {
+                let expected = if type_.is_bool() {
+                    match constructor.name.as_str() {
+                        "True" => self.bool_constant(module, true)?,
+                        "False" => self.bool_constant(module, false)?,
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "unsupported boolean constructor `{other}` in native functions"
+                                ),
+                            });
+                        }
+                    }
+                } else {
+                    self.zero_arity_record_constant(
+                        module,
+                        &constructor.module,
+                        constructor.constructor_index,
+                    )?
+                };
+
+                let cmp = self.builder.ins().icmp(IntCC::Equal, head, expected);
+                let match_block = self.builder.create_block();
+                for _ in 0..subject_count {
+                    let _ = self
+                        .builder
+                        .append_block_param(match_block, self.pointer_type);
+                }
+                let args = subjects.clone();
+                let _ = self
+                    .builder
+                    .ins()
+                    .brif(cmp, match_block, &args, failure_block, &args);
+                self.builder.seal_block(current_block);
+
+                self.builder.switch_to_block(match_block);
+                current_block = match_block;
+                subjects = self.builder.block_params(current_block).to_vec();
+                current_subject = subjects[subject_index];
+
+                head = self.builder.ins().load(
+                    self.pointer_type,
+                    mem_flags,
+                    current_subject,
+                    HEADER_SIZE,
+                );
+                tail = self.builder.ins().load(
+                    self.pointer_type,
+                    mem_flags,
+                    current_subject,
+                    tail_offset,
+                );
+            }
 
             if *capture {
                 if let Some(slot) = storage_slot {
