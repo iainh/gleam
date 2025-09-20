@@ -7,8 +7,8 @@
 use crate::{
     Result,
     ast::{
-        ClauseGuard, Constant, Function, Pattern, Publicity, Statement, TypedArg, TypedClauseGuard,
-        TypedConstant, TypedDefinition, TypedExpr, TypedStatement,
+        BinOp, ClauseGuard, Constant, Function, Pattern, Publicity, Statement, TypedArg,
+        TypedClauseGuard, TypedConstant, TypedDefinition, TypedExpr, TypedStatement,
     },
     build::Module as GleamModule,
     io::FileSystemWriter,
@@ -19,7 +19,7 @@ use camino::Utf8Path;
 use cranelift_codegen::{
     ir::{
         self, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, Value,
-        condcodes::IntCC,
+        condcodes::{FloatCC, IntCC},
     },
     settings::{self, Configurable},
 };
@@ -87,6 +87,7 @@ type FunctionIdMap = HashMap<(EcoString, usize), FuncId>;
 const VALUE_TAG_MASK: i64 = 0b11;
 const HEADER_FIELD_MASK: i64 = 0xFFFF;
 const HEADER_ARITY_SHIFT: i64 = 16;
+const HEADER_SIZE: i32 = 8;
 const TAG_RECORD: i64 = 6;
 const TAG_BOOLEAN: i64 = 12;
 const BOOLEAN_FALSE_ARITY: i64 = 0;
@@ -383,6 +384,10 @@ fn lower_expression(
         TypedExpr::Fn {
             arguments, body, ..
         } => lower_function_literal(module, arguments, body, ctx),
+
+        TypedExpr::BinOp {
+            name, left, right, ..
+        } => lower_bin_op(module, name, left, right, ctx),
 
         TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
 
@@ -792,6 +797,43 @@ fn lower_case(
     Ok(result)
 }
 
+fn lower_bin_op(
+    module: &mut ObjectModule,
+    op: &BinOp,
+    left: &TypedExpr,
+    right: &TypedExpr,
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Value> {
+    match op {
+        BinOp::Eq | BinOp::NotEq => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+            let left_type = left.type_();
+            let condition = if left_type.is_float() {
+                let left_float = ctx.load_float(left_value);
+                let right_float = ctx.load_float(right_value);
+                let cmp = if matches!(op, BinOp::Eq) {
+                    FloatCC::Equal
+                } else {
+                    FloatCC::NotEqual
+                };
+                ctx.builder.ins().fcmp(cmp, left_float, right_float)
+            } else {
+                let cmp = if matches!(op, BinOp::Eq) {
+                    IntCC::Equal
+                } else {
+                    IntCC::NotEqual
+                };
+                ctx.builder.ins().icmp(cmp, left_value, right_value)
+            };
+            ctx.bool_from_condition(module, condition)
+        }
+        _ => Err(crate::Error::NativeCodegen {
+            message: format!("binary operator `{op:?}` is not yet supported in native main"),
+        }),
+    }
+}
+
 fn lower_closure_function(
     module: &mut ObjectModule,
     pointer_type: ir::Type,
@@ -1039,6 +1081,27 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let id = *self.closure_counter;
         *self.closure_counter += 1;
         id
+    }
+
+    fn load_float(&mut self, value: Value) -> Value {
+        let mem_flags = MemFlags::trusted();
+        self.builder
+            .ins()
+            .load(ir::types::F64, mem_flags, value, HEADER_SIZE)
+    }
+
+    fn bool_from_condition(
+        &mut self,
+        module: &mut ObjectModule,
+        condition: Value,
+    ) -> Result<Value> {
+        let true_value = self.bool_constant(module, true)?;
+        let false_value = self.bool_constant(module, false)?;
+        let result = self
+            .builder
+            .ins()
+            .select(condition, true_value, false_value);
+        Ok(result)
     }
 
     fn try_call_function(

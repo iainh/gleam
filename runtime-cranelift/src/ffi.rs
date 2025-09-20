@@ -9,7 +9,6 @@ use std::{
 };
 
 use crate::{
-    Header, Heap, Tag, Value,
     atom::AtomTable,
     binary, gc,
     heap::AllocationError,
@@ -17,10 +16,11 @@ use crate::{
         Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ClosureFn, ConsCell,
         FloatBox, Map, MapEntry, MapTable,
     },
+    Header, Heap, Tag, Value,
 };
 
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine;
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
