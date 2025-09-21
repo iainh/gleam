@@ -448,6 +448,11 @@ fn lower_expression(
             Ok(current)
         }
 
+        TypedExpr::TupleIndex { index, tuple, .. } => {
+            let tuple_value = lower_expression(module, tuple, ctx)?;
+            ctx.tuple_element(tuple_value, *index)
+        }
+
         TypedExpr::Fn {
             arguments, body, ..
         } => lower_function_literal(module, arguments, body, ctx),
@@ -3132,6 +3137,108 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
+    }
+
+    fn tuple_element(&mut self, tuple: Value, index: u64) -> Result<Value> {
+        let pointer_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(pointer_block, self.pointer_type);
+        let failure_block = self.builder.create_block();
+
+        let mem_flags = MemFlags::trusted();
+        let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+        let boxed_check = self.builder.ins().band(tuple, value_tag_mask);
+        let zero = self.builder.ins().iconst(self.pointer_type, 0);
+        let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_boxed, pointer_block, &[tuple], failure_block, &[]);
+
+        self.builder.switch_to_block(pointer_block);
+        let pointer_subject = self.builder.block_params(pointer_block)[0];
+        let header = self
+            .builder
+            .ins()
+            .load(self.pointer_type, mem_flags, pointer_subject, 0);
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let header_tag = self.builder.ins().band(header, header_mask);
+        let tuple_tag = self.builder.ins().iconst(self.pointer_type, TAG_TUPLE);
+        let is_tuple = self.builder.ins().icmp(IntCC::Equal, header_tag, tuple_tag);
+
+        let tuple_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(tuple_block, self.pointer_type);
+        let _ = self
+            .builder
+            .append_block_param(tuple_block, self.pointer_type);
+        let _ = self.builder.ins().brif(
+            is_tuple,
+            tuple_block,
+            &[pointer_subject, header],
+            failure_block,
+            &[],
+        );
+        self.builder.seal_block(pointer_block);
+
+        self.builder.switch_to_block(tuple_block);
+        let tuple_ptr = self.builder.block_params(tuple_block)[0];
+        let tuple_header = self.builder.block_params(tuple_block)[1];
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let arity_shifted = self
+            .builder
+            .ins()
+            .ushr_imm(tuple_header, HEADER_ARITY_SHIFT);
+        let arity_value = self.builder.ins().band(arity_shifted, header_mask);
+
+        let index_i64 = i64::try_from(index).map_err(|_| crate::Error::NativeCodegen {
+            message: "tuple index exceeds native backend limits".into(),
+        })?;
+        let index_value = self.builder.ins().iconst(self.pointer_type, index_i64);
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, index_value, arity_value);
+
+        let element_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(element_block, self.pointer_type);
+        let _ = self
+            .builder
+            .ins()
+            .brif(in_bounds, element_block, &[tuple_ptr], failure_block, &[]);
+        self.builder.seal_block(tuple_block);
+
+        self.builder.switch_to_block(failure_block);
+        let _ = self.builder.ins().trap(TrapCode::User(0));
+        self.builder.seal_block(failure_block);
+
+        self.builder.switch_to_block(element_block);
+        let tuple_ptr = self.builder.block_params(element_block)[0];
+        let index_usize = usize::try_from(index).map_err(|_| crate::Error::NativeCodegen {
+            message: "tuple index exceeds native backend limits".into(),
+        })?;
+        let index_i32 = i32::try_from(index_usize).map_err(|_| crate::Error::NativeCodegen {
+            message: "tuple index offset exceeds native backend limits".into(),
+        })?;
+        let pointer_stride = self.pointer_bytes() as i32;
+        let offset = HEADER_SIZE + index_i32 * pointer_stride;
+        let element = self
+            .builder
+            .ins()
+            .load(self.pointer_type, mem_flags, tuple_ptr, offset);
+        self.builder.seal_block(element_block);
+        Ok(element)
     }
 
     fn declare_runtime_gleeunit_main(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
