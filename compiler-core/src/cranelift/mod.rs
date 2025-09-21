@@ -876,7 +876,9 @@ fn lower_case(
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
-                    ctx.builder.switch_to_block(pattern_block);
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
 
                     let mut extra_iter = extras.into_iter();
                     for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
@@ -1076,7 +1078,9 @@ fn lower_case(
             }
         }
 
-        ctx.builder.switch_to_block(pattern_block);
+        if ctx.builder.current_block() != Some(pattern_block) {
+            ctx.builder.switch_to_block(pattern_block);
+        }
         let mut final_subjects = ctx.builder.block_params(pattern_block).to_vec();
 
         if let Some(guard) = &clause.guard {
@@ -1127,7 +1131,9 @@ fn lower_case(
             pattern_subjects = guard_params[..subject_count].to_vec();
             final_subjects = pattern_subjects.clone();
 
-            ctx.builder.switch_to_block(pattern_block);
+            if ctx.builder.current_block() != Some(pattern_block) {
+                ctx.builder.switch_to_block(pattern_block);
+            }
         } else {
             final_subjects = pattern_subjects.clone();
         }
@@ -2253,7 +2259,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     ) -> Result<(ir::Block, Vec<Value>)> {
         let success_block = self.create_subject_block(subject_count);
 
-        self.builder.switch_to_block(current_block);
         let int = int_value
             .to_i64()
             .ok_or_else(|| crate::Error::NativeCodegen {
@@ -2270,7 +2275,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(cmp, success_block, &args, failure_block, &args);
         self.builder.seal_block(current_block);
 
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
         Ok((success_block, params))
     }
 
@@ -2494,11 +2499,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .append_block_param(success_block, self.pointer_type);
         }
 
-        let mut success_args = failure_args.to_vec();
-        let failure_args = failure_args.to_vec();
+        let mut success_args = Vec::with_capacity(subject_count + extra_count);
+        success_args.extend_from_slice(failure_args);
         let mem_flags = MemFlags::trusted();
-
-        self.builder.switch_to_block(current_block);
         let pointer_block = self.builder.create_block();
         let _ = self
             .builder
@@ -2521,7 +2524,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             pointer_block,
             &[subject],
             failure_block,
-            &failure_args,
+            failure_args,
         );
         self.builder.seal_block(current_block);
 
@@ -2584,7 +2587,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                &failure_args,
+                failure_args,
             );
             self.builder.seal_block(tag_block);
         } else {
@@ -2604,7 +2607,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 record_block,
                 &[tag_subject],
                 failure_block,
-                &failure_args,
+                failure_args,
             );
             self.builder.seal_block(tag_block);
 
@@ -2649,7 +2652,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                &failure_args,
+                failure_args,
             );
             self.builder.seal_block(record_block);
         }
@@ -2826,7 +2829,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 subjects = params;
                 current_subject = subjects[subject_index];
                 constructor_extras = extras;
-                self.builder.switch_to_block(current_block);
+                if self.builder.current_block() != Some(current_block) {
+                    self.builder.switch_to_block(current_block);
+                }
             }
 
             let tail_offset = HEADER_SIZE + pointer_bytes as i32;
