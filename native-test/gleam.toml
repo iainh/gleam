@@ -1,0 +1,6 @@
+name = "native_test"
+version = "0.1.0"
+description = ""
+
+[dependencies]
+gleam_stdlib = { path = "../../gleam-stdlib" }

@@ -278,9 +278,7 @@ fn lower_function(
             .map(|(_, name)| name.as_str())
             .unwrap_or("<anonymous>");
         return Err(crate::Error::NativeCodegen {
-            message: format!(
-                "error lowering {module_name}.{func_name}: {err} ({err:?})\n{clif}",
-            ),
+            message: format!("error lowering {module_name}.{func_name}: {err} ({err:?})\n{clif}",),
         });
     }
     module.clear_context(&mut ctx);
@@ -1238,6 +1236,21 @@ fn lower_case(
         let mut bindings: Vec<(EcoString, BindingSource)> = Vec::new();
 
         for (subject_index, pattern) in clause.pattern.iter().enumerate() {
+            let mut pattern = pattern;
+            loop {
+                match pattern {
+                    Pattern::Assign {
+                        name,
+                        pattern: inner,
+                        ..
+                    } => {
+                        bindings.push((name.clone(), BindingSource::Subject(subject_index)));
+                        pattern = inner;
+                    }
+                    _ => break,
+                }
+            }
+
             match pattern {
                 Pattern::Discard { .. } => {}
                 Pattern::Variable { name, .. } => {
@@ -1336,9 +1349,8 @@ fn lower_case(
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
-                    if ctx.builder.current_block() != Some(pattern_block) {
-                        ctx.builder.switch_to_block(pattern_block);
-                    }
+                    // Branch lowering leaves us positioned in the pattern block ready for
+                    // subsequent value bindings.
 
                     let mut extra_iter = extras.into_iter();
                     for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
@@ -1357,26 +1369,58 @@ fn lower_case(
                     }
                 }
                 Pattern::List { elements, tail, .. } => {
-                    let mut capture_heads = Vec::with_capacity(elements.len());
-                    let mut head_names = Vec::with_capacity(elements.len());
-                    let mut head_matches: Vec<Option<ListHeadMatch<'_>>> =
-                        Vec::with_capacity(elements.len());
-                    let mut head_field_bindings: Vec<Option<Vec<Option<EcoString>>>> =
-                        Vec::with_capacity(elements.len());
-
-                    for element in elements {
+                    fn analyse_list_element<'a>(
+                        element: &'a Pattern<Arc<Type>>,
+                        capture_heads: &mut Vec<bool>,
+                        head_names: &mut Vec<Option<EcoString>>,
+                        head_matches: &mut Vec<Option<ListHeadMatch<'a>>>,
+                        head_field_bindings: &mut Vec<Option<Vec<Option<EcoString>>>>,
+                        head_extra_bindings: &mut Vec<Vec<EcoString>>,
+                    ) -> Result<()> {
                         match element {
+                            Pattern::Assign { name, pattern, .. } => {
+                                let before = capture_heads.len();
+                                analyse_list_element(
+                                    pattern,
+                                    capture_heads,
+                                    head_names,
+                                    head_matches,
+                                    head_field_bindings,
+                                    head_extra_bindings,
+                                )?;
+                                if capture_heads.len() == before {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message:
+                                            "assign pattern did not produce list head in native lowering"
+                                                .into(),
+                                    });
+                                }
+                                let index = capture_heads.len() - 1;
+                                if !capture_heads[index] {
+                                    capture_heads[index] = true;
+                                    head_names[index] = Some(name.clone());
+                                } else if head_names[index].is_none() {
+                                    head_names[index] = Some(name.clone());
+                                } else {
+                                    head_extra_bindings[index].push(name.clone());
+                                }
+                                Ok(())
+                            }
                             Pattern::Variable { name, .. } => {
                                 capture_heads.push(true);
                                 head_names.push(Some(name.clone()));
                                 head_matches.push(None);
                                 head_field_bindings.push(None);
+                                head_extra_bindings.push(Vec::new());
+                                Ok(())
                             }
                             Pattern::Discard { .. } => {
                                 capture_heads.push(false);
                                 head_names.push(None);
                                 head_matches.push(None);
                                 head_field_bindings.push(None);
+                                head_extra_bindings.push(Vec::new());
+                                Ok(())
                             }
                             Pattern::Constructor {
                                 constructor,
@@ -1422,6 +1466,8 @@ fn lower_case(
                                     },
                                 )));
                                 head_field_bindings.push(Some(binding_names));
+                                head_extra_bindings.push(Vec::new());
+                                Ok(())
                             }
                             Pattern::Tuple { elements, .. } => {
                                 let mut capture_flags = Vec::with_capacity(elements.len());
@@ -1454,15 +1500,35 @@ fn lower_case(
                                     capture_flags,
                                 })));
                                 head_field_bindings.push(Some(binding_names));
+                                head_extra_bindings.push(Vec::new());
+                                Ok(())
                             }
-                            other => {
-                                return Err(crate::Error::NativeCodegen {
-                                    message: format!(
-                                        "list pattern element `{other:?}` is not yet supported in native functions"
-                                    ),
-                                });
-                            }
+                            other => Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "list pattern element `{other:?}` is not yet supported in native functions"
+                                ),
+                            }),
                         }
+                    }
+
+                    let mut capture_heads = Vec::with_capacity(elements.len());
+                    let mut head_names = Vec::with_capacity(elements.len());
+                    let mut head_matches: Vec<Option<ListHeadMatch<'_>>> =
+                        Vec::with_capacity(elements.len());
+                    let mut head_field_bindings: Vec<Option<Vec<Option<EcoString>>>> =
+                        Vec::with_capacity(elements.len());
+                    let mut head_extra_bindings: Vec<Vec<EcoString>> =
+                        Vec::with_capacity(elements.len());
+
+                    for element in elements {
+                        analyse_list_element(
+                            element,
+                            &mut capture_heads,
+                            &mut head_names,
+                            &mut head_matches,
+                            &mut head_field_bindings,
+                            &mut head_extra_bindings,
+                        )?;
                     }
 
                     let (capture_tail, tail_name) = match tail.as_deref() {
@@ -1494,12 +1560,10 @@ fn lower_case(
                     pattern_subjects = params;
 
                     let mut extra_iter = extras.into_iter();
-                    for (index, ((capture, name), field_bindings)) in capture_heads
-                        .iter()
-                        .zip(head_names.iter())
-                        .zip(head_field_bindings.iter())
-                        .enumerate()
-                    {
+                    for (index, capture) in capture_heads.iter().enumerate() {
+                        let name = &head_names[index];
+                        let field_bindings = &head_field_bindings[index];
+                        let extra_aliases = &head_extra_bindings[index];
                         if *capture {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
@@ -1510,6 +1574,9 @@ fn lower_case(
                             };
                             if let Some(name) = name {
                                 bindings.push((name.clone(), BindingSource::Value(value)));
+                            }
+                            for alias in extra_aliases {
+                                bindings.push((alias.clone(), BindingSource::Value(value)));
                             }
                         }
 
