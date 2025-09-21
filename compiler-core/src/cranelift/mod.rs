@@ -7,9 +7,9 @@
 use crate::{
     Result,
     ast::{
-        AssignmentKind, BinOp, ClauseGuard, Constant, Function, Pattern, PipelineAssignmentKind,
-        Publicity, Statement, TypedArg, TypedAssert, TypedClauseGuard, TypedConstant,
-        TypedDefinition, TypedExpr, TypedPipelineAssignment, TypedStatement,
+        AssignmentKind, BinOp, ClauseGuard, Constant, Function, ModuleConstant, Pattern,
+        PipelineAssignmentKind, Publicity, Statement, TypedArg, TypedAssert, TypedClauseGuard,
+        TypedConstant, TypedDefinition, TypedExpr, TypedPipelineAssignment, TypedStatement,
     },
     build::Module as GleamModule,
     io::FileSystemWriter,
@@ -131,6 +131,19 @@ fn collect_module_functions(
         .collect()
 }
 
+fn collect_module_constants(
+    module: &crate::ast::TypedModule,
+) -> Vec<&ModuleConstant<Arc<Type>, EcoString>> {
+    module
+        .definitions
+        .iter()
+        .filter_map(|definition| match definition {
+            TypedDefinition::ModuleConstant(constant) => Some(constant),
+            _ => None,
+        })
+        .collect()
+}
+
 fn declare_module_functions(
     module: &mut ObjectModule,
     module_name: &EcoString,
@@ -174,8 +187,11 @@ fn lower_module_functions(
         return Ok(None);
     }
 
+    let module_constants = collect_module_constants(&config.module.ast);
+
     let function_ids = declare_module_functions(module, &config.module.name, &functions)?;
     let mut zero_arity_records = HashMap::new();
+    let mut string_data = HashMap::new();
     let mut float_constants = HashMap::new();
     let mut record_constructors = HashMap::new();
     let mut module_functions = HashMap::new();
@@ -196,7 +212,9 @@ fn lower_module_functions(
             function,
             func_id,
             &function_ids,
+            &module_constants,
             &mut zero_arity_records,
+            &mut string_data,
             &mut float_constants,
             &mut record_constructors,
             &mut module_functions,
@@ -214,7 +232,9 @@ fn lower_function(
     function: &Function<Arc<Type>, TypedExpr>,
     func_id: FuncId,
     functions: &FunctionIdMap,
+    module_constants: &[&ModuleConstant<Arc<Type>, EcoString>],
     zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    string_data: &mut HashMap<EcoString, DataId>,
     float_constants: &mut HashMap<EcoString, DataId>,
     record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
     module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
@@ -251,12 +271,18 @@ fn lower_function(
             functions,
             module_name,
             zero_arity_records,
+            string_data,
             float_constants,
             record_constructors,
             module_functions,
             closure_counter,
         );
         lowering.mark_sealed(block);
+
+        for constant in module_constants {
+            let value = lowering.lower_constant(module, &constant.value)?;
+            lowering.define(&constant.name, value);
+        }
 
         for (value, arg) in block_params.iter().zip(function.arguments.iter()) {
             if let Some(name) = arg.get_variable_name() {
@@ -372,6 +398,18 @@ fn lower_expression(
                     ctx.record_constructor_value(module, ctor_module, *variant_index, *arity)
                 }
             }
+            ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                ctx.lower_constant(module, literal)
+            }
+            ValueConstructorVariant::LocalConstant { literal } => {
+                ctx.lower_constant(module, literal)
+            }
+            ValueConstructorVariant::ModuleFn {
+                module: function_module,
+                name: function_name,
+                arity,
+                ..
+            } => ctx.module_function_value(module, function_module, function_name, *arity),
             ValueConstructorVariant::LocalVariable { .. } => {
                 ctx.lookup(name)
                     .copied()
@@ -379,12 +417,6 @@ fn lower_expression(
                         message: format!("unknown variable `{name}` in native main"),
                     })
             }
-            _ => ctx
-                .lookup(name)
-                .copied()
-                .ok_or_else(|| crate::Error::NativeCodegen {
-                    message: format!("unknown variable `{name}` in native main"),
-                }),
         },
 
         TypedExpr::Block { statements, .. } => lower_block(module, statements.as_slice(), ctx),
@@ -488,9 +520,7 @@ fn lower_expression(
                     })?;
                 ctx.module_function_value(module, function_module, name, arity)
             }
-            ModuleValueConstructor::Constant { .. } => Err(crate::Error::NativeCodegen {
-                message: "module constants are not yet supported in native functions".into(),
-            }),
+            ModuleValueConstructor::Constant { literal, .. } => ctx.lower_constant(module, literal),
         },
 
         TypedExpr::BinOp {
@@ -1725,9 +1755,15 @@ fn lower_bin_op(
             let result = ctx.builder.ins().bor(shifted, tag);
             Ok(result)
         }
-        _ => Err(crate::Error::NativeCodegen {
-            message: format!("binary operator `{op:?}` is not yet supported in native main"),
-        }),
+        BinOp::Concatenate => {
+            let left_value = lower_expression(module, left, ctx)?;
+            let right_value = lower_expression(module, right, ctx)?;
+            let func_id = ctx.declare_runtime_string_add(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[left_value, right_value]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
+        }
     }
 }
 
@@ -1785,6 +1821,7 @@ fn lower_closure_function(
     functions: &FunctionIdMap,
     module_name: &EcoString,
     zero_arity_records: &mut HashMap<(EcoString, u16), DataId>,
+    string_data: &mut HashMap<EcoString, DataId>,
     float_constants: &mut HashMap<EcoString, DataId>,
     record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
     module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
@@ -1830,6 +1867,7 @@ fn lower_closure_function(
             functions,
             module_name,
             zero_arity_records,
+            string_data,
             float_constants,
             record_constructors,
             module_functions,
@@ -1960,6 +1998,7 @@ fn lower_function_literal(
             functions,
             &module_name,
             zero_arity_records,
+            &mut *ctx.string_data,
             float_constants,
             record_constructors,
             module_functions_ref,
@@ -2265,7 +2304,7 @@ struct LoweringContext<'a, 'b, 'c> {
     builder: &'a mut FunctionBuilder<'b>,
     pointer_type: ir::Type,
     scopes: Vec<HashMap<EcoString, Value>>,
-    string_data: HashMap<EcoString, DataId>,
+    string_data: &'c mut HashMap<EcoString, DataId>,
     float_constants: &'c mut HashMap<EcoString, DataId>,
     zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
     record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
@@ -2278,6 +2317,7 @@ struct LoweringContext<'a, 'b, 'c> {
     runtime_println: Option<FuncId>,
     runtime_print_error: Option<FuncId>,
     runtime_println_error: Option<FuncId>,
+    runtime_string_add: Option<FuncId>,
     runtime_bool_true: Option<FuncId>,
     runtime_bool_false: Option<FuncId>,
     runtime_list_cons: Option<FuncId>,
@@ -2302,6 +2342,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         functions: &'a FunctionIdMap,
         module_name: &'a EcoString,
         zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
+        string_data: &'c mut HashMap<EcoString, DataId>,
         float_constants: &'c mut HashMap<EcoString, DataId>,
         record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
         module_functions: &'c mut HashMap<(EcoString, EcoString, usize), FuncId>,
@@ -2311,7 +2352,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             builder,
             pointer_type,
             scopes: vec![HashMap::new()],
-            string_data: HashMap::new(),
+            string_data,
             float_constants,
             zero_arity_records,
             record_constructors,
@@ -2324,6 +2365,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println: None,
             runtime_print_error: None,
             runtime_println_error: None,
+            runtime_string_add: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -2404,6 +2446,257 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .select(condition, true_value, false_value);
         Ok(result)
+    }
+
+    fn apply_closure(
+        &mut self,
+        module: &mut ObjectModule,
+        fun_value: Value,
+        arguments: &[Value],
+    ) -> Result<Value> {
+        let args_ptr = if arguments.is_empty() {
+            self.builder.ins().iconst(self.pointer_type, 0)
+        } else {
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (arguments.len() * self.pointer_bytes()) as u32,
+            ));
+            for (index, value) in arguments.iter().enumerate() {
+                let offset = (index * self.pointer_bytes()) as i32;
+                let _ = self.builder.ins().stack_store(*value, slot, offset);
+            }
+            self.builder.ins().stack_addr(self.pointer_type, slot, 0)
+        };
+
+        let argc = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, arguments.len() as i64);
+
+        let apply_func = self.declare_runtime_apply_closure(module)?;
+        let apply_ref = module.declare_func_in_func(apply_func, &mut self.builder.func);
+        let call = self
+            .builder
+            .ins()
+            .call(apply_ref, &[fun_value, args_ptr, argc]);
+        let results = self.builder.inst_results(call);
+        Ok(results[0])
+    }
+
+    fn lower_constant(
+        &mut self,
+        module: &mut ObjectModule,
+        constant: &TypedConstant,
+    ) -> Result<Value> {
+        match constant {
+            Constant::Int { int_value, .. } => {
+                let value = int_value
+                    .to_i64()
+                    .ok_or_else(|| crate::Error::NativeCodegen {
+                        message: "integer literal out of range for 64-bit backend".into(),
+                    })?;
+                let encoded = encode_small_int(value)?;
+                Ok(self.builder.ins().iconst(ir::types::I64, encoded))
+            }
+            Constant::Float { value, .. } => self.float_constant(module, value),
+            Constant::String { value, .. } => self.string_constant(module, value.as_str()),
+            Constant::Tuple { elements, .. } => {
+                if elements.is_empty() {
+                    let func_id = self.declare_runtime_nil(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    let results = self.builder.inst_results(call);
+                    return Ok(results[0]);
+                }
+
+                let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (elements.len() * self.pointer_bytes()) as u32,
+                ));
+
+                for (index, element) in elements.iter().enumerate() {
+                    let value = self.lower_constant(module, element)?;
+                    let offset = (index * self.pointer_bytes()) as i32;
+                    let _ = self.builder.ins().stack_store(value, slot, offset);
+                }
+
+                let base_ptr = self.builder.ins().stack_addr(self.pointer_type, slot, 0);
+                let len_value = self
+                    .builder
+                    .ins()
+                    .iconst(self.pointer_type, elements.len() as i64);
+
+                let func_id = self.declare_runtime_alloc_tuple(module)?;
+                let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[base_ptr, len_value]);
+                let results = self.builder.inst_results(call);
+                Ok(results[0])
+            }
+            Constant::List { elements, .. } => {
+                let mut values = Vec::with_capacity(elements.len());
+                for element in elements {
+                    values.push(self.lower_constant(module, element)?);
+                }
+
+                let mut current = {
+                    let func_id = self.declare_runtime_nil(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    let call = self.builder.ins().call(func_ref, &[]);
+                    self.builder.inst_results(call)[0]
+                };
+
+                if !values.is_empty() {
+                    let func_id = self.declare_runtime_list_cons(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    for value in values.into_iter().rev() {
+                        let call = self.builder.ins().call(func_ref, &[value, current]);
+                        let results = self.builder.inst_results(call);
+                        current = results[0];
+                    }
+                }
+
+                Ok(current)
+            }
+            Constant::Record {
+                arguments,
+                record_constructor,
+                ..
+            } => {
+                let constructor =
+                    record_constructor
+                        .as_ref()
+                        .ok_or_else(|| crate::Error::NativeCodegen {
+                            message: "missing record constructor in constant".into(),
+                        })?;
+                match &constructor.variant {
+                    ValueConstructorVariant::Record {
+                        module: constructor_module,
+                        variant_index,
+                        arity,
+                        ..
+                    } => {
+                        let mut values = Vec::with_capacity(arguments.len());
+                        for argument in arguments {
+                            values.push(self.lower_constant(module, &argument.value)?);
+                        }
+
+                        if usize::from(*arity) != values.len() {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "record constant arity mismatch: expected {arity} arguments, got {}",
+                                    values.len()
+                                ),
+                            });
+                        }
+
+                        if *arity == 0 {
+                            self.zero_arity_record_constant(
+                                module,
+                                constructor_module,
+                                *variant_index,
+                            )
+                        } else {
+                            let fun_value = self.record_constructor_value(
+                                module,
+                                constructor_module,
+                                *variant_index,
+                                *arity,
+                            )?;
+                            self.apply_closure(module, fun_value, &values)
+                        }
+                    }
+                    ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                        self.lower_constant(module, literal)
+                    }
+                    ValueConstructorVariant::LocalConstant { literal } => {
+                        self.lower_constant(module, literal)
+                    }
+                    other => Err(crate::Error::NativeCodegen {
+                        message: format!(
+                            "record constant with unsupported constructor variant `{other:?}`"
+                        ),
+                    }),
+                }
+            }
+            Constant::Var {
+                name, constructor, ..
+            } => {
+                if let Some(constructor) = constructor {
+                    match &constructor.variant {
+                        ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                            self.lower_constant(module, literal)
+                        }
+                        ValueConstructorVariant::LocalConstant { literal } => {
+                            self.lower_constant(module, literal)
+                        }
+                        ValueConstructorVariant::Record {
+                            module: constructor_module,
+                            variant_index,
+                            arity,
+                            ..
+                        } => {
+                            if *arity == 0 {
+                                self.zero_arity_record_constant(
+                                    module,
+                                    constructor_module,
+                                    *variant_index,
+                                )
+                            } else {
+                                self.record_constructor_value(
+                                    module,
+                                    constructor_module,
+                                    *variant_index,
+                                    *arity,
+                                )
+                            }
+                        }
+                        ValueConstructorVariant::ModuleFn {
+                            module: function_module,
+                            name: function_name,
+                            arity,
+                            ..
+                        } => self.module_function_value(
+                            module,
+                            function_module,
+                            function_name,
+                            *arity,
+                        ),
+                        ValueConstructorVariant::LocalVariable { .. } => self
+                            .lookup(name)
+                            .copied()
+                            .ok_or_else(|| crate::Error::NativeCodegen {
+                                message: format!("unknown variable `{name}` in native constant"),
+                            }),
+                    }
+                } else {
+                    self.lookup(name)
+                        .copied()
+                        .ok_or_else(|| crate::Error::NativeCodegen {
+                            message: format!("unknown variable `{name}` in native constant"),
+                        })
+                }
+            }
+            Constant::StringConcatenation { left, right, .. } => {
+                if let (Some(left), Some(right)) =
+                    (constant_string_value(left), constant_string_value(right))
+                {
+                    let mut combined = left;
+                    combined.push_str(&right);
+                    self.string_constant(module, &combined)
+                } else {
+                    Err(crate::Error::NativeCodegen {
+                        message: "unsupported string concatenation constant in native backend"
+                            .into(),
+                    })
+                }
+            }
+            Constant::BitArray { .. } => Err(crate::Error::NativeCodegen {
+                message: "bit array constants are not yet supported in native functions".into(),
+            }),
+            Constant::Invalid { .. } => Err(crate::Error::NativeCodegen {
+                message: "invalid constant encountered during native lowering".into(),
+            }),
+        }
     }
 
     fn ensure_record_constructor_function(
@@ -2761,6 +3054,25 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_println_error = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_string_add(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_string_add {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("add", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_string_add = Some(id);
         Ok(id)
     }
 
@@ -3140,25 +3452,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         module: &mut ObjectModule,
         constant: &TypedConstant,
     ) -> Result<Value> {
-        match constant {
-            Constant::Record { name, type_, .. } if type_.is_bool() && name == "True" => {
-                self.bool_constant(module, true)
-            }
-            Constant::Record { name, type_, .. } if type_.is_bool() && name == "False" => {
-                self.bool_constant(module, false)
-            }
-            Constant::Var { name, type_, .. } if type_.is_bool() && name == "True" => {
-                self.bool_constant(module, true)
-            }
-            Constant::Var { name, type_, .. } if type_.is_bool() && name == "False" => {
-                self.bool_constant(module, false)
-            }
-            other => Err(crate::Error::NativeCodegen {
-                message: format!(
-                    "guard constant `{other:?}` is not yet supported in native functions"
-                ),
-            }),
-        }
+        self.lower_constant(module, constant)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4061,6 +4355,29 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
     fn pointer_bytes(&self) -> usize {
         self.pointer_bytes as usize
+    }
+}
+
+fn constant_string_value(constant: &TypedConstant) -> Option<String> {
+    match constant {
+        Constant::String { value, .. } => Some(value.to_string()),
+        Constant::StringConcatenation { left, right, .. } => {
+            let mut left_value = constant_string_value(left)?;
+            let right_value = constant_string_value(right)?;
+            left_value.push_str(&right_value);
+            Some(left_value)
+        }
+        Constant::Var {
+            constructor: Some(constructor),
+            ..
+        } => match &constructor.variant {
+            ValueConstructorVariant::ModuleConstant { literal, .. } => {
+                constant_string_value(literal)
+            }
+            ValueConstructorVariant::LocalConstant { literal } => constant_string_value(literal),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
