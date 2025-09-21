@@ -1589,6 +1589,66 @@ pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_r
 }
 
 #[no_mangle]
+pub extern "C" fn string_to_utf8_bits(raw: u64) -> u64 {
+    let string =
+        value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
+    bit_array_from_bytes(string.as_bytes(), string.len() * 8).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_pop_utf8_codepoint(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_pop_utf8_codepoint");
+
+    if view.bit_offset % 8 != 0 {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array utf8 split failure",
+        );
+        return tuple.to_raw();
+    }
+
+    let bytes = bit_array_bytes(&view);
+    if bytes.is_empty() {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array utf8 split failure",
+        );
+        return tuple.to_raw();
+    }
+
+    let string = match core::str::from_utf8(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            let tuple = tuple_from(
+                &[Value::from_bool(false), Value::nil(), Value::nil()],
+                "bit array utf8 split failure",
+            );
+            return tuple.to_raw();
+        }
+    };
+
+    let mut chars = string.chars();
+    let Some(first) = chars.next() else {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array utf8 split failure",
+        );
+        return tuple.to_raw();
+    };
+
+    let first_len = first.len_utf8();
+    let codepoint = Value::from_i63(first as u32 as i64);
+    let rest_bytes = &bytes[first_len..];
+    let rest_value = bit_array_from_bytes(rest_bytes, rest_bytes.len() * 8);
+
+    let tuple = tuple_from(
+        &[Value::from_bool(true), codepoint, rest_value],
+        "bit array utf8 split tuple",
+    );
+    tuple.to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));

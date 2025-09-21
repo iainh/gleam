@@ -2,6 +2,9 @@
 use std::panic::PanicHookInfo;
 
 pub fn add_handler() {
+    if std::env::var_os("GLEAM_NO_PANIC_HOOK").is_some() {
+        return;
+    }
     std::panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
         print_compiler_bug_message(info)
     }));

@@ -7,9 +7,10 @@
 use crate::{
     Result,
     ast::{
-        AssignmentKind, BinOp, ClauseGuard, Constant, Function, ModuleConstant, Pattern,
-        PipelineAssignmentKind, Publicity, Statement, TypedArg, TypedAssert, TypedClauseGuard,
-        TypedConstant, TypedDefinition, TypedExpr, TypedPipelineAssignment, TypedStatement,
+        AssignmentKind, BinOp, BitArrayOption, ClauseGuard, Constant, Function, ModuleConstant,
+        Pattern, PipelineAssignmentKind, Publicity, Statement, TypedArg, TypedAssert,
+        TypedClauseGuard, TypedConstant, TypedDefinition, TypedExpr, TypedPipelineAssignment,
+        TypedStatement,
     },
     build::Module as GleamModule,
     io::FileSystemWriter,
@@ -523,6 +524,36 @@ fn lower_expression(
             ModuleValueConstructor::Constant { literal, .. } => ctx.lower_constant(module, literal),
         },
 
+        TypedExpr::BitArray { segments, .. } => {
+            if segments.len() != 1 {
+                return Err(crate::Error::NativeCodegen {
+                    message:
+                        "bit array expressions with multiple segments are not yet supported in native functions"
+                            .into(),
+                });
+            }
+
+            let segment = &segments[0];
+            let is_utf8 = segment
+                .options
+                .iter()
+                .all(|option| matches!(option, BitArrayOption::Utf8 { .. }));
+
+            if !is_utf8 {
+                return Err(crate::Error::NativeCodegen {
+                    message: "bit array segment options are not yet supported in native functions"
+                        .into(),
+                });
+            }
+
+            let value = lower_expression(module, &segment.value, ctx)?;
+            let func_id = ctx.declare_runtime_string_utf8_bits(module)?;
+            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(func_ref, &[value]);
+            let results = ctx.builder.inst_results(call);
+            Ok(results[0])
+        }
+
         TypedExpr::BinOp {
             name, left, right, ..
         } => lower_bin_op(module, name, left, right, ctx),
@@ -838,6 +869,7 @@ fn lower_pattern_assignment(
                 tail.is_none(),
                 failure_block,
                 &failure_args,
+                subject_count,
                 subject_count,
             )?;
             pattern_block = block;
@@ -1372,16 +1404,28 @@ fn lower_case(
                             Pattern::Tuple { elements, .. } => {
                                 let mut element_capture_flags = Vec::with_capacity(elements.len());
                                 let mut element_binding_names = Vec::with_capacity(elements.len());
+                                let mut element_conditions = Vec::with_capacity(elements.len());
 
                                 for element in elements {
                                     match element {
                                         Pattern::Variable { name, .. } => {
                                             element_capture_flags.push(true);
                                             element_binding_names.push(Some(name.clone()));
+                                            element_conditions
+                                                .push(ConstructorTupleCondition::None);
                                         }
                                         Pattern::Discard { .. } => {
                                             element_capture_flags.push(false);
                                             element_binding_names.push(None);
+                                            element_conditions
+                                                .push(ConstructorTupleCondition::None);
+                                        }
+                                        Pattern::String { value, .. } => {
+                                            element_capture_flags.push(true);
+                                            element_binding_names.push(None);
+                                            element_conditions.push(
+                                                ConstructorTupleCondition::String(value.clone()),
+                                            );
                                         }
                                         other => {
                                             return Err(crate::Error::NativeCodegen {
@@ -1398,6 +1442,7 @@ fn lower_case(
                                 tuple_patterns.push(Some(ConstructorTupleInfo {
                                     capture_flags: element_capture_flags,
                                     binding_names: element_binding_names,
+                                    conditions: element_conditions,
                                 }));
                             }
                             other => {
@@ -1438,11 +1483,9 @@ fn lower_case(
                                             .into(),
                                 });
                             };
-                            if let Some(name) = &binding_names[index] {
-                                bindings.push((name.clone(), BindingSource::Value(value)));
-                            }
                             if let Some(tuple_info) = &tuple_patterns[index] {
                                 ctx.lower_constructor_tuple(
+                                    module,
                                     &mut pattern_block,
                                     &mut pattern_subjects,
                                     value,
@@ -1453,6 +1496,9 @@ fn lower_case(
                                 if ctx.builder.current_block() != Some(pattern_block) {
                                     ctx.builder.switch_to_block(pattern_block);
                                 }
+                            }
+                            if let Some(name) = &binding_names[index] {
+                                bindings.push((name.clone(), BindingSource::Value(value)));
                             }
                         } else if tuple_patterns[index].is_some() {
                             return Err(crate::Error::NativeCodegen {
@@ -1483,6 +1529,7 @@ fn lower_case(
                         info.ensure_exact,
                         next_block,
                         pattern_subjects.as_slice(),
+                        subject_count,
                         subject_count,
                     )?;
                     pattern_block = block;
@@ -1589,6 +1636,122 @@ fn lower_case(
                                 "unexpected extra values after lowering list pattern in native backend"
                                     .into(),
                         });
+                    }
+                }
+                Pattern::BitArray { segments, .. } => {
+                    if segments.len() == 1 {
+                        let segment = &segments[0];
+                        let is_bytes = segment
+                            .options
+                            .iter()
+                            .all(|option| matches!(option, BitArrayOption::Bytes { .. }));
+
+                        if !is_bytes {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "bit array pattern options are not yet supported in native functions"
+                                        .into(),
+                            });
+                        }
+
+                        match segment.value.as_ref() {
+                            Pattern::Variable { name, .. } => {
+                                bindings
+                                    .push((name.clone(), BindingSource::Subject(subject_index)));
+                            }
+                            Pattern::Discard { .. } => {}
+                            _ => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "only variable or discard patterns are supported for bytes segments in native functions"
+                                            .into(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
+                    if segments.len() != 2 {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "bit array patterns with unsupported segment count in native functions"
+                                .into(),
+                        });
+                    }
+
+                    let first_segment = &segments[0];
+                    let rest_segment = &segments[1];
+
+                    let is_utf8_codepoint = first_segment
+                        .options
+                        .iter()
+                        .all(|option| matches!(option, BitArrayOption::Utf8Codepoint { .. }));
+                    let is_bytes = rest_segment
+                        .options
+                        .iter()
+                        .all(|option| matches!(option, BitArrayOption::Bytes { .. }));
+
+                    if !is_utf8_codepoint || !is_bytes {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "bit array pattern options are not yet supported in native functions"
+                                    .into(),
+                        });
+                    }
+
+                    let first_binding = match first_segment.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        _ => {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "only variable or discard patterns are supported for utf8_codepoint segments in native functions"
+                                        .into(),
+                            });
+                        }
+                    };
+
+                    let rest_binding = match rest_segment.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        _ => {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "only variable or discard patterns are supported for bytes segments in native functions"
+                                        .into(),
+                            });
+                        }
+                    };
+
+                    let (block, params, extras) = ctx.branch_on_utf8_codepoint_pattern(
+                        module,
+                        pattern_block,
+                        pattern_subjects[subject_index],
+                        next_block,
+                        pattern_subjects.as_slice(),
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    if extras.len() != 2 {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "unexpected utf8 pattern extras in native case lowering"
+                                .into(),
+                        });
+                    }
+
+                    let first_value = extras[0];
+                    let rest_value = extras[1];
+
+                    if let Some(name) = first_binding {
+                        bindings.push((name, BindingSource::Value(first_value)));
+                    }
+                    if let Some(name) = rest_binding {
+                        bindings.push((name, BindingSource::Value(rest_value)));
                     }
                 }
                 other => {
@@ -2167,6 +2330,13 @@ struct NestedListInfo<'a> {
 struct ConstructorTupleInfo {
     capture_flags: Vec<bool>,
     binding_names: Vec<Option<EcoString>>,
+    conditions: Vec<ConstructorTupleCondition>,
+}
+
+#[derive(Debug)]
+enum ConstructorTupleCondition {
+    None,
+    String(EcoString),
 }
 
 #[derive(Clone, Copy)]
@@ -2400,6 +2570,8 @@ struct LoweringContext<'a, 'b, 'c> {
     runtime_println_error: Option<FuncId>,
     runtime_string_add: Option<FuncId>,
     runtime_string_equal: Option<FuncId>,
+    runtime_string_utf8_bits: Option<FuncId>,
+    runtime_bit_array_utf8_split: Option<FuncId>,
     runtime_bool_true: Option<FuncId>,
     runtime_bool_false: Option<FuncId>,
     runtime_list_cons: Option<FuncId>,
@@ -2449,6 +2621,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println_error: None,
             runtime_string_add: None,
             runtime_string_equal: None,
+            runtime_string_utf8_bits: None,
+            runtime_bit_array_utf8_split: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -3178,6 +3352,45 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(id)
     }
 
+    fn declare_runtime_string_utf8_bits(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_string_utf8_bits {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("string_to_utf8_bits", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_string_utf8_bits = Some(id);
+        Ok(id)
+    }
+
+    fn declare_runtime_bit_array_utf8_split(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_utf8_split {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_pop_utf8_codepoint", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_utf8_split = Some(id);
+        Ok(id)
+    }
+
     fn declare_runtime_bool_true(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
         if let Some(id) = self.runtime_bool_true {
             return Ok(id);
@@ -3392,7 +3605,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     ) -> Result<(ir::Block, Vec<Value>)> {
         let success_block = self.create_subject_block(subject_count);
 
-        self.builder.switch_to_block(current_block);
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
         let args = failure_args.to_vec();
         let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
         let boxed_check = self.builder.ins().band(subject, value_tag_mask);
@@ -3468,7 +3683,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     ) -> Result<(ir::Block, Vec<Value>)> {
         let success_block = self.create_subject_block(subject_count);
 
-        self.builder.switch_to_block(current_block);
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
         let args = failure_args.to_vec();
 
         let eq_func = self.declare_runtime_string_equal(module)?;
@@ -3494,6 +3711,61 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         let params = self.builder.func.dfg.block_params(success_block).to_vec();
         Ok((success_block, params))
+    }
+
+    fn branch_on_utf8_codepoint_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extract_block = self.builder.create_block();
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..2 {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        self.builder.switch_to_block(current_block);
+        let args = failure_args.to_vec();
+        let func_id = self.declare_runtime_bit_array_utf8_split(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject]);
+        let result = self.builder.inst_results(call)[0];
+
+        let flag = self.tuple_element(result, 0)?;
+        let true_value = self.bool_constant(module, true)?;
+        let condition = self.builder.ins().icmp(IntCC::Equal, flag, true_value);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(condition, extract_block, &[], failure_block, &args);
+        self.seal_block(current_block);
+
+        self.builder.switch_to_block(extract_block);
+        let codepoint = self.tuple_element(result, 1)?;
+        let rest = self.tuple_element(result, 2)?;
+        let mut success_args = failure_args.to_vec();
+        success_args.push(codepoint);
+        success_args.push(rest);
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.seal_block(extract_block);
+
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
     }
 
     fn lower_clause_guard_condition(
@@ -3552,6 +3824,16 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .builder
                     .ins()
                     .icmp(IntCC::SignedLessThanOrEqual, left_int, right_int))
+            }
+            ClauseGuard::And { left, right, .. } => {
+                let left = self.lower_clause_guard_condition(module, left)?;
+                let right = self.lower_clause_guard_condition(module, right)?;
+                Ok(self.builder.ins().band(left, right))
+            }
+            ClauseGuard::Or { left, right, .. } => {
+                let left = self.lower_clause_guard_condition(module, left)?;
+                let right = self.lower_clause_guard_condition(module, right)?;
+                Ok(self.builder.ins().bor(left, right))
             }
             ClauseGuard::Var { .. } | ClauseGuard::Constant(_) => {
                 let value = self.lower_clause_guard_operand(module, guard)?;
@@ -3927,8 +4209,15 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         ensure_exact: bool,
         failure_block: ir::Block,
         failure_args: &[Value],
+        failure_block_arg_count: usize,
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        if failure_block_arg_count > failure_args.len() {
+            return Err(crate::Error::NativeCodegen {
+                message: "requested failure argument count exceeds available subjects".into(),
+            });
+        }
+
         let head_capture_count = capture_heads.iter().filter(|capture| **capture).count();
         let pattern_capture_count: usize = head_patterns
             .iter()
@@ -3975,7 +4264,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         assert_eq!(capture_heads.len(), head_patterns.len());
 
         for (index, capture) in capture_heads.iter().enumerate() {
-            self.builder.switch_to_block(current_block);
+            if self.builder.current_block() != Some(current_block) {
+                self.builder.switch_to_block(current_block);
+            }
 
             let nil_func = self.declare_runtime_nil(module)?;
             let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
@@ -3993,11 +4284,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .builder
                     .append_block_param(non_nil_block, self.pointer_type);
             }
-            let args = subjects.clone();
-            let _ = self
-                .builder
-                .ins()
-                .brif(is_nil, failure_block, &args, non_nil_block, &args);
+            let failure_values: Vec<_> = subjects[..failure_block_arg_count].to_vec();
+            let _ = self.builder.ins().brif(
+                is_nil,
+                failure_block,
+                &failure_values,
+                non_nil_block,
+                &subjects,
+            );
             self.seal_block(current_block);
 
             self.builder.switch_to_block(non_nil_block);
@@ -4016,11 +4310,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .builder
                     .append_block_param(pointer_block, self.pointer_type);
             }
-            let args = subjects.clone();
-            let _ = self
-                .builder
-                .ins()
-                .brif(is_boxed, pointer_block, &args, failure_block, &args);
+            let failure_values: Vec<_> = subjects[..failure_block_arg_count].to_vec();
+            let _ = self.builder.ins().brif(
+                is_boxed,
+                pointer_block,
+                &subjects,
+                failure_block,
+                &failure_values,
+            );
             self.seal_block(current_block);
 
             self.builder.switch_to_block(pointer_block);
@@ -4046,11 +4343,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .builder
                     .append_block_param(list_block, self.pointer_type);
             }
-            let args = subjects.clone();
-            let _ = self
-                .builder
-                .ins()
-                .brif(is_list, list_block, &args, failure_block, &args);
+            let failure_values: Vec<_> = subjects[..failure_block_arg_count].to_vec();
+            let _ = self.builder.ins().brif(
+                is_list,
+                list_block,
+                &subjects,
+                failure_block,
+                &failure_values,
+            );
             self.seal_block(current_block);
 
             self.builder.switch_to_block(list_block);
@@ -4140,7 +4440,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         if ensure_exact {
-            self.builder.switch_to_block(current_block);
+            if self.builder.current_block() != Some(current_block) {
+                self.builder.switch_to_block(current_block);
+            }
 
             let nil_func = self.declare_runtime_nil(module)?;
             let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
@@ -4157,11 +4459,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .builder
                     .append_block_param(exact_block, self.pointer_type);
             }
-            let args = subjects.clone();
-            let _ = self
-                .builder
-                .ins()
-                .brif(is_nil, exact_block, &args, failure_block, &args);
+            let failure_values: Vec<_> = subjects[..failure_block_arg_count].to_vec();
+            let _ = self.builder.ins().brif(
+                is_nil,
+                exact_block,
+                &subjects,
+                failure_block,
+                &failure_values,
+            );
             self.seal_block(current_block);
 
             self.builder.switch_to_block(exact_block);
@@ -4220,23 +4525,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         nested_args.push(head_value);
         let nested_index = nested_args.len() - 1;
 
-        let nested_failure_block = self.builder.create_block();
-        for _ in 0..nested_args.len() {
-            let _ = self
-                .builder
-                .append_block_param(nested_failure_block, self.pointer_type);
-        }
-
-        self.builder.switch_to_block(nested_failure_block);
-        let failure_params = self.builder.block_params(nested_failure_block);
-        let trimmed_args: Vec<Value> = failure_params[..pattern_subjects.len()].to_vec();
-        let _ = self.builder.ins().jump(failure_block, &trimmed_args);
-        self.seal_block(nested_failure_block);
-
-        if self.builder.current_block() != Some(*pattern_block) {
-            self.builder.switch_to_block(*pattern_block);
-        }
-
         let (block, params, extras) = self.branch_on_list_pattern(
             module,
             *pattern_block,
@@ -4245,8 +4533,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             info.pattern.head_matches.as_slice(),
             info.pattern.capture_tail,
             info.pattern.ensure_exact,
-            nested_failure_block,
+            failure_block,
             nested_args.as_slice(),
+            pattern_subjects.len(),
             nested_args.len(),
         )?;
         *pattern_block = block;
@@ -4361,6 +4650,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
     fn lower_constructor_tuple(
         &mut self,
+        module: &mut ObjectModule,
         pattern_block: &mut ir::Block,
         pattern_subjects: &mut Vec<Value>,
         tuple_value: Value,
@@ -4386,7 +4676,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let mut extra_iter = extras.into_iter();
-        for (capture, name) in info.capture_flags.iter().zip(info.binding_names.iter()) {
+        for ((capture, name), condition) in info
+            .capture_flags
+            .iter()
+            .zip(info.binding_names.iter())
+            .zip(info.conditions.iter())
+        {
             if *capture {
                 let Some(value) = extra_iter.next() else {
                     return Err(crate::Error::NativeCodegen {
@@ -4394,6 +4689,35 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                             .into(),
                     });
                 };
+
+                match condition {
+                    ConstructorTupleCondition::None => {}
+                    ConstructorTupleCondition::String(expected) => {
+                        let expected_value = self.string_constant(module, expected.as_str())?;
+                        let func_id = self.declare_runtime_string_equal(module)?;
+                        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                        let call = self.builder.ins().call(func_ref, &[value, expected_value]);
+                        let result = self.builder.inst_results(call)[0];
+                        let true_value = self.bool_constant(module, true)?;
+                        let is_equal = self.builder.ins().icmp(IntCC::Equal, result, true_value);
+
+                        let continue_block = self.create_subject_block(pattern_subjects.len());
+                        let failure_args = pattern_subjects.clone();
+                        let success_args = pattern_subjects.clone();
+                        let _ = self.builder.ins().brif(
+                            is_equal,
+                            continue_block,
+                            success_args.as_slice(),
+                            failure_block,
+                            &failure_args,
+                        );
+                        self.seal_block(*pattern_block);
+                        self.builder.switch_to_block(continue_block);
+                        *pattern_block = continue_block;
+                        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+                    }
+                }
+
                 if let Some(name) = name {
                     bindings.push((name.clone(), BindingSource::Value(value)));
                 }
