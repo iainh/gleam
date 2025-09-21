@@ -31,7 +31,7 @@ use ecow::EcoString;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::TryFrom,
     mem::size_of,
     sync::Arc,
@@ -256,6 +256,7 @@ fn lower_function(
             module_functions,
             closure_counter,
         );
+        lowering.mark_sealed(block);
 
         for (value, arg) in block_params.iter().zip(function.arguments.iter()) {
             if let Some(name) = arg.get_variable_name() {
@@ -269,11 +270,19 @@ fn lower_function(
 
     builder.finalize();
 
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|err| crate::Error::NativeCodegen {
-            message: err.to_string(),
-        })?;
+    if let Err(err) = module.define_function(func_id, &mut ctx) {
+        let clif = format!("{}", ctx.func.display());
+        let func_name = function
+            .name
+            .as_ref()
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("<anonymous>");
+        return Err(crate::Error::NativeCodegen {
+            message: format!(
+                "error lowering {module_name}.{func_name}: {err} ({err:?})\n{clif}",
+            ),
+        });
+    }
     module.clear_context(&mut ctx);
     Ok(())
 }
@@ -548,14 +557,14 @@ fn lower_assert_statement(
         .builder
         .ins()
         .brif(is_true, success_block, &[], failure_block, &[]);
-    ctx.builder.seal_block(current_block);
+    ctx.seal_block(current_block);
 
     ctx.builder.switch_to_block(failure_block);
     if let Some(message) = &assert.message {
         let _ = lower_expression(module, message, ctx)?;
     }
     let _ = ctx.builder.ins().trap(TrapCode::User(0));
-    ctx.builder.seal_block(failure_block);
+    ctx.seal_block(failure_block);
 
     ctx.builder.switch_to_block(success_block);
     Ok(())
@@ -666,7 +675,7 @@ fn lower_pattern_assignment(
             ctx.builder.switch_to_block(failure_block);
             let params = ctx.builder.block_params(failure_block).to_vec();
             let _ = ctx.builder.ins().jump(trap_block, &params);
-            ctx.builder.seal_block(failure_block);
+            ctx.seal_block(failure_block);
             ctx.builder.switch_to_block(pattern_block);
         }
         Pattern::List { elements, tail, .. } => {
@@ -880,7 +889,7 @@ fn lower_pattern_assignment(
             ctx.builder.switch_to_block(failure_block);
             let params = ctx.builder.block_params(failure_block).to_vec();
             let _ = ctx.builder.ins().jump(trap_block, &params);
-            ctx.builder.seal_block(failure_block);
+            ctx.seal_block(failure_block);
             ctx.builder.switch_to_block(pattern_block);
         }
         Pattern::Tuple { elements, .. } => {
@@ -941,7 +950,7 @@ fn lower_pattern_assignment(
             ctx.builder.switch_to_block(failure_block);
             let params = ctx.builder.block_params(failure_block).to_vec();
             let _ = ctx.builder.ins().jump(trap_block, &params);
-            ctx.builder.seal_block(failure_block);
+            ctx.seal_block(failure_block);
             ctx.builder.switch_to_block(pattern_block);
         }
         other => {
@@ -968,7 +977,7 @@ fn lower_pattern_assignment(
             let _ = ctx.builder.ins().trap(TrapCode::User(0));
         }
     }
-    ctx.builder.seal_block(trap_block);
+    ctx.seal_block(trap_block);
 
     ctx.builder.switch_to_block(pattern_block);
 
@@ -1595,7 +1604,7 @@ fn lower_case(
                 next_block,
                 &failure_args,
             );
-            ctx.builder.seal_block(pattern_block);
+            ctx.seal_block(pattern_block);
 
             pattern_block = guard_success_block;
             let guard_params = ctx.builder.block_params(pattern_block).to_vec();
@@ -1633,7 +1642,7 @@ fn lower_case(
         let value = lower_expression(module, &clause.then, ctx)?;
         ctx.pop_scope();
         let _ = ctx.builder.ins().jump(exit_block, &[value]);
-        ctx.builder.seal_block(pattern_block);
+        ctx.seal_block(pattern_block);
 
         fallthrough = Some(next_block);
 
@@ -1644,11 +1653,11 @@ fn lower_case(
 
     if let Some(block) = fallthrough {
         ctx.builder.switch_to_block(block);
-        ctx.builder.seal_block(block);
+        ctx.seal_block(block);
         let _ = ctx.builder.ins().trap(TrapCode::User(0));
     }
 
-    ctx.builder.seal_block(exit_block);
+    ctx.seal_block(exit_block);
     ctx.builder.switch_to_block(exit_block);
     let result = ctx.builder.block_params(exit_block)[0];
     Ok(result)
@@ -1747,10 +1756,10 @@ fn lower_bin_op(
             ctx.builder.switch_to_block(right_block);
             let right_value = lower_expression(module, right, ctx)?;
             let _ = ctx.builder.ins().jump(exit_block, &[right_value]);
-            ctx.builder.seal_block(right_block);
+            ctx.seal_block(right_block);
 
             ctx.builder.switch_to_block(exit_block);
-            ctx.builder.seal_block(exit_block);
+            ctx.seal_block(exit_block);
             let result = ctx.builder.block_params(exit_block)[0];
             Ok(result)
         }
@@ -1901,6 +1910,7 @@ fn lower_closure_function(
             module_functions,
             closure_counter,
         );
+        lowering.mark_sealed(block);
 
         let mem_flags = MemFlags::trusted();
 
@@ -1930,11 +1940,14 @@ fn lower_closure_function(
 
     builder.finalize();
 
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|err| crate::Error::NativeCodegen {
-            message: err.to_string(),
-        })?;
+    if let Err(err) = module.define_function(func_id, &mut ctx) {
+        let clif = format!("{}", ctx.func.display());
+        return Err(crate::Error::NativeCodegen {
+            message: format!(
+                "error lowering closure {module_name}.{closure_id}: {err} ({err:?})\n{clif}",
+            ),
+        });
+    }
     module.clear_context(&mut ctx);
 
     Ok(func_id)
@@ -1983,11 +1996,14 @@ fn lower_record_constructor_function(
 
     builder.finalize();
 
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|err| crate::Error::NativeCodegen {
-            message: err.to_string(),
-        })?;
+    if let Err(err) = module.define_function(func_id, &mut ctx) {
+        let clif = format!("{}", ctx.func.display());
+        return Err(crate::Error::NativeCodegen {
+            message: format!(
+                "error lowering record constructor {module_name}.{constructor_module}.{variant_index}: {err} ({err:?})\n{clif}",
+            ),
+        });
+    }
     module.clear_context(&mut ctx);
     Ok(func_id)
 }
@@ -2120,6 +2136,7 @@ struct LoweringContext<'a, 'b, 'c> {
     pointer_bytes: u8,
     functions: &'a FunctionIdMap,
     module_name: &'a EcoString,
+    sealed_blocks: HashSet<ir::Block>,
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
@@ -2165,6 +2182,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             pointer_bytes,
             functions,
             module_name,
+            sealed_blocks: HashSet::new(),
         }
     }
 
@@ -2174,6 +2192,16 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
     fn pop_scope(&mut self) {
         let _ = self.scopes.pop();
+    }
+
+    fn mark_sealed(&mut self, block: ir::Block) {
+        let _ = self.sealed_blocks.insert(block);
+    }
+
+    fn seal_block(&mut self, block: ir::Block) {
+        if self.sealed_blocks.insert(block) {
+            self.builder.seal_block(block);
+        }
     }
 
     fn define(&mut self, name: &EcoString, value: Value) {
@@ -2778,7 +2806,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .brif(cmp, success_block, &args, failure_block, &args);
-        self.builder.seal_block(current_block);
+        self.seal_block(current_block);
 
         let params = self.builder.func.dfg.block_params(success_block).to_vec();
         Ok((success_block, params))
@@ -2812,7 +2840,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .brif(is_boxed, pointer_block, &args, failure_block, &args);
-        self.builder.seal_block(current_block);
+        self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
         let pointer_subject = self.builder.block_params(pointer_block)[0];
@@ -2841,7 +2869,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .brif(tag_matches, float_block, &args, failure_block, &args);
-        self.builder.seal_block(pointer_block);
+        self.seal_block(pointer_block);
 
         self.builder.switch_to_block(float_block);
         let params = self.builder.block_params(float_block).to_vec();
@@ -2853,7 +2881,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .brif(cmp, success_block, &args, failure_block, &args);
-        self.builder.seal_block(float_block);
+        self.seal_block(float_block);
 
         let params = self.builder.block_params(success_block).to_vec();
         Ok((success_block, params))
@@ -3031,7 +3059,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             failure_block,
             failure_args,
         );
-        self.builder.seal_block(current_block);
+        self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
         let pointer_subject = self.builder.block_params(pointer_block)[0];
@@ -3043,7 +3071,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .jump(tag_block, &[pointer_subject, header]);
-        self.builder.seal_block(pointer_block);
+        self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tag_block);
         let tag_subject = self.builder.block_params(tag_block)[0];
@@ -3094,7 +3122,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 failure_block,
                 failure_args,
             );
-            self.builder.seal_block(tag_block);
+            self.seal_block(tag_block);
         } else {
             let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
             let header_tag = self.builder.ins().band(tag_header, header_mask);
@@ -3114,7 +3142,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 failure_block,
                 failure_args,
             );
-            self.builder.seal_block(tag_block);
+            self.seal_block(tag_block);
 
             self.builder.switch_to_block(record_block);
             let record_subject = self.builder.block_params(record_block)[0];
@@ -3159,10 +3187,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 failure_block,
                 failure_args,
             );
-            self.builder.seal_block(record_block);
+            self.seal_block(record_block);
         }
 
         let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        self.seal_block(success_block);
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
@@ -3214,7 +3243,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             failure_block,
             failure_args,
         );
-        self.builder.seal_block(current_block);
+        self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
         let tuple_subject = self.builder.block_params(pointer_block)[0];
@@ -3254,7 +3283,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             failure_block,
             failure_args,
         );
-        self.builder.seal_block(pointer_block);
+        self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tuple_block);
         let tuple_subject = self.builder.block_params(tuple_block)[0];
@@ -3286,9 +3315,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         success_args.extend(captured_fields.iter().copied());
 
         let _ = self.builder.ins().jump(success_block, &success_args);
-        self.builder.seal_block(tuple_block);
+        self.seal_block(tuple_block);
 
         let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        self.seal_block(success_block);
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
@@ -3377,7 +3407,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .builder
                 .ins()
                 .brif(is_nil, failure_block, &args, non_nil_block, &args);
-            self.builder.seal_block(current_block);
+            self.seal_block(current_block);
 
             self.builder.switch_to_block(non_nil_block);
             current_block = non_nil_block;
@@ -3400,7 +3430,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .builder
                 .ins()
                 .brif(is_boxed, pointer_block, &args, failure_block, &args);
-            self.builder.seal_block(current_block);
+            self.seal_block(current_block);
 
             self.builder.switch_to_block(pointer_block);
             current_block = pointer_block;
@@ -3430,7 +3460,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .builder
                 .ins()
                 .brif(is_list, list_block, &args, failure_block, &args);
-            self.builder.seal_block(current_block);
+            self.seal_block(current_block);
 
             self.builder.switch_to_block(list_block);
             current_block = list_block;
@@ -3541,7 +3571,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 .builder
                 .ins()
                 .brif(is_nil, exact_block, &args, failure_block, &args);
-            self.builder.seal_block(current_block);
+            self.seal_block(current_block);
 
             self.builder.switch_to_block(exact_block);
             current_block = exact_block;
@@ -3576,9 +3606,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         success_args.extend(extra_values.iter().copied());
 
         let _ = self.builder.ins().jump(success_block, &success_args);
-        self.builder.seal_block(current_block);
+        self.seal_block(current_block);
         self.builder.switch_to_block(success_block);
         let params = self.builder.block_params(success_block).to_vec();
+        self.seal_block(success_block);
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
@@ -3630,7 +3661,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             failure_block,
             &[],
         );
-        self.builder.seal_block(pointer_block);
+        self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tuple_block);
         let tuple_ptr = self.builder.block_params(tuple_block)[0];
@@ -3662,7 +3693,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .brif(in_bounds, element_block, &[tuple_ptr], failure_block, &[]);
-        self.builder.seal_block(tuple_block);
+        self.seal_block(tuple_block);
+
+        self.builder.switch_to_block(failure_block);
+        let _ = self.builder.ins().trap(TrapCode::User(0));
+        self.seal_block(failure_block);
 
         self.builder.switch_to_block(element_block);
         let tuple_ptr = self.builder.block_params(element_block)[0];
@@ -3678,7 +3713,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .load(self.pointer_type, mem_flags, tuple_ptr, offset);
-        self.builder.seal_block(element_block);
+        self.seal_block(element_block);
         Ok(element)
     }
 
