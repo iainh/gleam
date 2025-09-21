@@ -876,6 +876,7 @@ fn lower_case(
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
+                    ctx.builder.switch_to_block(pattern_block);
 
                     let mut extra_iter = extras.into_iter();
                     for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
@@ -2494,7 +2495,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let mut success_args = failure_args.to_vec();
-        let args = failure_args.to_vec();
+        let failure_args = failure_args.to_vec();
         let mem_flags = MemFlags::trusted();
 
         self.builder.switch_to_block(current_block);
@@ -2515,10 +2516,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let zero = self.builder.ins().iconst(self.pointer_type, 0);
         let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
 
-        let _ = self
-            .builder
-            .ins()
-            .brif(is_boxed, pointer_block, &[subject], failure_block, &args);
+        let _ = self.builder.ins().brif(
+            is_boxed,
+            pointer_block,
+            &[subject],
+            failure_block,
+            &failure_args,
+        );
         self.builder.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
@@ -2580,7 +2584,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                &args,
+                &failure_args,
             );
             self.builder.seal_block(tag_block);
         } else {
@@ -2600,7 +2604,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 record_block,
                 &[tag_subject],
                 failure_block,
-                &args,
+                &failure_args,
             );
             self.builder.seal_block(tag_block);
 
@@ -2645,14 +2649,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                &args,
+                &failure_args,
             );
             self.builder.seal_block(record_block);
         }
 
-        self.builder.switch_to_block(success_block);
-
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
@@ -2824,6 +2826,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 subjects = params;
                 current_subject = subjects[subject_index];
                 constructor_extras = extras;
+                self.builder.switch_to_block(current_block);
             }
 
             let tail_offset = HEADER_SIZE + pointer_bytes as i32;
