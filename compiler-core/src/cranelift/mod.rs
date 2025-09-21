@@ -1313,6 +1313,20 @@ fn lower_case(
                     pattern_block = block;
                     pattern_subjects = params;
                 }
+                Pattern::String { value, .. } => {
+                    let literal = ctx.string_constant(module, value.as_str())?;
+                    let (block, params) = ctx.branch_on_string_pattern(
+                        module,
+                        pattern_block,
+                        pattern_subjects[subject_index],
+                        literal,
+                        next_block,
+                        &pattern_subjects,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+                }
                 Pattern::Constructor {
                     constructor,
                     arguments,
@@ -1334,6 +1348,8 @@ fn lower_case(
 
                     let mut capture_flags = Vec::with_capacity(arguments.len());
                     let mut binding_names = Vec::with_capacity(arguments.len());
+                    let mut tuple_patterns: Vec<Option<ConstructorTupleInfo>> =
+                        Vec::with_capacity(arguments.len());
                     for argument in arguments {
                         if argument.label.is_some() {
                             return Err(crate::Error::NativeCodegen {
@@ -1346,10 +1362,43 @@ fn lower_case(
                             Pattern::Variable { name, .. } => {
                                 capture_flags.push(true);
                                 binding_names.push(Some(name.clone()));
+                                tuple_patterns.push(None);
                             }
                             Pattern::Discard { .. } => {
                                 capture_flags.push(false);
                                 binding_names.push(None);
+                                tuple_patterns.push(None);
+                            }
+                            Pattern::Tuple { elements, .. } => {
+                                let mut element_capture_flags = Vec::with_capacity(elements.len());
+                                let mut element_binding_names = Vec::with_capacity(elements.len());
+
+                                for element in elements {
+                                    match element {
+                                        Pattern::Variable { name, .. } => {
+                                            element_capture_flags.push(true);
+                                            element_binding_names.push(Some(name.clone()));
+                                        }
+                                        Pattern::Discard { .. } => {
+                                            element_capture_flags.push(false);
+                                            element_binding_names.push(None);
+                                        }
+                                        other => {
+                                            return Err(crate::Error::NativeCodegen {
+                                                message: format!(
+                                                    "tuple constructor pattern element `{other:?}` is not yet supported in native functions"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+
+                                capture_flags.push(true);
+                                binding_names.push(None);
+                                tuple_patterns.push(Some(ConstructorTupleInfo {
+                                    capture_flags: element_capture_flags,
+                                    binding_names: element_binding_names,
+                                }));
                             }
                             other => {
                                 return Err(crate::Error::NativeCodegen {
@@ -1380,7 +1429,7 @@ fn lower_case(
                     }
 
                     let mut extra_iter = extras.into_iter();
-                    for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
+                    for (index, capture) in capture_flags.iter().enumerate() {
                         if *capture {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
@@ -1389,10 +1438,36 @@ fn lower_case(
                                             .into(),
                                 });
                             };
-                            if let Some(name) = name {
+                            if let Some(name) = &binding_names[index] {
                                 bindings.push((name.clone(), BindingSource::Value(value)));
                             }
+                            if let Some(tuple_info) = &tuple_patterns[index] {
+                                ctx.lower_constructor_tuple(
+                                    &mut pattern_block,
+                                    &mut pattern_subjects,
+                                    value,
+                                    tuple_info,
+                                    next_block,
+                                    &mut bindings,
+                                )?;
+                                if ctx.builder.current_block() != Some(pattern_block) {
+                                    ctx.builder.switch_to_block(pattern_block);
+                                }
+                            }
+                        } else if tuple_patterns[index].is_some() {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "nested tuple constructor pattern requires capturing the argument"
+                                        .into(),
+                            });
                         }
+                    }
+                    if extra_iter.next().is_some() {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "unexpected extra constructor capture values in native case lowering"
+                                    .into(),
+                        });
                     }
                 }
                 Pattern::List { elements, tail, .. } => {
@@ -2088,6 +2163,12 @@ struct NestedListInfo<'a> {
     pattern: Box<ListPatternInfo<'a>>,
 }
 
+#[derive(Debug)]
+struct ConstructorTupleInfo {
+    capture_flags: Vec<bool>,
+    binding_names: Vec<Option<EcoString>>,
+}
+
 #[derive(Clone, Copy)]
 enum BindingSource {
     Subject(usize),
@@ -2318,6 +2399,7 @@ struct LoweringContext<'a, 'b, 'c> {
     runtime_print_error: Option<FuncId>,
     runtime_println_error: Option<FuncId>,
     runtime_string_add: Option<FuncId>,
+    runtime_string_equal: Option<FuncId>,
     runtime_bool_true: Option<FuncId>,
     runtime_bool_false: Option<FuncId>,
     runtime_list_cons: Option<FuncId>,
@@ -2366,6 +2448,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_print_error: None,
             runtime_println_error: None,
             runtime_string_add: None,
+            runtime_string_equal: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -3076,6 +3159,25 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(id)
     }
 
+    fn declare_runtime_string_equal(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_string_equal {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("string_eq", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_string_equal = Some(id);
+        Ok(id)
+    }
+
     fn declare_runtime_bool_true(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
         if let Some(id) = self.runtime_bool_true {
             return Ok(id);
@@ -3351,6 +3453,46 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(float_block);
 
         let params = self.builder.block_params(success_block).to_vec();
+        Ok((success_block, params))
+    }
+
+    fn branch_on_string_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        string_value: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>)> {
+        let success_block = self.create_subject_block(subject_count);
+
+        self.builder.switch_to_block(current_block);
+        let args = failure_args.to_vec();
+
+        let eq_func = self.declare_runtime_string_equal(module)?;
+        let eq_ref = module.declare_func_in_func(eq_func, &mut self.builder.func);
+        let compare_call = self.builder.ins().call(eq_ref, &[subject, string_value]);
+        let compare_value = self.builder.inst_results(compare_call)[0];
+
+        let true_func = self.declare_runtime_bool_true(module)?;
+        let true_ref = module.declare_func_in_func(true_func, &mut self.builder.func);
+        let true_call = self.builder.ins().call(true_ref, &[]);
+        let true_value = self.builder.inst_results(true_call)[0];
+
+        let is_equal = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, compare_value, true_value);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_equal, success_block, &args, failure_block, &args);
+        self.seal_block(current_block);
+
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
         Ok((success_block, params))
     }
 
@@ -4211,6 +4353,57 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message:
                     "unexpected extra values after lowering nested list pattern in native backend"
                         .into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn lower_constructor_tuple(
+        &mut self,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        tuple_value: Value,
+        info: &ConstructorTupleInfo,
+        failure_block: ir::Block,
+        bindings: &mut Vec<(EcoString, BindingSource)>,
+    ) -> Result<()> {
+        let subject_count = pattern_subjects.len();
+        let (block, params, extras) = self.branch_on_tuple_pattern(
+            *pattern_block,
+            tuple_value,
+            info.capture_flags.len(),
+            info.capture_flags.as_slice(),
+            failure_block,
+            pattern_subjects.as_slice(),
+            subject_count,
+        )?;
+        *pattern_block = block;
+        *pattern_subjects = params;
+
+        if self.builder.current_block() != Some(*pattern_block) {
+            self.builder.switch_to_block(*pattern_block);
+        }
+
+        let mut extra_iter = extras.into_iter();
+        for (capture, name) in info.capture_flags.iter().zip(info.binding_names.iter()) {
+            if *capture {
+                let Some(value) = extra_iter.next() else {
+                    return Err(crate::Error::NativeCodegen {
+                        message: "missing tuple constructor element capture in native lowering"
+                            .into(),
+                    });
+                };
+                if let Some(name) = name {
+                    bindings.push((name.clone(), BindingSource::Value(value)));
+                }
+            }
+        }
+
+        if extra_iter.next().is_some() {
+            return Err(crate::Error::NativeCodegen {
+                message: "unexpected extra tuple constructor capture values in native lowering"
+                    .into(),
             });
         }
 

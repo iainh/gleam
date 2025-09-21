@@ -1589,6 +1589,15 @@ pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_r
 }
 
 #[no_mangle]
+pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
+    let left = value_to_string(Value::from_raw(left_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let right = value_to_string(Value::from_raw(right_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    Value::from_bool(left == right).to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn string_pop_codeunit(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
