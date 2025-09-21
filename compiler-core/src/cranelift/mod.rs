@@ -92,6 +92,7 @@ const HEADER_ARITY_SHIFT: i64 = 16;
 const HEADER_SIZE: i32 = 8;
 const TAG_FLOAT: u64 = 1;
 const TAG_LIST: i64 = 4;
+const TAG_TUPLE: i64 = 5;
 const TAG_RECORD: i64 = 6;
 const TAG_BOOLEAN: i64 = 12;
 const BOOLEAN_FALSE_ARITY: i64 = 0;
@@ -899,9 +900,9 @@ fn lower_case(
                 Pattern::List { elements, tail, .. } => {
                     let mut capture_heads = Vec::with_capacity(elements.len());
                     let mut head_names = Vec::with_capacity(elements.len());
-                    let mut head_constructors: Vec<Option<ListConstructorInfo<'_>>> =
+                    let mut head_matches: Vec<Option<ListHeadMatch<'_>>> =
                         Vec::with_capacity(elements.len());
-                    let mut head_constructor_bindings: Vec<Option<Vec<Option<EcoString>>>> =
+                    let mut head_field_bindings: Vec<Option<Vec<Option<EcoString>>>> =
                         Vec::with_capacity(elements.len());
 
                     for element in elements {
@@ -909,14 +910,14 @@ fn lower_case(
                             Pattern::Variable { name, .. } => {
                                 capture_heads.push(true);
                                 head_names.push(Some(name.clone()));
-                                head_constructors.push(None);
-                                head_constructor_bindings.push(None);
+                                head_matches.push(None);
+                                head_field_bindings.push(None);
                             }
                             Pattern::Discard { .. } => {
                                 capture_heads.push(false);
                                 head_names.push(None);
-                                head_constructors.push(None);
-                                head_constructor_bindings.push(None);
+                                head_matches.push(None);
+                                head_field_bindings.push(None);
                             }
                             Pattern::Constructor {
                                 constructor,
@@ -954,12 +955,46 @@ fn lower_case(
 
                                 capture_heads.push(false);
                                 head_names.push(None);
-                                head_constructors.push(Some(ListConstructorInfo {
-                                    constructor,
-                                    type_,
+                                head_matches.push(Some(ListHeadMatch::Constructor(
+                                    ListConstructorInfo {
+                                        constructor,
+                                        type_,
+                                        capture_flags,
+                                    },
+                                )));
+                                head_field_bindings.push(Some(binding_names));
+                            }
+                            Pattern::Tuple { elements, .. } => {
+                                let mut capture_flags = Vec::with_capacity(elements.len());
+                                let mut binding_names = Vec::with_capacity(elements.len());
+
+                                for element in elements {
+                                    match element {
+                                        Pattern::Variable { name, .. } => {
+                                            capture_flags.push(true);
+                                            binding_names.push(Some(name.clone()));
+                                        }
+                                        Pattern::Discard { .. } => {
+                                            capture_flags.push(false);
+                                            binding_names.push(None);
+                                        }
+                                        other => {
+                                            return Err(crate::Error::NativeCodegen {
+                                                message: format!(
+                                                    "tuple list head element `{other:?}` is not yet supported in native functions"
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+
+                                capture_heads.push(false);
+                                head_names.push(None);
+                                head_matches.push(Some(ListHeadMatch::Tuple(ListTupleInfo {
+                                    arity: elements.len(),
                                     capture_flags,
-                                }));
-                                head_constructor_bindings.push(Some(binding_names));
+                                })));
+                                head_field_bindings.push(Some(binding_names));
                             }
                             other => {
                                 return Err(crate::Error::NativeCodegen {
@@ -989,7 +1024,7 @@ fn lower_case(
                         pattern_block,
                         subject_index,
                         &capture_heads,
-                        &head_constructors,
+                        &head_matches,
                         capture_tail,
                         tail.is_none(),
                         next_block,
@@ -1000,10 +1035,10 @@ fn lower_case(
                     pattern_subjects = params;
 
                     let mut extra_iter = extras.into_iter();
-                    for (index, ((capture, name), constructor_bindings)) in capture_heads
+                    for (index, ((capture, name), field_bindings)) in capture_heads
                         .iter()
                         .zip(head_names.iter())
-                        .zip(head_constructor_bindings.iter())
+                        .zip(head_field_bindings.iter())
                         .enumerate()
                     {
                         if *capture {
@@ -1019,26 +1054,25 @@ fn lower_case(
                             }
                         }
 
-                        if let Some(binding_names) = constructor_bindings {
-                            let Some(info) =
-                                head_constructors.get(index).and_then(|opt| opt.as_ref())
+                        if let Some(binding_names) = field_bindings {
+                            let Some(info) = head_matches.get(index).and_then(|opt| opt.as_ref())
                             else {
                                 return Err(crate::Error::NativeCodegen {
                                     message:
-                                        "missing constructor info for list head bindings in native lowering"
+                                        "missing head match info for list bindings in native lowering"
                                             .into(),
                                 });
                             };
 
-                            if info.capture_flags.len() != binding_names.len() {
+                            if info.capture_flags().len() != binding_names.len() {
                                 return Err(crate::Error::NativeCodegen {
-                                    message: "constructor binding length mismatch in native list pattern lowering"
+                                    message: "list head binding length mismatch in native list pattern lowering"
                                         .into(),
                                 });
                             }
 
                             for (capture_flag, binding_name) in
-                                info.capture_flags.iter().zip(binding_names.iter())
+                                info.capture_flags().iter().zip(binding_names.iter())
                             {
                                 if *capture_flag {
                                     let Some(value) = extra_iter.next() else {
@@ -1583,6 +1617,27 @@ struct ListConstructorInfo<'a> {
     constructor: &'a PatternConstructor,
     type_: &'a Arc<Type>,
     capture_flags: Vec<bool>,
+}
+
+#[derive(Debug)]
+struct ListTupleInfo {
+    arity: usize,
+    capture_flags: Vec<bool>,
+}
+
+#[derive(Debug)]
+enum ListHeadMatch<'a> {
+    Constructor(ListConstructorInfo<'a>),
+    Tuple(ListTupleInfo),
+}
+
+impl<'a> ListHeadMatch<'a> {
+    fn capture_flags(&self) -> &[bool] {
+        match self {
+            ListHeadMatch::Constructor(info) => &info.capture_flags,
+            ListHeadMatch::Tuple(info) => &info.capture_flags,
+        }
+    }
 }
 
 struct LoweringContext<'a, 'b, 'c> {
@@ -2664,13 +2719,139 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn branch_on_tuple_pattern(
+        &mut self,
+        current_block: ir::Block,
+        subject: Value,
+        arity: usize,
+        capture_flags: &[bool],
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extra_count = capture_flags.iter().filter(|flag| **flag).count();
+
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..extra_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        let mut success_args = Vec::with_capacity(subject_count + extra_count);
+        success_args.extend_from_slice(failure_args);
+        let mem_flags = MemFlags::trusted();
+
+        let pointer_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(pointer_block, self.pointer_type);
+
+        let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+        let boxed_check = self.builder.ins().band(subject, value_tag_mask);
+        let zero = self.builder.ins().iconst(self.pointer_type, 0);
+        let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+        let _ = self.builder.ins().brif(
+            is_boxed,
+            pointer_block,
+            &[subject],
+            failure_block,
+            failure_args,
+        );
+        self.builder.seal_block(current_block);
+
+        self.builder.switch_to_block(pointer_block);
+        let tuple_subject = self.builder.block_params(pointer_block)[0];
+        let header = self
+            .builder
+            .ins()
+            .load(self.pointer_type, mem_flags, tuple_subject, 0);
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let header_tag = self.builder.ins().band(header, header_mask);
+        let tuple_tag = self.builder.ins().iconst(self.pointer_type, TAG_TUPLE);
+        let tag_matches = self.builder.ins().icmp(IntCC::Equal, header_tag, tuple_tag);
+
+        let arity_shifted = self.builder.ins().ushr_imm(header, HEADER_ARITY_SHIFT);
+        let arity_value = self.builder.ins().band(arity_shifted, header_mask);
+        let arity_u16 = u16::try_from(arity).map_err(|_| crate::Error::NativeCodegen {
+            message: "tuple arity exceeds native runtime limits".into(),
+        })?;
+        let expected = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, i64::from(arity_u16));
+        let arity_matches = self.builder.ins().icmp(IntCC::Equal, arity_value, expected);
+
+        let both_match = self.builder.ins().band(tag_matches, arity_matches);
+
+        let tuple_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(tuple_block, self.pointer_type);
+        let _ = self.builder.ins().brif(
+            both_match,
+            tuple_block,
+            &[tuple_subject],
+            failure_block,
+            failure_args,
+        );
+        self.builder.seal_block(pointer_block);
+
+        self.builder.switch_to_block(tuple_block);
+        let tuple_subject = self.builder.block_params(tuple_block)[0];
+
+        if capture_flags.len() != arity {
+            return Err(crate::Error::NativeCodegen {
+                message: "tuple capture flag length mismatch in native list pattern lowering"
+                    .into(),
+            });
+        }
+
+        let mut captured_fields = Vec::with_capacity(extra_count);
+        if extra_count > 0 {
+            let pointer_stride = self.pointer_bytes() as i32;
+            for (field_index, capture) in capture_flags.iter().enumerate() {
+                if *capture {
+                    let offset = HEADER_SIZE + (field_index as i32) * pointer_stride;
+                    let field_value = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        tuple_subject,
+                        offset,
+                    );
+                    captured_fields.push(field_value);
+                }
+            }
+        }
+
+        success_args.extend(captured_fields.iter().copied());
+
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.builder.seal_block(tuple_block);
+
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn branch_on_list_pattern(
         &mut self,
         module: &mut ObjectModule,
         current_block: ir::Block,
         subject_index: usize,
         capture_heads: &[bool],
-        head_constructors: &[Option<ListConstructorInfo<'_>>],
+        head_patterns: &[Option<ListHeadMatch<'_>>],
         capture_tail: bool,
         ensure_exact: bool,
         failure_block: ir::Block,
@@ -2678,13 +2859,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
         let head_capture_count = capture_heads.iter().filter(|capture| **capture).count();
-        let constructor_capture_count: usize = head_constructors
+        let pattern_capture_count: usize = head_patterns
             .iter()
             .filter_map(|info| info.as_ref())
-            .map(|info| info.capture_flags.iter().filter(|flag| **flag).count())
+            .map(|info| info.capture_flags().iter().filter(|flag| **flag).count())
             .sum();
         let extra_count =
-            head_capture_count + constructor_capture_count + if capture_tail { 1 } else { 0 };
+            head_capture_count + pattern_capture_count + if capture_tail { 1 } else { 0 };
 
         let success_block = self.builder.create_block();
         for _ in 0..subject_count {
@@ -2720,7 +2901,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 })?;
         let mut stored = 0usize;
 
-        assert_eq!(capture_heads.len(), head_constructors.len());
+        assert_eq!(capture_heads.len(), head_patterns.len());
 
         for (index, capture) in capture_heads.iter().enumerate() {
             self.builder.switch_to_block(current_block);
@@ -2806,29 +2987,40 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             subjects = self.builder.block_params(current_block).to_vec();
             current_subject = subjects[subject_index];
 
-            let constructor_info = head_constructors[index].as_ref();
-            let mut constructor_extras: Vec<Value> = Vec::new();
-            if let Some(info) = constructor_info {
+            let head_pattern = head_patterns[index].as_ref();
+            let mut head_extras: Vec<Value> = Vec::new();
+            if let Some(pattern) = head_pattern {
                 let head_value = self.builder.ins().load(
                     self.pointer_type,
                     mem_flags,
                     current_subject,
                     HEADER_SIZE,
                 );
-                let (block, params, extras) = self.branch_on_constructor_pattern(
-                    current_block,
-                    head_value,
-                    info.constructor,
-                    info.type_,
-                    &info.capture_flags,
-                    failure_block,
-                    &subjects,
-                    subject_count,
-                )?;
+                let (block, params, extras) = match pattern {
+                    ListHeadMatch::Constructor(info) => self.branch_on_constructor_pattern(
+                        current_block,
+                        head_value,
+                        info.constructor,
+                        info.type_,
+                        info.capture_flags.as_slice(),
+                        failure_block,
+                        &subjects,
+                        subject_count,
+                    )?,
+                    ListHeadMatch::Tuple(info) => self.branch_on_tuple_pattern(
+                        current_block,
+                        head_value,
+                        info.arity,
+                        info.capture_flags.as_slice(),
+                        failure_block,
+                        &subjects,
+                        subject_count,
+                    )?,
+                };
                 current_block = block;
                 subjects = params;
                 current_subject = subjects[subject_index];
-                constructor_extras = extras;
+                head_extras = extras;
                 if self.builder.current_block() != Some(current_block) {
                     self.builder.switch_to_block(current_block);
                 }
@@ -2852,14 +3044,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 stored += 1;
             }
 
-            if let Some(info) = constructor_info {
-                let mut extras_iter = constructor_extras.into_iter();
-                for capture_flag in &info.capture_flags {
+            if let Some(pattern) = head_pattern {
+                let mut extras_iter = head_extras.into_iter();
+                for capture_flag in pattern.capture_flags() {
                     if *capture_flag {
                         let Some(value) = extras_iter.next() else {
                             return Err(crate::Error::NativeCodegen {
                                 message:
-                                    "missing constructor capture value in native list pattern lowering"
+                                    "missing head capture value in native list pattern lowering"
                                         .into(),
                             });
                         };
