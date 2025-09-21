@@ -593,29 +593,7 @@ fn lower_pattern_assignment(
                 message: "pattern assignment requires an active block".into(),
             })?;
 
-    let failure_block = ctx.builder.create_block();
-    for _ in 0..subject_count {
-        let _ = ctx
-            .builder
-            .append_block_param(failure_block, ctx.pointer_type);
-    }
-
-    let current_block = pattern_block;
-    ctx.builder.switch_to_block(failure_block);
-    let _ = ctx.builder.block_params(failure_block);
-    match failure {
-        AssignmentFailure::Trap => {
-            let _ = ctx.builder.ins().trap(TrapCode::User(0));
-        }
-        AssignmentFailure::Assert { message } => {
-            if let Some(message) = message {
-                let _ = lower_expression(module, message, ctx)?;
-            }
-            let _ = ctx.builder.ins().trap(TrapCode::User(0));
-        }
-    }
-    ctx.builder.seal_block(failure_block);
-    ctx.builder.switch_to_block(current_block);
+    let trap_block = ctx.create_subject_block(subject_count);
 
     let mut bindings = Vec::new();
 
@@ -653,6 +631,7 @@ fn lower_pattern_assignment(
             }
 
             let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
             let (block, _params, extras) = ctx.branch_on_constructor_pattern(
                 pattern_block,
                 subjects[0],
@@ -683,6 +662,12 @@ fn lower_pattern_assignment(
                     }
                 }
             }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.builder.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
         }
         Pattern::List { elements, tail, .. } => {
             let mut capture_heads = Vec::with_capacity(elements.len());
@@ -805,6 +790,7 @@ fn lower_pattern_assignment(
             };
 
             let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
             let (block, _params, extras) = ctx.branch_on_list_pattern(
                 module,
                 pattern_block,
@@ -890,6 +876,12 @@ fn lower_pattern_assignment(
                     bindings.push((name, value));
                 }
             }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.builder.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
         }
         Pattern::Tuple { elements, .. } => {
             let mut capture_flags = Vec::with_capacity(elements.len());
@@ -916,6 +908,7 @@ fn lower_pattern_assignment(
             }
 
             let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
             let (block, _params, extras) = ctx.branch_on_tuple_pattern(
                 pattern_block,
                 subjects[0],
@@ -944,6 +937,12 @@ fn lower_pattern_assignment(
                     }
                 }
             }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.builder.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
         }
         other => {
             return Err(crate::Error::NativeCodegen {
@@ -955,6 +954,23 @@ fn lower_pattern_assignment(
     if ctx.builder.current_block() != Some(pattern_block) {
         ctx.builder.switch_to_block(pattern_block);
     }
+
+    ctx.builder.switch_to_block(trap_block);
+    let _ = ctx.builder.block_params(trap_block);
+    match failure {
+        AssignmentFailure::Trap => {
+            let _ = ctx.builder.ins().trap(TrapCode::User(0));
+        }
+        AssignmentFailure::Assert { message } => {
+            if let Some(message) = message {
+                let _ = lower_expression(module, message, ctx)?;
+            }
+            let _ = ctx.builder.ins().trap(TrapCode::User(0));
+        }
+    }
+    ctx.builder.seal_block(trap_block);
+
+    ctx.builder.switch_to_block(pattern_block);
 
     for (name, value) in bindings {
         ctx.define(&name, value);
@@ -3647,10 +3663,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .brif(in_bounds, element_block, &[tuple_ptr], failure_block, &[]);
         self.builder.seal_block(tuple_block);
-
-        self.builder.switch_to_block(failure_block);
-        let _ = self.builder.ins().trap(TrapCode::User(0));
-        self.builder.seal_block(failure_block);
 
         self.builder.switch_to_block(element_block);
         let tuple_ptr = self.builder.block_params(element_block)[0];
