@@ -1217,12 +1217,6 @@ fn lower_case(
 
     let mut fallthrough = Some(fallthrough_block);
 
-    #[derive(Clone, Copy)]
-    enum BindingSource {
-        Subject(usize),
-        Value(Value),
-    }
-
     for (index, clause) in clauses.iter().enumerate() {
         let Some(current_block) = fallthrough else {
             break;
@@ -1349,8 +1343,11 @@ fn lower_case(
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
-                    // Branch lowering leaves us positioned in the pattern block ready for
-                    // subsequent value bindings.
+                    // Ensure we resume writing instructions in the pattern block returned by
+                    // the branch lowering helper.
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
 
                     let mut extra_iter = extras.into_iter();
                     for (capture, name) in capture_flags.iter().zip(binding_names.iter()) {
@@ -1369,202 +1366,35 @@ fn lower_case(
                     }
                 }
                 Pattern::List { elements, tail, .. } => {
-                    fn analyse_list_element<'a>(
-                        element: &'a Pattern<Arc<Type>>,
-                        capture_heads: &mut Vec<bool>,
-                        head_names: &mut Vec<Option<EcoString>>,
-                        head_matches: &mut Vec<Option<ListHeadMatch<'a>>>,
-                        head_field_bindings: &mut Vec<Option<Vec<Option<EcoString>>>>,
-                        head_extra_bindings: &mut Vec<Vec<EcoString>>,
-                    ) -> Result<()> {
-                        match element {
-                            Pattern::Assign { name, pattern, .. } => {
-                                let before = capture_heads.len();
-                                analyse_list_element(
-                                    pattern,
-                                    capture_heads,
-                                    head_names,
-                                    head_matches,
-                                    head_field_bindings,
-                                    head_extra_bindings,
-                                )?;
-                                if capture_heads.len() == before {
-                                    return Err(crate::Error::NativeCodegen {
-                                        message:
-                                            "assign pattern did not produce list head in native lowering"
-                                                .into(),
-                                    });
-                                }
-                                let index = capture_heads.len() - 1;
-                                if !capture_heads[index] {
-                                    capture_heads[index] = true;
-                                    head_names[index] = Some(name.clone());
-                                } else if head_names[index].is_none() {
-                                    head_names[index] = Some(name.clone());
-                                } else {
-                                    head_extra_bindings[index].push(name.clone());
-                                }
-                                Ok(())
-                            }
-                            Pattern::Variable { name, .. } => {
-                                capture_heads.push(true);
-                                head_names.push(Some(name.clone()));
-                                head_matches.push(None);
-                                head_field_bindings.push(None);
-                                head_extra_bindings.push(Vec::new());
-                                Ok(())
-                            }
-                            Pattern::Discard { .. } => {
-                                capture_heads.push(false);
-                                head_names.push(None);
-                                head_matches.push(None);
-                                head_field_bindings.push(None);
-                                head_extra_bindings.push(Vec::new());
-                                Ok(())
-                            }
-                            Pattern::Constructor {
-                                constructor,
-                                arguments,
-                                spread,
-                                type_,
-                                ..
-                            } if spread.is_none() => {
-                                let constructor = constructor.expect_ref(
-                                    "pattern constructor must be known during native code generation",
-                                );
-
-                                let mut capture_flags = Vec::with_capacity(arguments.len());
-                                let mut binding_names = Vec::with_capacity(arguments.len());
-
-                                for argument in arguments {
-                                    match &argument.value {
-                                        Pattern::Variable { name, .. } => {
-                                            capture_flags.push(true);
-                                            binding_names.push(Some(name.clone()));
-                                        }
-                                        Pattern::Discard { .. } => {
-                                            capture_flags.push(false);
-                                            binding_names.push(None);
-                                        }
-                                        other => {
-                                            return Err(crate::Error::NativeCodegen {
-                                                message: format!(
-                                                    "constructor list head pattern argument `{other:?}` is not yet supported in native functions"
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
-
-                                capture_heads.push(false);
-                                head_names.push(None);
-                                head_matches.push(Some(ListHeadMatch::Constructor(
-                                    ListConstructorInfo {
-                                        constructor,
-                                        type_,
-                                        capture_flags,
-                                    },
-                                )));
-                                head_field_bindings.push(Some(binding_names));
-                                head_extra_bindings.push(Vec::new());
-                                Ok(())
-                            }
-                            Pattern::Tuple { elements, .. } => {
-                                let mut capture_flags = Vec::with_capacity(elements.len());
-                                let mut binding_names = Vec::with_capacity(elements.len());
-
-                                for element in elements {
-                                    match element {
-                                        Pattern::Variable { name, .. } => {
-                                            capture_flags.push(true);
-                                            binding_names.push(Some(name.clone()));
-                                        }
-                                        Pattern::Discard { .. } => {
-                                            capture_flags.push(false);
-                                            binding_names.push(None);
-                                        }
-                                        other => {
-                                            return Err(crate::Error::NativeCodegen {
-                                                message: format!(
-                                                    "tuple list head element `{other:?}` is not yet supported in native functions"
-                                                ),
-                                            });
-                                        }
-                                    }
-                                }
-
-                                capture_heads.push(false);
-                                head_names.push(None);
-                                head_matches.push(Some(ListHeadMatch::Tuple(ListTupleInfo {
-                                    arity: elements.len(),
-                                    capture_flags,
-                                })));
-                                head_field_bindings.push(Some(binding_names));
-                                head_extra_bindings.push(Vec::new());
-                                Ok(())
-                            }
-                            other => Err(crate::Error::NativeCodegen {
-                                message: format!(
-                                    "list pattern element `{other:?}` is not yet supported in native functions"
-                                ),
-                            }),
-                        }
-                    }
-
-                    let mut capture_heads = Vec::with_capacity(elements.len());
-                    let mut head_names = Vec::with_capacity(elements.len());
-                    let mut head_matches: Vec<Option<ListHeadMatch<'_>>> =
-                        Vec::with_capacity(elements.len());
-                    let mut head_field_bindings: Vec<Option<Vec<Option<EcoString>>>> =
-                        Vec::with_capacity(elements.len());
-                    let mut head_extra_bindings: Vec<Vec<EcoString>> =
-                        Vec::with_capacity(elements.len());
-
-                    for element in elements {
-                        analyse_list_element(
-                            element,
-                            &mut capture_heads,
-                            &mut head_names,
-                            &mut head_matches,
-                            &mut head_field_bindings,
-                            &mut head_extra_bindings,
-                        )?;
-                    }
-
-                    let (capture_tail, tail_name) = match tail.as_deref() {
-                        None => (false, None),
-                        Some(Pattern::Variable { name, .. }) => (true, Some(name.clone())),
-                        Some(Pattern::Discard { .. }) => (false, None),
-                        Some(other) => {
-                            return Err(crate::Error::NativeCodegen {
-                                message: format!(
-                                    "list tail pattern `{other:?}` is not yet supported in native functions"
-                                ),
-                            });
-                        }
-                    };
+                    let info = collect_list_pattern_info(elements, tail.as_deref())?;
 
                     let (block, params, extras) = ctx.branch_on_list_pattern(
                         module,
                         pattern_block,
                         subject_index,
-                        &capture_heads,
-                        &head_matches,
-                        capture_tail,
-                        tail.is_none(),
+                        info.capture_heads.as_slice(),
+                        info.head_matches.as_slice(),
+                        info.capture_tail,
+                        info.ensure_exact,
                         next_block,
-                        &pattern_subjects,
+                        pattern_subjects.as_slice(),
                         subject_count,
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
 
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
                     let mut extra_iter = extras.into_iter();
-                    for (index, capture) in capture_heads.iter().enumerate() {
-                        let name = &head_names[index];
-                        let field_bindings = &head_field_bindings[index];
-                        let extra_aliases = &head_extra_bindings[index];
-                        if *capture {
+                    for index in 0..info.capture_heads.len() {
+                        let capture = info.capture_heads[index];
+                        let name = &info.head_names[index];
+                        let field_bindings = &info.head_field_bindings[index];
+                        let extra_aliases = &info.head_extra_bindings[index];
+                        let nested = &info.head_nested_lists[index];
+                        if capture {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
                                     message:
@@ -1578,11 +1408,31 @@ fn lower_case(
                             for alias in extra_aliases {
                                 bindings.push((alias.clone(), BindingSource::Value(value)));
                             }
+
+                            if let Some(nested_info) = nested {
+                                ctx.lower_nested_list(
+                                    module,
+                                    &mut pattern_block,
+                                    &mut pattern_subjects,
+                                    value,
+                                    nested_info,
+                                    next_block,
+                                    &mut bindings,
+                                )?;
+                                if ctx.builder.current_block() != Some(pattern_block) {
+                                    ctx.builder.switch_to_block(pattern_block);
+                                }
+                            }
+                        } else if nested.is_some() {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "nested list pattern requires head capture in native case lowering"
+                                        .into(),
+                            });
                         }
 
                         if let Some(binding_names) = field_bindings {
-                            let Some(info) = head_matches.get(index).and_then(|opt| opt.as_ref())
-                            else {
+                            let Some(info) = info.head_matches[index].as_ref() else {
                                 return Err(crate::Error::NativeCodegen {
                                     message:
                                         "missing head match info for list bindings in native lowering"
@@ -1615,8 +1465,8 @@ fn lower_case(
                             }
                         }
                     }
-                    if capture_tail {
-                        if let Some(name) = tail_name {
+                    if info.capture_tail {
+                        if let Some(name) = info.tail_name {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
                                     message:
@@ -1626,6 +1476,14 @@ fn lower_case(
                             };
                             bindings.push((name, BindingSource::Value(value)));
                         }
+                    }
+
+                    if extra_iter.next().is_some() {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "unexpected extra values after lowering list pattern in native backend"
+                                    .into(),
+                        });
                     }
                 }
                 other => {
@@ -2171,6 +2029,236 @@ impl<'a> ListHeadMatch<'a> {
             ListHeadMatch::Tuple(info) => &info.capture_flags,
         }
     }
+}
+
+#[derive(Debug)]
+struct ListPatternInfo<'a> {
+    capture_heads: Vec<bool>,
+    head_names: Vec<Option<EcoString>>,
+    head_matches: Vec<Option<ListHeadMatch<'a>>>,
+    head_field_bindings: Vec<Option<Vec<Option<EcoString>>>>,
+    head_extra_bindings: Vec<Vec<EcoString>>,
+    head_nested_lists: Vec<Option<NestedListInfo<'a>>>,
+    capture_tail: bool,
+    tail_name: Option<EcoString>,
+    ensure_exact: bool,
+}
+
+#[derive(Debug)]
+struct NestedListInfo<'a> {
+    pattern: Box<ListPatternInfo<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum BindingSource {
+    Subject(usize),
+    Value(Value),
+}
+
+fn collect_list_pattern_info<'a>(
+    elements: &'a [Pattern<Arc<Type>>],
+    tail: Option<&'a Pattern<Arc<Type>>>,
+) -> Result<ListPatternInfo<'a>> {
+    fn analyse_list_element<'a>(
+        element: &'a Pattern<Arc<Type>>,
+        capture_heads: &mut Vec<bool>,
+        head_names: &mut Vec<Option<EcoString>>,
+        head_matches: &mut Vec<Option<ListHeadMatch<'a>>>,
+        head_field_bindings: &mut Vec<Option<Vec<Option<EcoString>>>>,
+        head_extra_bindings: &mut Vec<Vec<EcoString>>,
+        head_nested_lists: &mut Vec<Option<NestedListInfo<'a>>>,
+    ) -> Result<()> {
+        match element {
+            Pattern::Assign { name, pattern, .. } => {
+                let before = capture_heads.len();
+                analyse_list_element(
+                    pattern,
+                    capture_heads,
+                    head_names,
+                    head_matches,
+                    head_field_bindings,
+                    head_extra_bindings,
+                    head_nested_lists,
+                )?;
+                if capture_heads.len() == before {
+                    return Err(crate::Error::NativeCodegen {
+                        message: "assign pattern did not produce list head in native lowering"
+                            .into(),
+                    });
+                }
+                let index = capture_heads.len() - 1;
+                if !capture_heads[index] {
+                    capture_heads[index] = true;
+                    head_names[index] = Some(name.clone());
+                } else if head_names[index].is_none() {
+                    head_names[index] = Some(name.clone());
+                } else {
+                    head_extra_bindings[index].push(name.clone());
+                }
+                Ok(())
+            }
+            Pattern::Variable { name, .. } => {
+                capture_heads.push(true);
+                head_names.push(Some(name.clone()));
+                head_matches.push(None);
+                head_field_bindings.push(None);
+                head_extra_bindings.push(Vec::new());
+                head_nested_lists.push(None);
+                Ok(())
+            }
+            Pattern::Discard { .. } => {
+                capture_heads.push(false);
+                head_names.push(None);
+                head_matches.push(None);
+                head_field_bindings.push(None);
+                head_extra_bindings.push(Vec::new());
+                head_nested_lists.push(None);
+                Ok(())
+            }
+            Pattern::Constructor {
+                constructor,
+                arguments,
+                spread,
+                type_,
+                ..
+            } if spread.is_none() => {
+                let constructor = constructor
+                    .expect_ref("pattern constructor must be known during native code generation");
+
+                let mut capture_flags = Vec::with_capacity(arguments.len());
+                let mut binding_names = Vec::with_capacity(arguments.len());
+
+                for argument in arguments {
+                    match &argument.value {
+                        Pattern::Variable { name, .. } => {
+                            capture_flags.push(true);
+                            binding_names.push(Some(name.clone()));
+                        }
+                        Pattern::Discard { .. } => {
+                            capture_flags.push(false);
+                            binding_names.push(None);
+                        }
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "constructor list head argument `{other:?}` is not yet supported in native functions"
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                capture_heads.push(false);
+                head_names.push(None);
+                head_matches.push(Some(ListHeadMatch::Constructor(ListConstructorInfo {
+                    constructor,
+                    type_,
+                    capture_flags,
+                })));
+                head_field_bindings.push(Some(binding_names));
+                head_extra_bindings.push(Vec::new());
+                head_nested_lists.push(None);
+                Ok(())
+            }
+            Pattern::Tuple { elements, .. } => {
+                let mut capture_flags = Vec::with_capacity(elements.len());
+                let mut binding_names = Vec::with_capacity(elements.len());
+
+                for element in elements {
+                    match element {
+                        Pattern::Variable { name, .. } => {
+                            capture_flags.push(true);
+                            binding_names.push(Some(name.clone()));
+                        }
+                        Pattern::Discard { .. } => {
+                            capture_flags.push(false);
+                            binding_names.push(None);
+                        }
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "tuple list head element `{other:?}` is not yet supported in native functions"
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                capture_heads.push(false);
+                head_names.push(None);
+                head_matches.push(Some(ListHeadMatch::Tuple(ListTupleInfo {
+                    arity: elements.len(),
+                    capture_flags,
+                })));
+                head_field_bindings.push(Some(binding_names));
+                head_extra_bindings.push(Vec::new());
+                head_nested_lists.push(None);
+                Ok(())
+            }
+            Pattern::List { elements, tail, .. } => {
+                let info = collect_list_pattern_info(elements, tail.as_deref())?;
+                capture_heads.push(true);
+                head_names.push(None);
+                head_matches.push(None);
+                head_field_bindings.push(None);
+                head_extra_bindings.push(Vec::new());
+                head_nested_lists.push(Some(NestedListInfo {
+                    pattern: Box::new(info),
+                }));
+                Ok(())
+            }
+            other => Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "list pattern element `{other:?}` is not yet supported in native functions"
+                ),
+            }),
+        }
+    }
+
+    let mut capture_heads = Vec::with_capacity(elements.len());
+    let mut head_names = Vec::with_capacity(elements.len());
+    let mut head_matches: Vec<Option<ListHeadMatch<'a>>> = Vec::with_capacity(elements.len());
+    let mut head_field_bindings: Vec<Option<Vec<Option<EcoString>>>> =
+        Vec::with_capacity(elements.len());
+    let mut head_extra_bindings: Vec<Vec<EcoString>> = Vec::with_capacity(elements.len());
+    let mut head_nested_lists: Vec<Option<NestedListInfo<'a>>> = Vec::with_capacity(elements.len());
+
+    for element in elements {
+        analyse_list_element(
+            element,
+            &mut capture_heads,
+            &mut head_names,
+            &mut head_matches,
+            &mut head_field_bindings,
+            &mut head_extra_bindings,
+            &mut head_nested_lists,
+        )?;
+    }
+
+    let (capture_tail, tail_name) = match tail {
+        None => (false, None),
+        Some(Pattern::Variable { name, .. }) => (true, Some(name.clone())),
+        Some(Pattern::Discard { .. }) => (false, None),
+        Some(other) => {
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "list tail pattern `{other:?}` is not yet supported in native functions"
+                ),
+            });
+        }
+    };
+
+    Ok(ListPatternInfo {
+        capture_heads,
+        head_names,
+        head_matches,
+        head_field_bindings,
+        head_extra_bindings,
+        head_nested_lists,
+        capture_tail,
+        tail_name,
+        ensure_exact: tail.is_none(),
+    })
 }
 
 struct LoweringContext<'a, 'b, 'c> {
@@ -3680,6 +3768,159 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let new_subjects = params[..subject_count].to_vec();
         let extras = params[subject_count..].to_vec();
         Ok((success_block, new_subjects, extras))
+    }
+
+    fn lower_nested_list<'pattern>(
+        &mut self,
+        module: &mut ObjectModule,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        head_value: Value,
+        info: &NestedListInfo<'pattern>,
+        failure_block: ir::Block,
+        bindings: &mut Vec<(EcoString, BindingSource)>,
+    ) -> Result<()> {
+        let mut nested_args = pattern_subjects.clone();
+        nested_args.push(head_value);
+        let nested_index = nested_args.len() - 1;
+
+        let nested_failure_block = self.builder.create_block();
+        for _ in 0..nested_args.len() {
+            let _ = self
+                .builder
+                .append_block_param(nested_failure_block, self.pointer_type);
+        }
+
+        self.builder.switch_to_block(nested_failure_block);
+        let failure_params = self.builder.block_params(nested_failure_block);
+        let trimmed_args: Vec<Value> = failure_params[..pattern_subjects.len()].to_vec();
+        let _ = self.builder.ins().jump(failure_block, &trimmed_args);
+        self.seal_block(nested_failure_block);
+
+        if self.builder.current_block() != Some(*pattern_block) {
+            self.builder.switch_to_block(*pattern_block);
+        }
+
+        let (block, params, extras) = self.branch_on_list_pattern(
+            module,
+            *pattern_block,
+            nested_index,
+            info.pattern.capture_heads.as_slice(),
+            info.pattern.head_matches.as_slice(),
+            info.pattern.capture_tail,
+            info.pattern.ensure_exact,
+            nested_failure_block,
+            nested_args.as_slice(),
+            nested_args.len(),
+        )?;
+        *pattern_block = block;
+        let mut new_subjects = params;
+        let _ = new_subjects.pop();
+        *pattern_subjects = new_subjects;
+
+        if self.builder.current_block() != Some(*pattern_block) {
+            self.builder.switch_to_block(*pattern_block);
+        }
+
+        let mut extra_iter = extras.into_iter();
+        for index in 0..info.pattern.capture_heads.len() {
+            let capture = info.pattern.capture_heads[index];
+            let name = &info.pattern.head_names[index];
+            let field_bindings = &info.pattern.head_field_bindings[index];
+            let extra_aliases = &info.pattern.head_extra_bindings[index];
+            let nested = &info.pattern.head_nested_lists[index];
+            if capture {
+                let Some(value) = extra_iter.next() else {
+                    return Err(crate::Error::NativeCodegen {
+                        message: "missing captured nested list head value in native case lowering"
+                            .into(),
+                    });
+                };
+                if let Some(name) = name {
+                    bindings.push((name.clone(), BindingSource::Value(value)));
+                }
+                for alias in extra_aliases {
+                    bindings.push((alias.clone(), BindingSource::Value(value)));
+                }
+
+                if let Some(nested_info) = nested {
+                    self.lower_nested_list(
+                        module,
+                        pattern_block,
+                        pattern_subjects,
+                        value,
+                        nested_info,
+                        failure_block,
+                        bindings,
+                    )?;
+                    if self.builder.current_block() != Some(*pattern_block) {
+                        self.builder.switch_to_block(*pattern_block);
+                    }
+                }
+            } else if nested.is_some() {
+                return Err(crate::Error::NativeCodegen {
+                    message: "nested list pattern requires head capture in native case lowering"
+                        .into(),
+                });
+            }
+
+            if let Some(binding_names) = field_bindings {
+                let Some(info) = info.pattern.head_matches[index].as_ref() else {
+                    return Err(crate::Error::NativeCodegen {
+                        message:
+                            "missing nested head match info for list bindings in native lowering"
+                                .into(),
+                    });
+                };
+
+                if info.capture_flags().len() != binding_names.len() {
+                    return Err(crate::Error::NativeCodegen {
+                        message:
+                            "nested list head binding length mismatch in native list pattern lowering"
+                                .into(),
+                    });
+                }
+
+                for (capture_flag, binding_name) in
+                    info.capture_flags().iter().zip(binding_names.iter())
+                {
+                    if *capture_flag {
+                        let Some(value) = extra_iter.next() else {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "missing captured nested constructor field in native case lowering"
+                                        .into(),
+                            });
+                        };
+                        if let Some(name) = binding_name {
+                            bindings.push((name.clone(), BindingSource::Value(value)));
+                        }
+                    }
+                }
+            }
+        }
+
+        if info.pattern.capture_tail {
+            if let Some(name) = &info.pattern.tail_name {
+                let Some(value) = extra_iter.next() else {
+                    return Err(crate::Error::NativeCodegen {
+                        message: "missing captured nested list tail value in native case lowering"
+                            .into(),
+                    });
+                };
+                bindings.push((name.clone(), BindingSource::Value(value)));
+            }
+        }
+
+        if extra_iter.next().is_some() {
+            return Err(crate::Error::NativeCodegen {
+                message:
+                    "unexpected extra values after lowering nested list pattern in native backend"
+                        .into(),
+            });
+        }
+
+        Ok(())
     }
 
     fn tuple_element(&mut self, tuple: Value, index: u64) -> Result<Value> {
