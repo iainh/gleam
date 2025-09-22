@@ -56,6 +56,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_bit_array_bit_size: Option<FuncId>,
     pub(super) runtime_bit_array_to_int: Option<FuncId>,
     pub(super) runtime_bit_array_pop_byte: Option<FuncId>,
+    pub(super) runtime_bit_array_split_bits: Option<FuncId>,
     pub(super) runtime_bool_true: Option<FuncId>,
     pub(super) runtime_bool_false: Option<FuncId>,
     pub(super) runtime_list_cons: Option<FuncId>,
@@ -110,6 +111,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_bit_array_bit_size: None,
             runtime_bit_array_to_int: None,
             runtime_bit_array_pop_byte: None,
+            runtime_bit_array_split_bits: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -976,6 +978,28 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(id)
     }
 
+    pub(super) fn declare_runtime_bit_array_split_bits(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_split_bits {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_split_bits", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_split_bits = Some(id);
+        Ok(id)
+    }
+
     pub(super) fn branch_on_empty_bit_array_pattern(
         &mut self,
         module: &mut ObjectModule,
@@ -1119,6 +1143,64 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let rest_value = self.tuple_element(result, 2)?;
         let mut success_args = failure_args.to_vec();
         success_args.push(first_value);
+        success_args.push(rest_value);
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.seal_block(extract_block);
+
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
+    }
+
+    pub(super) fn branch_on_bit_array_prefix_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        size_value: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extract_block = self.builder.create_block();
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..2 {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let func_id = self.declare_runtime_bit_array_split_bits(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject, size_value]);
+        let result = self.builder.inst_results(call)[0];
+
+        let flag = self.tuple_element(result, 0)?;
+        let true_value = self.bool_constant(module, true)?;
+        let condition = self.builder.ins().icmp(IntCC::Equal, flag, true_value);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(condition, extract_block, &[], failure_block, failure_args);
+        self.seal_block(current_block);
+
+        self.builder.switch_to_block(extract_block);
+        let prefix_value = self.tuple_element(result, 1)?;
+        let rest_value = self.tuple_element(result, 2)?;
+        let mut success_args = failure_args.to_vec();
+        success_args.push(prefix_value);
         success_args.push(rest_value);
         let _ = self.builder.ins().jump(success_block, &success_args);
         self.seal_block(extract_block);

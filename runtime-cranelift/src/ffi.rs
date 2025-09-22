@@ -1677,6 +1677,49 @@ pub extern "C" fn bit_array_pop_byte(raw: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn bit_array_split_bits(bits_raw: u64, size_raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(bits_raw), "bit_array_split_bits bits");
+    let size_value = value_to_i63(Value::from_raw(size_raw), "bit_array_split_bits size");
+
+    if size_value < 0 {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array split bits failure",
+        );
+        return tuple.to_raw();
+    }
+
+    let Ok(prefix_len) = usize::try_from(size_value) else {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array split bits failure",
+        );
+        return tuple.to_raw();
+    };
+
+    if prefix_len > view.bit_len {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array split bits failure",
+        );
+        return tuple.to_raw();
+    }
+
+    let prefix_bytes = copy_bits(&view, 0, prefix_len);
+    let prefix_value = bit_array_from_bytes(&prefix_bytes, prefix_len);
+
+    let rest_len = view.bit_len - prefix_len;
+    let rest_bytes = copy_bits(&view, prefix_len, rest_len);
+    let rest_value = bit_array_from_bytes(&rest_bytes, rest_len);
+
+    let tuple = tuple_from(
+        &[Value::from_bool(true), prefix_value, rest_value],
+        "bit array split bits tuple",
+    );
+    tuple.to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
