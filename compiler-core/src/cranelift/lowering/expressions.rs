@@ -69,6 +69,25 @@ fn resolve_assign_pattern<'pattern>(
     }
 }
 
+fn strip_assign_aliases<'pattern>(
+    mut pattern: &'pattern Pattern<Arc<Type>>,
+    aliases: &mut Vec<EcoString>,
+) -> &'pattern Pattern<Arc<Type>> {
+    loop {
+        match pattern {
+            Pattern::Assign {
+                name,
+                pattern: inner,
+                ..
+            } => {
+                aliases.push(name.clone());
+                pattern = inner;
+            }
+            _ => return pattern,
+        }
+    }
+}
+
 fn collect_module_functions(
     module: &crate::ast::TypedModule,
 ) -> Vec<&Function<Arc<Type>, TypedExpr>> {
@@ -1430,6 +1449,8 @@ fn lower_case(
 
                     let mut capture_flags = Vec::with_capacity(arguments.len());
                     let mut binding_names = Vec::with_capacity(arguments.len());
+                    let mut argument_aliases: Vec<Vec<EcoString>> =
+                        Vec::with_capacity(arguments.len());
                     let mut tuple_patterns: Vec<Option<ConstructorTupleInfo>> =
                         Vec::with_capacity(arguments.len());
                     for argument in arguments {
@@ -1440,15 +1461,21 @@ fn lower_case(
                             });
                         }
 
-                        match &argument.value {
+                        let mut aliases = Vec::new();
+                        let pattern = strip_assign_aliases(&argument.value, &mut aliases);
+
+                        match pattern {
                             Pattern::Variable { name, .. } => {
                                 capture_flags.push(true);
                                 binding_names.push(Some(name.clone()));
+                                argument_aliases.push(aliases);
                                 tuple_patterns.push(None);
                             }
                             Pattern::Discard { .. } => {
-                                capture_flags.push(false);
+                                let capture = !aliases.is_empty();
+                                capture_flags.push(capture);
                                 binding_names.push(None);
+                                argument_aliases.push(aliases);
                                 tuple_patterns.push(None);
                             }
                             Pattern::Tuple { elements, .. } => {
@@ -1489,6 +1516,7 @@ fn lower_case(
 
                                 capture_flags.push(true);
                                 binding_names.push(None);
+                                argument_aliases.push(aliases);
                                 tuple_patterns.push(Some(ConstructorTupleInfo {
                                     capture_flags: element_capture_flags,
                                     binding_names: element_binding_names,
@@ -1503,6 +1531,10 @@ fn lower_case(
                                 });
                             }
                         }
+                    }
+
+                    while argument_aliases.len() < capture_flags.len() {
+                        argument_aliases.push(Vec::new());
                     }
 
                     let (block, params, extras) = ctx.branch_on_constructor_pattern(
@@ -1550,10 +1582,19 @@ fn lower_case(
                             if let Some(name) = &binding_names[index] {
                                 bindings.push((name.clone(), BindingSource::Value(value)));
                             }
+                            for alias in &argument_aliases[index] {
+                                bindings.push((alias.clone(), BindingSource::Value(value)));
+                            }
                         } else if tuple_patterns[index].is_some() {
                             return Err(crate::Error::NativeCodegen {
                                 message:
                                     "nested tuple constructor pattern requires capturing the argument"
+                                        .into(),
+                            });
+                        } else if !argument_aliases[index].is_empty() {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "constructor alias pattern requires capturing the argument in native functions"
                                         .into(),
                             });
                         }
