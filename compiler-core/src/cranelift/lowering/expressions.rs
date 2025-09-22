@@ -262,6 +262,10 @@ fn lower_function(
 
         let value = lower_block(module, function.body.as_slice(), &mut lowering)?;
         let _ = lowering.builder.ins().return_(&[value]);
+
+        if let Some(block) = lowering.builder.current_block() {
+            lowering.seal_block(block);
+        }
     }
 
     builder.finalize();
