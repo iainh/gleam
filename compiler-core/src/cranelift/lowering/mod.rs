@@ -24,6 +24,11 @@ pub(super) type FunctionIdMap = HashMap<(EcoString, usize), FuncId>;
 #[derive(Clone, Copy)]
 pub(super) enum BindingSource {
     Subject(usize),
+    /// References a block parameter by stable index so captures survive block rewrites
+    BlockParam {
+        index: usize,
+        value: Value,
+    },
     Value(Value),
 }
 

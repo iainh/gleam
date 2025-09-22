@@ -1220,11 +1220,20 @@ fn lower_case(
         for (subject_index, pattern) in clause.pattern.iter().enumerate() {
             let current_params = ctx.builder.block_params(pattern_block).to_vec();
             for (_, source) in &mut bindings {
-                if let BindingSource::Value(value) = source {
-                    if let Some(position) = current_params.iter().position(|param| *param == *value)
-                    {
-                        *value = current_params[position];
+                match source {
+                    BindingSource::Value(value) => {
+                        if let Some(position) =
+                            current_params.iter().position(|param| *param == *value)
+                        {
+                            *value = current_params[position];
+                        }
                     }
+                    BindingSource::BlockParam { index, value } => {
+                        if let Some(param) = current_params.get(*index) {
+                            *value = *param;
+                        }
+                    }
+                    BindingSource::Subject(_) => {}
                 }
             }
 
@@ -1763,10 +1772,22 @@ fn lower_case(
                             })?;
 
                         if let Some(name) = first_binding {
-                            bindings.push((name, BindingSource::Value(byte_value)));
+                            bindings.push((
+                                name,
+                                BindingSource::BlockParam {
+                                    index: base_index,
+                                    value: byte_value,
+                                },
+                            ));
                         }
                         if let Some(name) = rest_binding {
-                            bindings.push((name, BindingSource::Value(rest_value)));
+                            bindings.push((
+                                name,
+                                BindingSource::BlockParam {
+                                    index: base_index + 1,
+                                    value: rest_value,
+                                },
+                            ));
                         }
                         continue;
                     }
@@ -1913,17 +1934,24 @@ fn lower_case(
                                             .into(),
                                 });
                             };
-                            let value = block_params
-                                .get(base_index + extra_position)
-                                .copied()
-                                .ok_or_else(|| crate::Error::NativeCodegen {
+                            let param_index = base_index + extra_position;
+                            let value =
+                                block_params.get(param_index).copied().ok_or_else(|| {
+                                    crate::Error::NativeCodegen {
                                     message:
                                         "missing tuple capture parameter in native case lowering"
                                             .into(),
+                                }
                                 })?;
                             extra_position += 1;
                             if let Some(name) = binding_name {
-                                bindings.push((name.clone(), BindingSource::Value(value)));
+                                bindings.push((
+                                    name.clone(),
+                                    BindingSource::BlockParam {
+                                        index: param_index,
+                                        value,
+                                    },
+                                ));
                             }
                         }
                     }
@@ -1953,10 +1981,19 @@ fn lower_case(
         }
         let current_params = ctx.builder.block_params(pattern_block).to_vec();
         for (_, source) in &mut bindings {
-            if let BindingSource::Value(value) = source {
-                if let Some(position) = current_params.iter().position(|param| *param == *value) {
-                    *value = current_params[position];
+            match source {
+                BindingSource::Value(value) => {
+                    if let Some(position) = current_params.iter().position(|param| *param == *value)
+                    {
+                        *value = current_params[position];
+                    }
                 }
+                BindingSource::BlockParam { index, value } => {
+                    if let Some(param) = current_params.get(*index) {
+                        *value = *param;
+                    }
+                }
+                BindingSource::Subject(_) => {}
             }
         }
         let mut final_subjects = ctx.builder.block_params(pattern_block).to_vec();
@@ -1966,6 +2003,7 @@ fn lower_case(
             for (name, source) in &bindings {
                 let value = match source {
                     BindingSource::Subject(index) => final_subjects[*index],
+                    BindingSource::BlockParam { value, .. } => *value,
                     BindingSource::Value(value) => *value,
                 };
                 ctx.define(name, value);
@@ -1997,35 +2035,50 @@ fn lower_case(
             let binding_names: Vec<EcoString> =
                 bindings.iter().map(|(name, _)| name.clone()).collect();
             for (binding_index, (_, source)) in bindings.iter_mut().enumerate() {
-                if let BindingSource::Value(value) = source {
-                    let Some(position) = guard_inputs.iter().position(|input| input == value)
-                    else {
-                        let binding_name = binding_names[binding_index].clone();
-                        return Err(crate::Error::NativeCodegen {
-                            message: format!(
-                                "missing captured value in native guard lowering (binding: {:?}, value: {:?}, inputs: {:?})",
-                                binding_name, value, guard_inputs
-                            ),
-                        });
-                    };
-                    *value = guard_params[position];
+                match source {
+                    BindingSource::Value(value) => {
+                        let Some(position) = guard_inputs.iter().position(|input| input == value)
+                        else {
+                            let binding_name = binding_names[binding_index].clone();
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "missing captured value in native guard lowering (binding: {:?}, value: {:?}, inputs: {:?})",
+                                    binding_name, value, guard_inputs
+                                ),
+                            });
+                        };
+                        *value = guard_params[position];
+                    }
+                    BindingSource::BlockParam { index, value } => {
+                        let Some(param) = guard_params.get(*index) else {
+                            let binding_name = binding_names[binding_index].clone();
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "missing captured block param in native guard lowering (binding: {:?}, index: {:?}, params: {:?})",
+                                    binding_name, index, guard_params
+                                ),
+                            });
+                        };
+                        *value = *param;
+                    }
+                    BindingSource::Subject(_) => {}
                 }
             }
 
-            pattern_subjects = guard_params[..subject_count].to_vec();
-            final_subjects = pattern_subjects.clone();
+            final_subjects = guard_params;
 
             if ctx.builder.current_block() != Some(pattern_block) {
                 ctx.builder.switch_to_block(pattern_block);
             }
         } else {
-            final_subjects = pattern_subjects.clone();
+            final_subjects = ctx.builder.block_params(pattern_block).to_vec();
         }
 
         ctx.push_scope();
         for (name, source) in &bindings {
             let value = match source {
                 BindingSource::Subject(index) => final_subjects[*index],
+                BindingSource::BlockParam { value, .. } => *value,
                 BindingSource::Value(value) => *value,
             };
             ctx.define(name, value);
