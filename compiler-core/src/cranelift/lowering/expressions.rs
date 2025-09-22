@@ -1365,6 +1365,8 @@ fn lower_case(
                 }
             }
 
+            #[cfg(debug_assertions)]
+            eprintln!("native lowering: pattern before resolution = {:?}", pattern);
             let pattern = resolve_assign_pattern(pattern, &mut bindings, subject_index);
             debug_assert!(
                 !matches!(pattern, Pattern::Assign { .. }),
