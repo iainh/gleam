@@ -5,6 +5,7 @@ use crate::{
         PipelineAssignmentKind, Statement, TypedArg, TypedAssert, TypedDefinition, TypedExpr,
         TypedPipelineAssignment, TypedStatement,
     },
+    bit_array::GetLiteralValue,
     type_::{ModuleValueConstructor, Type, ValueConstructorVariant},
 };
 use cranelift_codegen::ir::{
@@ -1217,6 +1218,16 @@ fn lower_case(
         let mut bindings: Vec<(EcoString, BindingSource)> = Vec::new();
 
         for (subject_index, pattern) in clause.pattern.iter().enumerate() {
+            let current_params = ctx.builder.block_params(pattern_block).to_vec();
+            for (_, source) in &mut bindings {
+                if let BindingSource::Value(value) = source {
+                    if let Some(position) = current_params.iter().position(|param| *param == *value)
+                    {
+                        *value = current_params[position];
+                    }
+                }
+            }
+
             let mut pattern = pattern;
             loop {
                 match pattern {
@@ -1564,6 +1575,20 @@ fn lower_case(
                     }
                 }
                 Pattern::BitArray { segments, .. } => {
+                    if segments.is_empty() {
+                        let (block, params) = ctx.branch_on_empty_bit_array_pattern(
+                            module,
+                            pattern_block,
+                            pattern_subjects[subject_index],
+                            next_block,
+                            pattern_subjects.as_slice(),
+                            subject_count,
+                        )?;
+                        pattern_block = block;
+                        pattern_subjects = params;
+                        continue;
+                    }
+
                     if segments.len() == 1 {
                         let segment = &segments[0];
                         let is_bytes = segment
@@ -1572,10 +1597,57 @@ fn lower_case(
                             .all(|option| matches!(option, BitArrayOption::Bytes { .. }));
 
                         if !is_bytes {
+                            if let Some(size_pattern) = segment.size()
+                                && segment.type_.is_int()
+                                && let Some(size_bits) = size_pattern.as_int_literal()
+                                && let Some(size_bits) = size_bits.to_i64()
+                            {
+                                let (block, params, _value) = ctx
+                                    .branch_on_sized_int_bit_array_pattern(
+                                        module,
+                                        pattern_block,
+                                        pattern_subjects[subject_index],
+                                        size_bits,
+                                        next_block,
+                                        pattern_subjects.as_slice(),
+                                        subject_count,
+                                    )?;
+                                pattern_block = block;
+                                pattern_subjects = params;
+
+                                match segment.value.as_ref() {
+                                    Pattern::Variable { name, .. } => {
+                                        let block_params =
+                                            ctx.builder.block_params(pattern_block).to_vec();
+                                        let base_index = pattern_subjects.len();
+                                        let captured = block_params
+                                            .get(base_index)
+                                            .copied()
+                                            .ok_or_else(|| crate::Error::NativeCodegen {
+                                                message:
+                                                    "missing sized int capture parameter in native case lowering"
+                                                        .into(),
+                                            })?;
+                                        bindings
+                                            .push((name.clone(), BindingSource::Value(captured)));
+                                    }
+                                    Pattern::Discard { .. } => {}
+                                    _ => {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message:
+                                                "only variable or discard patterns are supported for sized int segments in native functions"
+                                                    .into(),
+                                        });
+                                    }
+                                }
+                                continue;
+                            }
+
                             return Err(crate::Error::NativeCodegen {
-                                message:
-                                    "bit array pattern options are not yet supported in native functions"
-                                        .into(),
+                                message: format!(
+                                    "bit array pattern options are not yet supported in native functions: {:?}",
+                                    segment.options
+                                ),
                             });
                         }
 
@@ -1606,19 +1678,126 @@ fn lower_case(
                     let first_segment = &segments[0];
                     let rest_segment = &segments[1];
 
+                    let rest_is_bits = rest_segment
+                        .options
+                        .iter()
+                        .all(|option| matches!(option, BitArrayOption::Bits { .. }));
+
+                    if rest_is_bits
+                        && first_segment.type_.is_int()
+                        && rest_segment.type_.is_bit_array()
+                        && first_segment.size().is_none()
+                        && first_segment.options.iter().all(|option| {
+                            matches!(
+                                option,
+                                BitArrayOption::Int { .. }
+                                    | BitArrayOption::Signed { .. }
+                                    | BitArrayOption::Unsigned { .. }
+                                    | BitArrayOption::Bytes { .. }
+                            )
+                        })
+                    {
+                        let first_binding = match first_segment.value.as_ref() {
+                            Pattern::Variable { name, .. } => Some(name.clone()),
+                            Pattern::Discard { .. } => None,
+                            _ => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "only variable or discard patterns are supported for byte segments in native functions"
+                                            .into(),
+                                });
+                            }
+                        };
+
+                        let rest_binding = match rest_segment.value.as_ref() {
+                            Pattern::Variable { name, .. } => Some(name.clone()),
+                            Pattern::Discard { .. } => None,
+                            _ => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "only variable or discard patterns are supported for bits segments in native functions"
+                                            .into(),
+                                });
+                            }
+                        };
+
+                        let (block, params, extras) = ctx.branch_on_bit_array_byte_pattern(
+                            module,
+                            pattern_block,
+                            pattern_subjects[subject_index],
+                            next_block,
+                            pattern_subjects.as_slice(),
+                            subject_count,
+                        )?;
+                        pattern_block = block;
+                        pattern_subjects = params;
+
+                        if ctx.builder.current_block() != Some(pattern_block) {
+                            ctx.builder.switch_to_block(pattern_block);
+                        }
+
+                        if extras.len() != 2 {
+                            return Err(crate::Error::NativeCodegen {
+                                message: "unexpected byte pattern extras in native case lowering"
+                                    .into(),
+                            });
+                        }
+
+                        let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                        let base_index = pattern_subjects.len();
+                        let byte_value =
+                            block_params.get(base_index).copied().ok_or_else(|| {
+                                crate::Error::NativeCodegen {
+                                    message:
+                                        "missing byte capture parameter in native case lowering"
+                                            .into(),
+                                }
+                            })?;
+                        let rest_value =
+                            block_params.get(base_index + 1).copied().ok_or_else(|| {
+                                crate::Error::NativeCodegen {
+                                    message:
+                                        "missing bits capture parameter in native case lowering"
+                                            .into(),
+                                }
+                            })?;
+
+                        if let Some(name) = first_binding {
+                            bindings.push((name, BindingSource::Value(byte_value)));
+                        }
+                        if let Some(name) = rest_binding {
+                            bindings.push((name, BindingSource::Value(rest_value)));
+                        }
+                        continue;
+                    }
+
                     let is_utf8_codepoint = first_segment
                         .options
                         .iter()
                         .all(|option| matches!(option, BitArrayOption::Utf8Codepoint { .. }));
+                    let is_utf8_segment = first_segment
+                        .options
+                        .iter()
+                        .all(|option| matches!(option, BitArrayOption::Utf8 { .. }));
                     let is_bytes = rest_segment
                         .options
                         .iter()
                         .all(|option| matches!(option, BitArrayOption::Bytes { .. }));
 
-                    if !is_utf8_codepoint || !is_bytes {
+                    if (!is_utf8_codepoint && !is_utf8_segment) || !is_bytes {
+                        return Err(crate::Error::NativeCodegen {
+                            message: format!(
+                                "bit array pattern options are not yet supported in native functions: {segments:?}"
+                            ),
+                        });
+                    }
+
+                    if is_utf8_segment
+                        && !matches!(first_segment.value.as_ref(), Pattern::Discard { .. })
+                    {
                         return Err(crate::Error::NativeCodegen {
                             message:
-                                "bit array pattern options are not yet supported in native functions"
+                                "utf8 bit array pattern segments must be discarded in native functions"
                                     .into(),
                         });
                     }
@@ -1679,6 +1858,86 @@ fn lower_case(
                         bindings.push((name, BindingSource::Value(rest_value)));
                     }
                 }
+                Pattern::Tuple { elements, .. } => {
+                    let mut capture_flags = Vec::with_capacity(elements.len());
+                    let mut binding_names = Vec::with_capacity(elements.len());
+
+                    for element in elements {
+                        match element {
+                            Pattern::Variable { name, .. } => {
+                                capture_flags.push(true);
+                                binding_names.push(Some(name.clone()));
+                            }
+                            Pattern::Discard { .. } => {
+                                capture_flags.push(false);
+                                binding_names.push(None);
+                            }
+                            other => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: format!(
+                                        "tuple pattern element `{other:?}` is not yet supported in native functions"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
+                    let (block, params, extras) = ctx.branch_on_tuple_pattern(
+                        pattern_block,
+                        pattern_subjects[subject_index],
+                        elements.len(),
+                        &capture_flags,
+                        next_block,
+                        pattern_subjects.as_slice(),
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                    let base_index = pattern_subjects.len();
+                    let mut extras_iter = extras.into_iter();
+                    let mut extra_position = 0usize;
+                    for (capture_flag, binding_name) in
+                        capture_flags.iter().zip(binding_names.iter())
+                    {
+                        if *capture_flag {
+                            let Some(_value) = extras_iter.next() else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "missing captured tuple element in native case lowering"
+                                            .into(),
+                                });
+                            };
+                            let value = block_params
+                                .get(base_index + extra_position)
+                                .copied()
+                                .ok_or_else(|| crate::Error::NativeCodegen {
+                                    message:
+                                        "missing tuple capture parameter in native case lowering"
+                                            .into(),
+                                })?;
+                            extra_position += 1;
+                            if let Some(name) = binding_name {
+                                bindings.push((name.clone(), BindingSource::Value(value)));
+                            }
+                        }
+                    }
+
+                    if extras_iter.next().is_some() {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "unexpected extra tuple capture values in native case lowering"
+                                    .into(),
+                        });
+                    }
+
+                    continue;
+                }
                 other => {
                     return Err(crate::Error::NativeCodegen {
                         message: format!(
@@ -1691,6 +1950,14 @@ fn lower_case(
 
         if ctx.builder.current_block() != Some(pattern_block) {
             ctx.builder.switch_to_block(pattern_block);
+        }
+        let current_params = ctx.builder.block_params(pattern_block).to_vec();
+        for (_, source) in &mut bindings {
+            if let BindingSource::Value(value) = source {
+                if let Some(position) = current_params.iter().position(|param| *param == *value) {
+                    *value = current_params[position];
+                }
+            }
         }
         let mut final_subjects = ctx.builder.block_params(pattern_block).to_vec();
 
@@ -1727,12 +1994,18 @@ fn lower_case(
             pattern_block = guard_success_block;
             let guard_params = ctx.builder.block_params(pattern_block).to_vec();
 
-            for (_, source) in &mut bindings {
+            let binding_names: Vec<EcoString> =
+                bindings.iter().map(|(name, _)| name.clone()).collect();
+            for (binding_index, (_, source)) in bindings.iter_mut().enumerate() {
                 if let BindingSource::Value(value) = source {
                     let Some(position) = guard_inputs.iter().position(|input| input == value)
                     else {
+                        let binding_name = binding_names[binding_index].clone();
                         return Err(crate::Error::NativeCodegen {
-                            message: "missing captured value in native guard lowering".into(),
+                            message: format!(
+                                "missing captured value in native guard lowering (binding: {:?}, value: {:?}, inputs: {:?})",
+                                binding_name, value, guard_inputs
+                            ),
                         });
                     };
                     *value = guard_params[position];

@@ -1649,6 +1649,34 @@ pub extern "C" fn bit_array_pop_utf8_codepoint(raw: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn bit_array_pop_byte(raw: u64) -> u64 {
+    let view = bit_array_view(Value::from_raw(raw), "bit_array_pop_byte");
+
+    if view.bit_len < 8 {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "bit array byte split failure",
+        );
+        return tuple.to_raw();
+    }
+
+    let byte = read_byte(&view, 0);
+    let remaining_bits = view.bit_len - 8;
+    let rest_bytes = copy_bits(&view, 8, remaining_bits);
+    let rest_value = bit_array_from_bytes(&rest_bytes, remaining_bits);
+
+    let tuple = tuple_from(
+        &[
+            Value::from_bool(true),
+            Value::from_i63(byte as i64),
+            rest_value,
+        ],
+        "bit array byte split tuple",
+    );
+    tuple.to_raw()
+}
+
+#[no_mangle]
 pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));

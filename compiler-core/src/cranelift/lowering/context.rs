@@ -53,6 +53,9 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_string_equal: Option<FuncId>,
     pub(super) runtime_string_utf8_bits: Option<FuncId>,
     pub(super) runtime_bit_array_utf8_split: Option<FuncId>,
+    pub(super) runtime_bit_array_bit_size: Option<FuncId>,
+    pub(super) runtime_bit_array_to_int: Option<FuncId>,
+    pub(super) runtime_bit_array_pop_byte: Option<FuncId>,
     pub(super) runtime_bool_true: Option<FuncId>,
     pub(super) runtime_bool_false: Option<FuncId>,
     pub(super) runtime_list_cons: Option<FuncId>,
@@ -104,6 +107,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_string_equal: None,
             runtime_string_utf8_bits: None,
             runtime_bit_array_utf8_split: None,
+            runtime_bit_array_bit_size: None,
+            runtime_bit_array_to_int: None,
+            runtime_bit_array_pop_byte: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -905,6 +911,223 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             })?;
         self.runtime_bit_array_utf8_split = Some(id);
         Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_bit_size(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_bit_size {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_bit_size", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_bit_size = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_to_int(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_to_int {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_to_int_and_size", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_to_int = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_pop_byte(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_pop_byte {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_pop_byte", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_pop_byte = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn branch_on_empty_bit_array_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>)> {
+        let success_block = self.create_subject_block(subject_count);
+
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let func_id = self.declare_runtime_bit_array_bit_size(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject]);
+        let size_value = self.builder.inst_results(call)[0];
+
+        let zero_encoded = encode_small_int(0)?;
+        let zero_value = self.builder.ins().iconst(self.pointer_type, zero_encoded);
+        let is_empty = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, size_value, zero_value);
+
+        let args = failure_args.to_vec();
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_empty, success_block, &args, failure_block, &args);
+        self.seal_block(current_block);
+
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        Ok((success_block, params))
+    }
+
+    pub(super) fn branch_on_sized_int_bit_array_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        size_bits: i64,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Value)> {
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        let _ = self
+            .builder
+            .append_block_param(success_block, self.pointer_type);
+
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let func_id = self.declare_runtime_bit_array_to_int(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject]);
+        let tuple = self.builder.inst_results(call)[0];
+
+        let value = self.tuple_element(tuple, 0)?;
+        let size_value = self.tuple_element(tuple, 1)?;
+        let expected_size = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, encode_small_int(size_bits)?);
+        let size_matches = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, size_value, expected_size);
+
+        let args = failure_args.to_vec();
+        let mut success_args = args.clone();
+        success_args.push(value);
+        let _ = self.builder.ins().brif(
+            size_matches,
+            success_block,
+            &success_args,
+            failure_block,
+            &args,
+        );
+        self.seal_block(current_block);
+
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        let subjects = params[..subject_count].to_vec();
+        let captured = params[subject_count];
+        Ok((success_block, subjects, captured))
+    }
+
+    pub(super) fn branch_on_bit_array_byte_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extract_block = self.builder.create_block();
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..2 {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let func_id = self.declare_runtime_bit_array_pop_byte(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject]);
+        let result = self.builder.inst_results(call)[0];
+
+        let flag = self.tuple_element(result, 0)?;
+        let true_value = self.bool_constant(module, true)?;
+        let condition = self.builder.ins().icmp(IntCC::Equal, flag, true_value);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(condition, extract_block, &[], failure_block, failure_args);
+        self.seal_block(current_block);
+
+        self.builder.switch_to_block(extract_block);
+        let first_value = self.tuple_element(result, 1)?;
+        let rest_value = self.tuple_element(result, 2)?;
+        let mut success_args = failure_args.to_vec();
+        success_args.push(first_value);
+        success_args.push(rest_value);
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.seal_block(extract_block);
+
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
     }
 
     pub(super) fn declare_runtime_bool_true(
