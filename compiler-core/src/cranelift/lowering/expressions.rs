@@ -266,6 +266,30 @@ fn lower_function(
         if let Some(block) = lowering.builder.current_block() {
             lowering.seal_block(block);
         }
+
+        #[cfg(debug_assertions)]
+        {
+            let mut open_blocks = Vec::new();
+            for block in lowering.builder.func.layout.blocks() {
+                if !lowering.sealed_blocks.contains(&block) {
+                    open_blocks.push(block.as_u32());
+                }
+            }
+
+            if !open_blocks.is_empty() {
+                let func_name = function
+                    .name
+                    .as_ref()
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or("<anonymous>");
+                tracing::debug!(
+                    module = %module_name,
+                    function = func_name,
+                    ?open_blocks,
+                    "native lowering: unsealed blocks before finalize",
+                );
+            }
+        }
     }
 
     builder.finalize();
@@ -394,6 +418,15 @@ pub(super) fn lower_expression(
         },
 
         TypedExpr::Block { statements, .. } => lower_block(module, statements.as_slice(), ctx),
+
+        TypedExpr::NegateBool { value, .. } => {
+            let inner = lower_expression(module, value, ctx)?;
+            let true_value = ctx.bool_constant(module, true)?;
+            let false_value = ctx.bool_constant(module, false)?;
+            let is_true = ctx.builder.ins().icmp(IntCC::Equal, inner, true_value);
+            let result = ctx.builder.ins().select(is_true, false_value, true_value);
+            Ok(result)
+        }
 
         TypedExpr::NegateInt { value, .. } => {
             let inner = lower_expression(module, value, ctx)?;
@@ -670,6 +703,14 @@ fn lower_assert_statement(
     let success_block = ctx.builder.create_block();
     let failure_block = ctx.builder.create_block();
 
+    #[cfg(debug_assertions)]
+    tracing::debug!(
+        current_block = %current_block.as_u32(),
+        success_block = %success_block.as_u32(),
+        failure_block = %failure_block.as_u32(),
+        "lower_assert: created blocks",
+    );
+
     let _ = ctx
         .builder
         .ins()
@@ -684,6 +725,7 @@ fn lower_assert_statement(
     ctx.seal_block(failure_block);
 
     ctx.builder.switch_to_block(success_block);
+    ctx.seal_block(success_block);
     Ok(())
 }
 
@@ -1084,140 +1126,498 @@ fn lower_pattern_assignment(
                     .options
                     .iter()
                     .any(|option| matches!(option, BitArrayOption::Bits { .. }));
+                let rest_is_bits = rest
+                    .options
+                    .iter()
+                    .all(|option| matches!(option, BitArrayOption::Bits { .. }));
 
-                if !first_is_bits {
-                    return Err(crate::Error::NativeCodegen {
-                        message: format!(
-                            "bit array head pattern options are not yet supported in native assignments: {:?}",
-                            first.options
-                        ),
-                    });
-                }
+                if first_is_bits {
+                    let size_pattern = first.size().ok_or_else(|| crate::Error::NativeCodegen {
+                        message: "bit array segment missing size in native assignments".into(),
+                    })?;
 
-                let size_pattern = first.size().ok_or_else(|| crate::Error::NativeCodegen {
-                    message: "bit array segment missing size in native assignments".into(),
-                })?;
+                    let size_value = 'size: {
+                        if let Pattern::Int { int_value, .. } = size_pattern {
+                            let Some(bits) = int_value.to_i64() else {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: "bit array segment size exceeds native limits".into(),
+                                });
+                            };
+                            let encoded = encode_small_int(bits)?;
+                            break 'size ctx.builder.ins().iconst(ctx.pointer_type, encoded);
+                        }
 
-                let size_value = 'size: {
-                    if let Pattern::Int { int_value, .. } = size_pattern {
-                        let Some(bits) = int_value.to_i64() else {
-                            return Err(crate::Error::NativeCodegen {
-                                message: "bit array segment size exceeds native limits".into(),
-                            });
+                        let mut resolved_size = match size_pattern {
+                            Pattern::BitArraySize(size) => size,
+                            other => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: format!(
+                                        "bit array size pattern `{other:?}` is not yet supported in native assignments"
+                                    ),
+                                });
+                            }
                         };
-                        let encoded = encode_small_int(bits)?;
-                        break 'size ctx.builder.ins().iconst(ctx.pointer_type, encoded);
+
+                        loop {
+                            match resolved_size {
+                                BitArraySize::Block { inner, .. } => {
+                                    resolved_size = inner.as_ref();
+                                }
+                                BitArraySize::Int { int_value, .. } => {
+                                    let Some(bits) = int_value.to_i64() else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message: "bit array segment size exceeds native limits"
+                                                .into(),
+                                        });
+                                    };
+                                    let encoded = encode_small_int(bits)?;
+                                    break 'size ctx
+                                        .builder
+                                        .ins()
+                                        .iconst(ctx.pointer_type, encoded);
+                                }
+                                BitArraySize::Variable { name, .. } => {
+                                    let Some(value) = ctx.lookup(&name) else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message: format!(
+                                                "bit array segment size variable `{name}` is not defined in native functions"
+                                            ),
+                                        });
+                                    };
+                                    break 'size *value;
+                                }
+                                _ => {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message: "bit array size expression is not yet supported in native assignments"
+                                            .into(),
+                                    });
+                                }
+                            }
+                        }
+                    };
+
+                    let head_binding = match first.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "bit array head pattern `{other:?}` is not yet supported in native assignments"
+                                ),
+                            });
+                        }
+                    };
+
+                    if !matches!(rest.value.as_ref(), Pattern::Discard { .. }) {
+                        return Err(crate::Error::NativeCodegen {
+                            message: format!(
+                                "bit array tail pattern `{rest:?}` is not yet supported in native assignments"
+                            ),
+                        });
                     }
 
-                    let mut resolved_size = match size_pattern {
-                        Pattern::BitArraySize(size) => size,
-                        other => {
+                    let failure_args = subjects.clone();
+                    let failure_block = ctx.create_subject_block(subject_count);
+                    let (block, _params, extras) = ctx.branch_on_bit_array_prefix_pattern(
+                        module,
+                        pattern_block,
+                        subjects[0],
+                        size_value,
+                        failure_block,
+                        &failure_args,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    if extras.len() != 2 {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "unexpected bit array prefix extras in native assignment lowering"
+                                    .into(),
+                        });
+                    }
+
+                    let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                    let base_index = failure_args.len();
+                    let head_value = block_params.get(base_index).copied().ok_or_else(|| {
+                        crate::Error::NativeCodegen {
+                            message:
+                                "missing bit array head capture parameter in native assignment lowering"
+                                    .into(),
+                        }
+                    })?;
+                    let rest_value =
+                        block_params.get(base_index + 1).copied().ok_or_else(|| {
+                            crate::Error::NativeCodegen {
+                                message:
+                                    "missing bit array remainder in native assignment lowering"
+                                        .into(),
+                            }
+                        })?;
+
+                    if let Some(name) = head_binding {
+                        bindings.push((name, head_value));
+                    }
+
+                    let expected_rest_bits = match rest.size() {
+                        Some(Pattern::Int { int_value, .. }) => {
+                            int_value
+                                .to_i64()
+                                .ok_or_else(|| crate::Error::NativeCodegen {
+                                    message: "bit array segment size exceeds native limits".into(),
+                                })?
+                        }
+                        Some(Pattern::BitArraySize(size)) => {
+                            let mut resolved = size;
+                            loop {
+                                match resolved {
+                                    BitArraySize::Block { inner, .. } => {
+                                        resolved = inner.as_ref();
+                                    }
+                                    BitArraySize::Int { int_value, .. } => {
+                                        break int_value.to_i64().ok_or_else(|| {
+                                            crate::Error::NativeCodegen {
+                                                message:
+                                                    "bit array segment size exceeds native limits"
+                                                        .into(),
+                                            }
+                                        })?;
+                                    }
+                                    BitArraySize::Variable { name, .. } => {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message: format!(
+                                                "bit array segment size variable `{name}` is not yet supported in native assignments"
+                                            ),
+                                        });
+                                    }
+                                    BitArraySize::BinaryOperator { .. } => {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message:
+                                                "bit array size expressions are not yet supported in native assignments"
+                                                    .into(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Some(other) => {
                             return Err(crate::Error::NativeCodegen {
                                 message: format!(
                                     "bit array size pattern `{other:?}` is not yet supported in native assignments"
                                 ),
                             });
                         }
+                        None => 0,
                     };
 
-                    loop {
-                        match resolved_size {
-                            BitArraySize::Block { inner, .. } => {
-                                resolved_size = inner.as_ref();
-                            }
-                            BitArraySize::Int { int_value, .. } => {
-                                let Some(bits) = int_value.to_i64() else {
-                                    return Err(crate::Error::NativeCodegen {
-                                        message: "bit array segment size exceeds native limits"
-                                            .into(),
-                                    });
-                                };
-                                let encoded = encode_small_int(bits)?;
-                                break 'size ctx.builder.ins().iconst(ctx.pointer_type, encoded);
-                            }
-                            BitArraySize::Variable { name, .. } => {
-                                let Some(value) = ctx.lookup(&name) else {
-                                    return Err(crate::Error::NativeCodegen {
-                                        message: format!(
-                                            "bit array segment size variable `{name}` is not defined in native functions"
-                                        ),
-                                    });
-                                };
-                                break 'size *value;
-                            }
-                            _ => {
+                    if expected_rest_bits >= 0 {
+                        let func_id = ctx.declare_runtime_bit_array_bit_size(module)?;
+                        let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                        let call = ctx.builder.ins().call(func_ref, &[rest_value]);
+                        let actual_size = ctx.builder.inst_results(call)[0];
+                        let expected_value = ctx
+                            .builder
+                            .ins()
+                            .iconst(ctx.pointer_type, encode_small_int(expected_rest_bits)?);
+                        let mismatch =
+                            ctx.builder
+                                .ins()
+                                .icmp(IntCC::NotEqual, actual_size, expected_value);
+
+                        let continue_block = ctx.builder.create_block();
+                        let _ = ctx.builder.ins().brif(
+                            mismatch,
+                            failure_block,
+                            &failure_args,
+                            continue_block,
+                            &[],
+                        );
+                        ctx.seal_block(pattern_block);
+                        ctx.builder.switch_to_block(continue_block);
+                        pattern_block = continue_block;
+                    }
+
+                    ctx.builder.switch_to_block(failure_block);
+                    let params = ctx.builder.block_params(failure_block).to_vec();
+                    let _ = ctx.builder.ins().jump(trap_block, &params);
+                    ctx.seal_block(failure_block);
+                    ctx.builder.switch_to_block(pattern_block);
+                } else if rest_is_bits
+                    && first.type_.is_int()
+                    && rest.type_.is_bit_array()
+                    && first.size().is_some()
+                    && first.options.iter().all(|option| {
+                        matches!(
+                            option,
+                            BitArrayOption::Int { .. }
+                                | BitArrayOption::Signed { .. }
+                                | BitArrayOption::Unsigned { .. }
+                                | BitArrayOption::Bytes { .. }
+                                | BitArrayOption::Size { .. }
+                                | BitArrayOption::Unit { .. }
+                                | BitArrayOption::Big { .. }
+                                | BitArrayOption::Little { .. }
+                                | BitArrayOption::Native { .. }
+                        )
+                    })
+                {
+                    let size_pattern = first.size().ok_or_else(|| crate::Error::NativeCodegen {
+                        message: "bit array segment missing size in native assignments".into(),
+                    })?;
+
+                    let size_value = 'size: {
+                        if let Pattern::Int { int_value, .. } = size_pattern {
+                            let Some(bits) = int_value.to_i64() else {
                                 return Err(crate::Error::NativeCodegen {
-                                    message: "bit array size expression is not yet supported in native assignments"
-                                        .into(),
+                                    message: "bit array segment size exceeds native limits".into(),
+                                });
+                            };
+                            let encoded = encode_small_int(bits)?;
+                            break 'size ctx.builder.ins().iconst(ctx.pointer_type, encoded);
+                        }
+
+                        let mut resolved_size = match size_pattern {
+                            Pattern::BitArraySize(size) => size,
+                            other => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message: format!(
+                                        "bit array size pattern `{other:?}` is not yet supported in native assignments"
+                                    ),
                                 });
                             }
-                        }
-                    }
-                };
+                        };
 
-                let head_binding = match first.value.as_ref() {
-                    Pattern::Variable { name, .. } => Some(name.clone()),
-                    Pattern::Discard { .. } => None,
-                    other => {
+                        loop {
+                            match resolved_size {
+                                BitArraySize::Block { inner, .. } => {
+                                    resolved_size = inner.as_ref();
+                                }
+                                BitArraySize::Int { int_value, .. } => {
+                                    let Some(bits) = int_value.to_i64() else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message: "bit array segment size exceeds native limits"
+                                                .into(),
+                                        });
+                                    };
+                                    let encoded = encode_small_int(bits)?;
+                                    break 'size ctx
+                                        .builder
+                                        .ins()
+                                        .iconst(ctx.pointer_type, encoded);
+                                }
+                                BitArraySize::Variable { name, .. } => {
+                                    let Some(value) = ctx.lookup(&name) else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message: format!(
+                                                "bit array segment size variable `{name}` is not defined in native functions"
+                                            ),
+                                        });
+                                    };
+                                    break 'size *value;
+                                }
+                                _ => {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message: "bit array size expression is not yet supported in native assignments"
+                                            .into(),
+                                    });
+                                }
+                            }
+                        }
+                    };
+
+                    let head_binding = match first.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "bit array head pattern `{other:?}` is not yet supported in native assignments"
+                                ),
+                            });
+                        }
+                    };
+
+                    let rest_binding = match rest.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "bit array tail pattern `{other:?}` is not yet supported in native assignments"
+                                ),
+                            });
+                        }
+                    };
+
+                    let failure_args = subjects.clone();
+                    let failure_block = ctx.create_subject_block(subject_count);
+                    let (block, _params, extras) = ctx.branch_on_bit_array_prefix_pattern(
+                        module,
+                        pattern_block,
+                        subjects[0],
+                        size_value,
+                        failure_block,
+                        &failure_args,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    if extras.len() != 2 {
                         return Err(crate::Error::NativeCodegen {
-                            message: format!(
-                                "bit array head pattern `{other:?}` is not yet supported in native assignments"
-                            ),
+                            message:
+                                "unexpected bit array prefix extras in native assignment lowering"
+                                    .into(),
                         });
                     }
-                };
 
-                if !matches!(rest.value.as_ref(), Pattern::Discard { .. }) {
+                    let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                    let base_index = failure_args.len();
+                    let prefix_value = block_params.get(base_index).copied().ok_or_else(|| {
+                        crate::Error::NativeCodegen {
+                            message:
+                                "missing bit array head capture parameter in native assignment lowering"
+                                    .into(),
+                        }
+                    })?;
+                    let rest_value =
+                        block_params.get(base_index + 1).copied().ok_or_else(|| {
+                            crate::Error::NativeCodegen {
+                                message:
+                                    "missing bit array remainder in native assignment lowering"
+                                        .into(),
+                            }
+                        })?;
+
+                    if let Some(name) = head_binding {
+                        let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
+                        let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                        let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
+                        let tuple = ctx.builder.inst_results(call)[0];
+                        let head_value = ctx.tuple_element(tuple, 0)?;
+                        let actual_size = ctx.tuple_element(tuple, 1)?;
+                        let mismatch =
+                            ctx.builder
+                                .ins()
+                                .icmp(IntCC::NotEqual, actual_size, size_value);
+
+                        let current_block = pattern_block;
+                        let continue_block = ctx.builder.create_block();
+                        let _ = ctx.builder.ins().brif(
+                            mismatch,
+                            failure_block,
+                            &failure_args,
+                            continue_block,
+                            &[],
+                        );
+                        ctx.seal_block(current_block);
+                        ctx.builder.switch_to_block(continue_block);
+                        pattern_block = continue_block;
+
+                        bindings.push((name, head_value));
+                    }
+
+                    if let Some(name) = rest_binding {
+                        bindings.push((name, rest_value));
+                    }
+
+                    ctx.builder.switch_to_block(failure_block);
+                    let params = ctx.builder.block_params(failure_block).to_vec();
+                    let _ = ctx.builder.ins().jump(trap_block, &params);
+                    ctx.seal_block(failure_block);
+                    ctx.builder.switch_to_block(pattern_block);
+                } else if rest_is_bits
+                    && first.type_.is_int()
+                    && rest.type_.is_bit_array()
+                    && first.size().is_none()
+                    && first.options.iter().all(|option| {
+                        matches!(
+                            option,
+                            BitArrayOption::Int { .. }
+                                | BitArrayOption::Signed { .. }
+                                | BitArrayOption::Unsigned { .. }
+                                | BitArrayOption::Bytes { .. }
+                                | BitArrayOption::Size { .. }
+                        )
+                    })
+                {
+                    if !matches!(first.value.as_ref(), Pattern::Discard { .. }) {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "bit array assignment requires discarding int heads in native functions"
+                                    .into(),
+                        });
+                    }
+
+                    let tail_binding = match rest.value.as_ref() {
+                        Pattern::Variable { name, .. } => Some(name.clone()),
+                        Pattern::Discard { .. } => None,
+                        other => {
+                            return Err(crate::Error::NativeCodegen {
+                                message: format!(
+                                    "bit array tail pattern `{other:?}` is not yet supported in native assignments"
+                                ),
+                            });
+                        }
+                    };
+
+                    let failure_args = subjects.clone();
+                    let failure_block = ctx.create_subject_block(subject_count);
+                    let (block, _params, extras) = ctx.branch_on_bit_array_byte_pattern(
+                        module,
+                        pattern_block,
+                        subjects[0],
+                        failure_block,
+                        &failure_args,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    if extras.len() != 2 {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "unexpected byte pattern extras in native assignment lowering"
+                                .into(),
+                        });
+                    }
+
+                    let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                    let base_index = failure_args.len();
+                    let rest_value = block_params
+                        .get(base_index + 1)
+                        .copied()
+                        .ok_or_else(|| crate::Error::NativeCodegen {
+                            message:
+                                "missing bit array rest capture parameter in native assignment lowering"
+                                    .into(),
+                        })?;
+
+                    if let Some(name) = tail_binding {
+                        bindings.push((name, rest_value));
+                    }
+
+                    ctx.builder.switch_to_block(failure_block);
+                    let params = ctx.builder.block_params(failure_block).to_vec();
+                    let _ = ctx.builder.ins().jump(trap_block, &params);
+                    ctx.seal_block(failure_block);
+                    ctx.builder.switch_to_block(pattern_block);
+                } else {
                     return Err(crate::Error::NativeCodegen {
                         message: format!(
-                            "bit array tail pattern `{rest:?}` is not yet supported in native assignments"
+                            "bit array pattern `{segments:?}` is not yet supported in native assignments"
                         ),
                     });
                 }
-
-                let failure_args = subjects.clone();
-                let failure_block = ctx.create_subject_block(subject_count);
-                let (block, _params, extras) = ctx.branch_on_bit_array_prefix_pattern(
-                    module,
-                    pattern_block,
-                    subjects[0],
-                    size_value,
-                    failure_block,
-                    &failure_args,
-                    subject_count,
-                )?;
-                pattern_block = block;
-
-                if ctx.builder.current_block() != Some(pattern_block) {
-                    ctx.builder.switch_to_block(pattern_block);
-                }
-
-                if extras.len() != 2 {
-                    return Err(crate::Error::NativeCodegen {
-                        message: "unexpected bit array prefix extras in native assignment lowering"
-                            .into(),
-                    });
-                }
-
-                let block_params = ctx.builder.block_params(pattern_block).to_vec();
-                let base_index = failure_args.len();
-                let head_value = block_params.get(base_index).copied().ok_or_else(|| {
-                    crate::Error::NativeCodegen {
-                        message:
-                            "missing bit array head capture parameter in native assignment lowering"
-                                .into(),
-                    }
-                })?;
-
-                if let Some(name) = head_binding {
-                    bindings.push((name, head_value));
-                }
-
-                ctx.builder.switch_to_block(failure_block);
-                let params = ctx.builder.block_params(failure_block).to_vec();
-                let _ = ctx.builder.ins().jump(trap_block, &params);
-                ctx.seal_block(failure_block);
-                ctx.builder.switch_to_block(pattern_block);
             }
             _ => {
                 return Err(crate::Error::NativeCodegen {
@@ -2171,6 +2571,199 @@ fn lower_case(
                                     value: rest_value,
                                 },
                             ));
+                        }
+
+                        continue;
+                    }
+
+                    if rest_is_bits
+                        && first_segment.type_.is_int()
+                        && rest_segment.type_.is_bit_array()
+                        && first_segment.size().is_some()
+                        && first_segment.options.iter().all(|option| {
+                            matches!(
+                                option,
+                                BitArrayOption::Int { .. }
+                                    | BitArrayOption::Signed { .. }
+                                    | BitArrayOption::Unsigned { .. }
+                                    | BitArrayOption::Bytes { .. }
+                                    | BitArrayOption::Size { .. }
+                                    | BitArrayOption::Unit { .. }
+                                    | BitArrayOption::Big { .. }
+                                    | BitArrayOption::Little { .. }
+                                    | BitArrayOption::Native { .. }
+                            )
+                        })
+                    {
+                        let size_pattern =
+                            first_segment
+                                .size()
+                                .ok_or_else(|| crate::Error::NativeCodegen {
+                                    message:
+                                        "sized bit array segment missing size in native functions"
+                                            .into(),
+                                })?;
+
+                        let size_value = 'size: {
+                            if let Pattern::Int { int_value, .. } = size_pattern {
+                                let Some(bits) = int_value.to_i64() else {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message: "bit array segment size exceeds native limits"
+                                            .into(),
+                                    });
+                                };
+                                let encoded = encode_small_int(bits)?;
+                                break 'size ctx.builder.ins().iconst(ctx.pointer_type, encoded);
+                            }
+
+                            let mut resolved_size = match size_pattern {
+                                Pattern::BitArraySize(size) => size,
+                                other => {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message: format!(
+                                            "bit array size pattern `{other:?}` is not yet supported in native functions"
+                                        ),
+                                    });
+                                }
+                            };
+
+                            loop {
+                                match resolved_size {
+                                    BitArraySize::Block { inner, .. } => {
+                                        resolved_size = inner.as_ref();
+                                    }
+                                    BitArraySize::Int { int_value, .. } => {
+                                        let Some(bits) = int_value.to_i64() else {
+                                            return Err(crate::Error::NativeCodegen {
+                                                message:
+                                                    "bit array segment size exceeds native limits"
+                                                        .into(),
+                                            });
+                                        };
+                                        let encoded = encode_small_int(bits)?;
+                                        break 'size ctx
+                                            .builder
+                                            .ins()
+                                            .iconst(ctx.pointer_type, encoded);
+                                    }
+                                    BitArraySize::Variable { name, .. } => {
+                                        let Some(value) = ctx.lookup(name) else {
+                                            return Err(crate::Error::NativeCodegen {
+                                                message: format!(
+                                                    "bit array segment size variable `{name}` is not defined in native functions"
+                                                ),
+                                            });
+                                        };
+                                        break 'size *value;
+                                    }
+                                    _ => {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message:
+                                                "bit array size expression is not yet supported in native functions"
+                                                    .into(),
+                                        });
+                                    }
+                                }
+                            }
+                        };
+
+                        let head_binding = match first_segment.value.as_ref() {
+                            Pattern::Variable { name, .. } => Some(name.clone()),
+                            Pattern::Discard { .. } => None,
+                            _ => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "only variable or discard patterns are supported for sized int segments in native functions"
+                                            .into(),
+                                });
+                            }
+                        };
+
+                        let rest_binding = match rest_segment.value.as_ref() {
+                            Pattern::Variable { name, .. } => Some(name.clone()),
+                            Pattern::Discard { .. } => None,
+                            _ => {
+                                return Err(crate::Error::NativeCodegen {
+                                    message:
+                                        "only variable or discard patterns are supported for bits segments in native functions"
+                                            .into(),
+                                });
+                            }
+                        };
+
+                        let (block, params, extras) = ctx.branch_on_bit_array_prefix_pattern(
+                            module,
+                            pattern_block,
+                            pattern_subjects[subject_index],
+                            size_value,
+                            next_block,
+                            pattern_subjects.as_slice(),
+                            subject_count,
+                        )?;
+                        pattern_block = block;
+                        pattern_subjects = params;
+
+                        if ctx.builder.current_block() != Some(pattern_block) {
+                            ctx.builder.switch_to_block(pattern_block);
+                        }
+
+                        if extras.len() != 2 {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "unexpected bit array prefix extras in native case lowering"
+                                        .into(),
+                            });
+                        }
+
+                        let block_params = ctx.builder.block_params(pattern_block).to_vec();
+                        let base_index = pattern_subjects.len();
+                        let prefix_value = block_params.get(base_index).copied().ok_or_else(|| {
+                            crate::Error::NativeCodegen {
+                                message:
+                                    "missing bit array prefix capture parameter in native case lowering"
+                                        .into(),
+                            }
+                        })?;
+                        let rest_value = block_params
+                            .get(base_index + 1)
+                            .copied()
+                            .ok_or_else(|| crate::Error::NativeCodegen {
+                                message:
+                                    "missing bit array rest capture parameter in native case lowering"
+                                        .into(),
+                            })?;
+
+                        if let Some(name) = head_binding {
+                            let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
+                            let func_ref =
+                                module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                            let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
+                            let tuple = ctx.builder.inst_results(call)[0];
+                            let head_value = ctx.tuple_element(tuple, 0)?;
+                            let actual_size = ctx.tuple_element(tuple, 1)?;
+                            let mismatch =
+                                ctx.builder
+                                    .ins()
+                                    .icmp(IntCC::NotEqual, actual_size, size_value);
+
+                            let current_block = pattern_block;
+                            let continue_block = ctx.builder.create_block();
+                            let _ = ctx.builder.ins().brif(
+                                mismatch,
+                                next_block,
+                                pattern_subjects.as_slice(),
+                                continue_block,
+                                &[],
+                            );
+                            ctx.seal_block(current_block);
+                            ctx.builder.switch_to_block(continue_block);
+                            pattern_block = continue_block;
+
+                            bindings.push((name, BindingSource::Value(head_value)));
+                        }
+
+                        if let Some(name) = rest_binding {
+                            bindings.push((name, BindingSource::Value(rest_value)));
                         }
 
                         continue;
