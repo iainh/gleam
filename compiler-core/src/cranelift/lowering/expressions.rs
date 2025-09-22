@@ -45,6 +45,30 @@ fn record_constructor_symbol(
     )
 }
 
+fn resolve_assign_pattern<'pattern>(
+    mut pattern: &'pattern Pattern<Arc<Type>>,
+    bindings: &mut Vec<(EcoString, BindingSource)>,
+    subject_index: usize,
+) -> &'pattern Pattern<Arc<Type>> {
+    loop {
+        match pattern {
+            Pattern::Assign {
+                name,
+                pattern: inner,
+                ..
+            } => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "native lowering: resolving assign pattern `{name}` on subject index {subject_index}"
+                );
+                bindings.push((name.clone(), BindingSource::Subject(subject_index)));
+                pattern = inner;
+            }
+            _ => return pattern,
+        }
+    }
+}
+
 fn collect_module_functions(
     module: &crate::ast::TypedModule,
 ) -> Vec<&Function<Arc<Type>, TypedExpr>> {
@@ -1322,20 +1346,16 @@ fn lower_case(
                 }
             }
 
-            let mut pattern = pattern;
-            loop {
-                match pattern {
-                    Pattern::Assign {
-                        name,
-                        pattern: inner,
-                        ..
-                    } => {
-                        bindings.push((name.clone(), BindingSource::Subject(subject_index)));
-                        pattern = inner;
-                    }
-                    _ => break,
-                }
-            }
+            let pattern = resolve_assign_pattern(pattern, &mut bindings, subject_index);
+            debug_assert!(
+                !matches!(pattern, Pattern::Assign { .. }),
+                "assign pattern should be resolved before lowering"
+            );
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "native lowering: pattern after assign resolution = {:?}",
+                pattern
+            );
 
             match pattern {
                 Pattern::Discard { .. } => {}
@@ -2208,6 +2228,7 @@ fn lower_case(
                     continue;
                 }
                 other => {
+                    eprintln!("UNSUPPORTED_PATTERN {:?}", other);
                     return Err(crate::Error::NativeCodegen {
                         message: format!(
                             "case pattern `{other:?}` is not yet supported in native functions"
