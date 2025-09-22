@@ -1834,11 +1834,22 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         constructor: &PatternConstructor,
         type_: &Arc<Type>,
         capture_flags: &[bool],
+        alias_counts: &[usize],
         failure_block: ir::Block,
         failure_args: &[Value],
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
-        let extra_count = capture_flags.iter().filter(|flag| **flag).count();
+        if capture_flags.len() != alias_counts.len() {
+            return Err(crate::Error::NativeCodegen {
+                message:
+                    "constructor capture flag and alias count length mismatch in native lowering"
+                        .into(),
+            });
+        }
+
+        let captures: usize = capture_flags.iter().filter(|flag| **flag).count();
+        let alias_total: usize = alias_counts.iter().sum();
+        let extra_count = captures + alias_total;
 
         let success_block = self.builder.create_block();
         for _ in 0..subject_count {
@@ -1985,14 +1996,27 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 let field_base = HEADER_SIZE + (2 * size_of::<u32>() as i32);
                 let pointer_stride = self.pointer_bytes() as i32;
                 for (field_index, capture) in capture_flags.iter().enumerate() {
-                    if *capture {
-                        let field_offset = field_base + (field_index as i32) * pointer_stride;
-                        let field_value = self.builder.ins().load(
-                            self.pointer_type,
-                            mem_flags,
-                            record_subject,
-                            field_offset,
-                        );
+                    let alias_count = alias_counts[field_index];
+                    if !*capture {
+                        if alias_count > 0 {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "constructor alias requires capturing the argument in native functions"
+                                        .into(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    let field_offset = field_base + (field_index as i32) * pointer_stride;
+                    let field_value = self.builder.ins().load(
+                        self.pointer_type,
+                        mem_flags,
+                        record_subject,
+                        field_offset,
+                    );
+                    captured_fields.push(field_value);
+                    for _ in 0..alias_count {
                         captured_fields.push(field_value);
                     }
                 }
@@ -2315,16 +2339,20 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     HEADER_SIZE,
                 );
                 let (block, params, extras) = match pattern {
-                    ListHeadMatch::Constructor(info) => self.branch_on_constructor_pattern(
-                        current_block,
-                        head_value,
-                        info.constructor,
-                        info.type_,
-                        info.capture_flags.as_slice(),
-                        failure_block,
-                        &subjects,
-                        subject_count,
-                    )?,
+                    ListHeadMatch::Constructor(info) => {
+                        let alias_counts = vec![0; info.capture_flags.len()];
+                        self.branch_on_constructor_pattern(
+                            current_block,
+                            head_value,
+                            info.constructor,
+                            info.type_,
+                            info.capture_flags.as_slice(),
+                            alias_counts.as_slice(),
+                            failure_block,
+                            &subjects,
+                            subject_count,
+                        )?
+                    }
                     ListHeadMatch::Tuple(info) => self.branch_on_tuple_pattern(
                         current_block,
                         head_value,

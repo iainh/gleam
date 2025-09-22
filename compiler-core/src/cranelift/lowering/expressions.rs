@@ -754,12 +754,14 @@ fn lower_pattern_assignment(
 
             let failure_args = subjects.clone();
             let failure_block = ctx.create_subject_block(subject_count);
+            let alias_counts: Vec<usize> = capture_flags.iter().map(|_| 0).collect();
             let (block, _params, extras) = ctx.branch_on_constructor_pattern(
                 pattern_block,
                 subjects[0],
                 constructor,
                 type_,
                 &capture_flags,
+                alias_counts.as_slice(),
                 failure_block,
                 &failure_args,
                 subject_count,
@@ -1539,12 +1541,18 @@ fn lower_case(
                         argument_aliases.push(Vec::new());
                     }
 
+                    let alias_counts: Vec<usize> = argument_aliases
+                        .iter()
+                        .map(|aliases| aliases.len())
+                        .collect();
+
                     let (block, params, extras) = ctx.branch_on_constructor_pattern(
                         pattern_block,
                         pattern_subjects[subject_index],
                         constructor,
                         type_,
                         &capture_flags,
+                        alias_counts.as_slice(),
                         next_block,
                         &pattern_subjects,
                         subject_count,
@@ -1559,6 +1567,7 @@ fn lower_case(
 
                     let mut extra_iter = extras.into_iter();
                     for (index, capture) in capture_flags.iter().enumerate() {
+                        let alias_count = alias_counts[index];
                         if *capture {
                             let Some(value) = extra_iter.next() else {
                                 return Err(crate::Error::NativeCodegen {
@@ -1585,7 +1594,19 @@ fn lower_case(
                                 bindings.push((name.clone(), BindingSource::Value(value)));
                             }
                             for alias in &argument_aliases[index] {
-                                bindings.push((alias.clone(), BindingSource::Value(value)));
+                                let alias_value = if alias_count > 0 {
+                                    let Some(alias_extra) = extra_iter.next() else {
+                                        return Err(crate::Error::NativeCodegen {
+                                            message:
+                                                "missing constructor alias value in native case lowering"
+                                                    .into(),
+                                        });
+                                    };
+                                    alias_extra
+                                } else {
+                                    value
+                                };
+                                bindings.push((alias.clone(), BindingSource::Value(alias_value)));
                             }
                         } else if tuple_patterns[index].is_some() {
                             return Err(crate::Error::NativeCodegen {
