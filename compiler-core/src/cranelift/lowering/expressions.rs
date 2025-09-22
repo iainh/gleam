@@ -1,9 +1,9 @@
 use crate::{
     Result,
     ast::{
-        AssignmentKind, BinOp, BitArrayOption, BitArraySize, Function, ModuleConstant, Pattern,
-        PipelineAssignmentKind, Statement, TypedArg, TypedAssert, TypedDefinition, TypedExpr,
-        TypedPipelineAssignment, TypedStatement,
+        AssignmentKind, BinOp, BitArrayOption, BitArraySize, Endianness, Function, ModuleConstant,
+        Pattern, PipelineAssignmentKind, Statement, TypedArg, TypedAssert, TypedDefinition,
+        TypedExpr, TypedPipelineAssignment, TypedStatement,
     },
     bit_array::GetLiteralValue,
     type_::{ModuleValueConstructor, Type, ValueConstructorVariant},
@@ -451,33 +451,118 @@ pub(super) fn lower_expression(
         },
 
         TypedExpr::BitArray { segments, .. } => {
-            if segments.len() != 1 {
+            let builder_id = ctx.declare_runtime_bit_array_builder_new(module)?;
+            let builder_ref = module.declare_func_in_func(builder_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(builder_ref, &[]);
+            let mut builder_value = ctx.builder.inst_results(call)[0];
+
+            if segments.is_empty() {
+                let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
+                let finish_ref = module.declare_func_in_func(finish_id, &mut ctx.builder.func);
+                let finish_call = ctx.builder.ins().call(finish_ref, &[builder_value]);
+                let result = ctx.builder.inst_results(finish_call)[0];
+                return Ok(result);
+            }
+
+            for segment in segments {
+                if segment.type_.is_bit_array() {
+                    let value = lower_expression(module, &segment.value, ctx)?;
+                    let (size_value, has_size_value) = if let Some(size_expr) = segment.size() {
+                        let size = lower_expression(module, size_expr, ctx)?;
+                        (size, ctx.builder.ins().iconst(ctx.pointer_type, 1))
+                    } else {
+                        (
+                            ctx.builder.ins().iconst(ctx.pointer_type, 0),
+                            ctx.builder.ins().iconst(ctx.pointer_type, 0),
+                        )
+                    };
+                    let unit_value = ctx
+                        .builder
+                        .ins()
+                        .iconst(ctx.pointer_type, i64::from(segment.unit()));
+                    let func_id = ctx.declare_runtime_bit_array_builder_append_bit_array(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let call = ctx.builder.ins().call(
+                        func_ref,
+                        &[builder_value, value, size_value, has_size_value, unit_value],
+                    );
+                    builder_value = ctx.builder.inst_results(call)[0];
+                    continue;
+                }
+
+                if segment.type_.is_int() {
+                    let value = lower_expression(module, &segment.value, ctx)?;
+                    let (size_value, has_size_value) = if let Some(size_expr) = segment.size() {
+                        let size = lower_expression(module, size_expr, ctx)?;
+                        (size, ctx.builder.ins().iconst(ctx.pointer_type, 1))
+                    } else {
+                        (
+                            ctx.builder.ins().iconst(ctx.pointer_type, 0),
+                            ctx.builder.ins().iconst(ctx.pointer_type, 0),
+                        )
+                    };
+                    let unit_value = ctx
+                        .builder
+                        .ins()
+                        .iconst(ctx.pointer_type, i64::from(segment.unit()));
+                    let default_size_value = ctx.builder.ins().iconst(ctx.pointer_type, 8);
+                    let signed_value = ctx.builder.ins().iconst(ctx.pointer_type, 1);
+                    let endianness = match segment.endianness() {
+                        Endianness::Big => 0,
+                        Endianness::Little => 1,
+                    };
+                    let endianness_value = ctx
+                        .builder
+                        .ins()
+                        .iconst(ctx.pointer_type, i64::from(endianness));
+                    let func_id = ctx.declare_runtime_bit_array_builder_append_int(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let call = ctx.builder.ins().call(
+                        func_ref,
+                        &[
+                            builder_value,
+                            value,
+                            size_value,
+                            has_size_value,
+                            unit_value,
+                            default_size_value,
+                            signed_value,
+                            endianness_value,
+                        ],
+                    );
+                    builder_value = ctx.builder.inst_results(call)[0];
+                    continue;
+                }
+
+                if segment.type_.is_string() {
+                    if segment.has_utf16_option() || segment.has_utf32_option() {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "utf16 and utf32 string segments are not yet supported in native functions"
+                                .into(),
+                        });
+                    }
+                    let value = lower_expression(module, &segment.value, ctx)?;
+                    let func_id =
+                        ctx.declare_runtime_bit_array_builder_append_string_utf8(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
+                    builder_value = ctx.builder.inst_results(call)[0];
+                    continue;
+                }
+
                 return Err(crate::Error::NativeCodegen {
-                    message:
-                        "bit array expressions with multiple segments are not yet supported in native functions"
-                            .into(),
+                    message: format!(
+                        "bit array segment type is not yet supported in native functions: {:?}",
+                        segment.type_
+                    ),
                 });
             }
 
-            let segment = &segments[0];
-            let is_utf8 = segment
-                .options
-                .iter()
-                .all(|option| matches!(option, BitArrayOption::Utf8 { .. }));
-
-            if !is_utf8 {
-                return Err(crate::Error::NativeCodegen {
-                    message: "bit array segment options are not yet supported in native functions"
-                        .into(),
-                });
-            }
-
-            let value = lower_expression(module, &segment.value, ctx)?;
-            let func_id = ctx.declare_runtime_string_utf8_bits(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
-            let call = ctx.builder.ins().call(func_ref, &[value]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
+            let finish_ref = module.declare_func_in_func(finish_id, &mut ctx.builder.func);
+            let call = ctx.builder.ins().call(finish_ref, &[builder_value]);
+            let result = ctx.builder.inst_results(call)[0];
+            Ok(result)
         }
 
         TypedExpr::BinOp {

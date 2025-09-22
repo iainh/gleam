@@ -366,6 +366,147 @@ fn copy_bits_into(
     }
 }
 
+struct BitArrayBuilder {
+    bytes: Vec<u8>,
+    bit_len: usize,
+}
+
+impl BitArrayBuilder {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            bit_len: 0,
+        }
+    }
+
+    fn push_bit(&mut self, bit: u8) {
+        let byte_index = self.bit_len / 8;
+        if byte_index == self.bytes.len() {
+            self.bytes.push(0);
+        }
+        if bit != 0 {
+            let offset = 7 - (self.bit_len % 8);
+            if let Some(byte) = self.bytes.get_mut(byte_index) {
+                *byte |= 1 << offset;
+            }
+        }
+        self.bit_len += 1;
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.bit_len % 8 == 0 {
+            self.bytes.extend_from_slice(bytes);
+            self.bit_len += bytes.len() * 8;
+        } else {
+            for byte in bytes {
+                for shift in (0..8).rev() {
+                    let bit = (byte >> shift) & 1;
+                    self.push_bit(bit);
+                }
+            }
+        }
+    }
+
+    fn append_view_bits(&mut self, view: &BitArrayView, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let new_len = self.bit_len + len;
+        let required_bytes = (new_len + 7) / 8;
+        if self.bytes.len() < required_bytes {
+            self.bytes.resize(required_bytes, 0);
+        }
+        copy_bits_into(view, start, len, &mut self.bytes, self.bit_len);
+        self.bit_len = new_len;
+    }
+
+    fn append_bit_array_value(&mut self, value: Value, take_bits: Option<usize>) {
+        if value == Value::nil() {
+            return;
+        }
+        let view = bit_array_view(value, "bit array builder append");
+        let available = view.bit_len;
+        let len = match take_bits {
+            Some(bits) => {
+                if bits > available {
+                    panic!("runtime bit_array builder segment size exceeds available bits");
+                }
+                bits
+            }
+            None => available,
+        };
+        self.append_view_bits(&view, 0, len);
+    }
+
+    fn append_int(
+        &mut self,
+        value: i64,
+        size_bits: usize,
+        signed: bool,
+        endianness: BuilderEndianness,
+    ) {
+        if size_bits == 0 {
+            return;
+        }
+        match endianness {
+            BuilderEndianness::Big => {
+                for index in (0..size_bits).rev() {
+                    let bit = extract_int_bit(value, index, signed);
+                    self.push_bit(bit);
+                }
+            }
+            BuilderEndianness::Little => {
+                for index in 0..size_bits {
+                    let bit = extract_int_bit(value, index, signed);
+                    self.push_bit(bit);
+                }
+            }
+        }
+    }
+}
+
+fn extract_int_bit(value: i64, index: usize, signed: bool) -> u8 {
+    if index < 63 {
+        if signed {
+            ((value >> index) & 1) as u8
+        } else {
+            (((value as u64) >> index) & 1) as u8
+        }
+    } else if signed && value < 0 {
+        1
+    } else {
+        0
+    }
+}
+
+enum BuilderEndianness {
+    Big,
+    Little,
+}
+
+fn builder_from_raw(raw: u64) -> *mut BitArrayBuilder {
+    raw as *mut BitArrayBuilder
+}
+
+fn builder_ref(raw: u64) -> &'static mut BitArrayBuilder {
+    unsafe { &mut *builder_from_raw(raw) }
+}
+
+fn compute_size_bits(size: i64, unit: u64) -> usize {
+    let unit_i64 =
+        i64::try_from(unit).unwrap_or_else(|_| panic!("bit array segment unit overflow"));
+    let product = (size as i128) * (unit_i64 as i128);
+    if product <= 0 {
+        0
+    } else {
+        usize::try_from(product)
+            .unwrap_or_else(|_| panic!("bit array segment size exceeds native backend limits"))
+    }
+}
+
 fn bit_array_from_bytes(bytes: &[u8], bit_len: usize) -> Value {
     gc::ensure_initialised();
     let heap = Heap::new();
@@ -1717,6 +1858,86 @@ pub extern "C" fn bit_array_split_bits(bits_raw: u64, size_raw: u64) -> u64 {
         "bit array split bits tuple",
     );
     tuple.to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_builder_new() -> u64 {
+    let builder = Box::new(BitArrayBuilder::new());
+    Box::into_raw(builder) as u64
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_builder_append_bit_array(
+    builder_raw: u64,
+    bits_raw: u64,
+    size_raw: u64,
+    has_size_raw: u64,
+    unit_raw: u64,
+) -> u64 {
+    let builder = builder_ref(builder_raw);
+    let has_size = has_size_raw != 0;
+    let unit = unit_raw as u64;
+    let take_bits = if has_size {
+        let size_value = value_to_i63(Value::from_raw(size_raw), "bit array segment size");
+        let bits = compute_size_bits(size_value, unit);
+        Some(bits)
+    } else {
+        None
+    };
+    let value = Value::from_raw(bits_raw);
+    builder.append_bit_array_value(value, take_bits);
+    builder_raw
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_builder_append_int(
+    builder_raw: u64,
+    value_raw: u64,
+    size_raw: u64,
+    has_size_raw: u64,
+    unit_raw: u64,
+    default_size_raw: u64,
+    signed_raw: u64,
+    endianness_raw: u64,
+) -> u64 {
+    let builder = builder_ref(builder_raw);
+    let unit = unit_raw as u64;
+    let default_size_bits = default_size_raw as i64;
+    let base_size = if has_size_raw != 0 {
+        value_to_i63(Value::from_raw(size_raw), "bit array segment size")
+    } else {
+        default_size_bits
+    };
+    let size_bits = compute_size_bits(base_size, unit);
+    if size_bits == 0 {
+        return builder_raw;
+    }
+    let value = value_to_i63(Value::from_raw(value_raw), "bit array int segment");
+    let signed = signed_raw != 0;
+    let endianness = match endianness_raw {
+        0 => BuilderEndianness::Big,
+        1 => BuilderEndianness::Little,
+        _ => panic!("invalid endianness flag"),
+    };
+    builder.append_int(value, size_bits, signed, endianness);
+    builder_raw
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_builder_append_string_utf8(builder_raw: u64, string_raw: u64) -> u64 {
+    let builder = builder_ref(builder_raw);
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    builder.append_bytes(string.as_bytes());
+    builder_raw
+}
+
+#[no_mangle]
+pub extern "C" fn bit_array_builder_finish(builder_raw: u64) -> u64 {
+    let builder_ptr = builder_from_raw(builder_raw);
+    let builder = unsafe { Box::from_raw(builder_ptr) };
+    let value = bit_array_from_bytes(&builder.bytes, builder.bit_len);
+    value.to_raw()
 }
 
 #[no_mangle]

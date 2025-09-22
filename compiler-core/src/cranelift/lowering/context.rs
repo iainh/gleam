@@ -51,12 +51,16 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_println_error: Option<FuncId>,
     pub(super) runtime_string_add: Option<FuncId>,
     pub(super) runtime_string_equal: Option<FuncId>,
-    pub(super) runtime_string_utf8_bits: Option<FuncId>,
     pub(super) runtime_bit_array_utf8_split: Option<FuncId>,
     pub(super) runtime_bit_array_bit_size: Option<FuncId>,
     pub(super) runtime_bit_array_to_int: Option<FuncId>,
     pub(super) runtime_bit_array_pop_byte: Option<FuncId>,
     pub(super) runtime_bit_array_split_bits: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_new: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_append_int: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_append_bit_array: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_append_string_utf8: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_finish: Option<FuncId>,
     pub(super) runtime_bool_true: Option<FuncId>,
     pub(super) runtime_bool_false: Option<FuncId>,
     pub(super) runtime_list_cons: Option<FuncId>,
@@ -106,12 +110,16 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println_error: None,
             runtime_string_add: None,
             runtime_string_equal: None,
-            runtime_string_utf8_bits: None,
             runtime_bit_array_utf8_split: None,
             runtime_bit_array_bit_size: None,
             runtime_bit_array_to_int: None,
             runtime_bit_array_pop_byte: None,
             runtime_bit_array_split_bits: None,
+            runtime_bit_array_builder_new: None,
+            runtime_bit_array_builder_append_int: None,
+            runtime_bit_array_builder_append_bit_array: None,
+            runtime_bit_array_builder_append_string_utf8: None,
+            runtime_bit_array_builder_finish: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
             runtime_list_cons: None,
@@ -873,27 +881,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(id)
     }
 
-    pub(super) fn declare_runtime_string_utf8_bits(
-        &mut self,
-        module: &mut ObjectModule,
-    ) -> Result<FuncId> {
-        if let Some(id) = self.runtime_string_utf8_bits {
-            return Ok(id);
-        }
-
-        let mut signature = module.make_signature();
-        signature.params.push(ir::AbiParam::new(self.pointer_type));
-        signature.returns.push(ir::AbiParam::new(self.pointer_type));
-
-        let id = module
-            .declare_function("string_to_utf8_bits", Linkage::Import, &signature)
-            .map_err(|err| crate::Error::NativeCodegen {
-                message: err.to_string(),
-            })?;
-        self.runtime_string_utf8_bits = Some(id);
-        Ok(id)
-    }
-
     pub(super) fn declare_runtime_bit_array_utf8_split(
         &mut self,
         module: &mut ObjectModule,
@@ -997,6 +984,123 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_bit_array_split_bits = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_new(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_new {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_builder_new", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_new = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_append_int(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_append_int {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        for _ in 0..8 {
+            signature.params.push(ir::AbiParam::new(self.pointer_type));
+        }
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_builder_append_int", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_append_int = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_append_bit_array(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_append_bit_array {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        for _ in 0..5 {
+            signature.params.push(ir::AbiParam::new(self.pointer_type));
+        }
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function(
+                "bit_array_builder_append_bit_array",
+                Linkage::Import,
+                &signature,
+            )
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_append_bit_array = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_append_string_utf8(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_append_string_utf8 {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function(
+                "bit_array_builder_append_string_utf8",
+                Linkage::Import,
+                &signature,
+            )
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_append_string_utf8 = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_finish(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_finish {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("bit_array_builder_finish", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_finish = Some(id);
         Ok(id)
     }
 
