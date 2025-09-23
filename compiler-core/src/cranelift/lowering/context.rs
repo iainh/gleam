@@ -79,6 +79,19 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
+    #[cfg(debug_assertions)]
+    fn assert_block_open(&self, block: ir::Block, context: &str) {
+        if let Some(inst) = self.builder.func.layout.last_inst(block) {
+            if self.builder.func.dfg.insts[inst].opcode().is_terminator() {
+                panic!(
+                    "native lowering: attempted to insert into filled block {:?} while {}",
+                    block,
+                    context
+                );
+            }
+        }
+    }
+
     pub(super) fn new(
         builder: &'a mut FunctionBuilder<'b>,
         pointer_type: ir::Type,
@@ -1541,6 +1554,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     ) -> Result<(ir::Block, Vec<Value>)> {
         let success_block = self.create_subject_block(subject_count);
 
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
         let int = int_value
             .to_i64()
             .ok_or_else(|| crate::Error::NativeCodegen {
@@ -1857,13 +1874,61 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         alias_counts: &[usize],
         failure_block: ir::Block,
         failure_args: &[Value],
+        failure_block_arg_count: usize,
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let actual_failure_arg_count = self.builder.block_params(failure_block).len();
+        debug_assert_eq!(
+            actual_failure_arg_count, failure_block_arg_count,
+            "constructor failure arg count mismatch: expected {}, actual {}",
+            failure_block_arg_count, actual_failure_arg_count
+        );
+        let failure_block_arg_count = actual_failure_arg_count;
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "native lowering: constructor branch received failure_args_len={}, subject_count={}, failure_block_args={}",
+            failure_args.len(),
+            subject_count,
+            failure_block_arg_count
+        );
+
         if capture_flags.len() != alias_counts.len() {
             return Err(crate::Error::NativeCodegen {
                 message:
                     "constructor capture flag and alias count length mismatch in native lowering"
                         .into(),
+            });
+        }
+
+        if failure_block_arg_count > failure_args.len() {
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "constructor pattern requested {failure_block_arg_count} failure arguments, got {}",
+                    failure_args.len()
+                )
+                .into(),
+            });
+        }
+
+        if failure_args.len() < subject_count {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "native lowering: constructor failure_args_len={}, subject_count={}, failure_block_args={}",
+                failure_args.len(),
+                subject_count,
+                failure_block_arg_count
+            );
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "constructor pattern mismatch: subjects={}, available={}",
+                    subject_count,
+                    failure_args.len()
+                )
+                .into(),
             });
         }
 
@@ -1884,7 +1949,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let mut success_args = Vec::with_capacity(subject_count + extra_count);
-        success_args.extend_from_slice(failure_args);
+        success_args.extend(failure_args.iter().take(subject_count).copied());
         let mem_flags = MemFlags::trusted();
         let pointer_block = self.builder.create_block();
         let _ = self
@@ -1903,12 +1968,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let zero = self.builder.ins().iconst(self.pointer_type, 0);
         let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
 
+        let failure_values = failure_args[..failure_block_arg_count].to_vec();
         let _ = self.builder.ins().brif(
             is_boxed,
             pointer_block,
             &[subject],
             failure_block,
-            failure_args,
+            &failure_values,
         );
         self.seal_block(current_block);
 
@@ -1971,7 +2037,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                failure_args,
+                &failure_values,
             );
             self.seal_block(tag_block);
         } else {
@@ -1991,7 +2057,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 record_block,
                 &[tag_subject],
                 failure_block,
-                failure_args,
+                &failure_values,
             );
             self.seal_block(tag_block);
 
@@ -2049,7 +2115,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 success_block,
                 &success_args,
                 failure_block,
-                failure_args,
+                &failure_values,
             );
             self.seal_block(record_block);
         }
@@ -2070,8 +2136,46 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         capture_flags: &[bool],
         failure_block: ir::Block,
         failure_args: &[Value],
+        failure_block_arg_count: usize,
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+
+        let actual_failure_arg_count = self.builder.block_params(failure_block).len();
+        debug_assert_eq!(
+            actual_failure_arg_count, failure_block_arg_count,
+            "tuple failure arg count mismatch: expected {}, actual {}",
+            failure_block_arg_count, actual_failure_arg_count
+        );
+        let failure_block_arg_count = actual_failure_arg_count;
+
+        if failure_block_arg_count > failure_args.len() {
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "tuple pattern requested {failure_block_arg_count} failure arguments, got {}",
+                    failure_args.len()
+                )
+                .into(),
+            });
+        }
+
+        if failure_args.len() < subject_count {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "native lowering: tuple success needs {subject_count} subjects, failure args available {}",
+                failure_args.len()
+            );
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "tuple pattern requires {subject_count} subject arguments, got {}",
+                    failure_args.len()
+                )
+                .into(),
+            });
+        }
+
         let extra_count = capture_flags.iter().filter(|flag| **flag).count();
 
         let success_block = self.builder.create_block();
@@ -2087,7 +2191,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let mut success_args = Vec::with_capacity(subject_count + extra_count);
-        success_args.extend_from_slice(failure_args);
+        success_args.extend(failure_args.iter().take(subject_count).copied());
         let mem_flags = MemFlags::trusted();
 
         let pointer_block = self.builder.create_block();
@@ -2100,12 +2204,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let zero = self.builder.ins().iconst(self.pointer_type, 0);
         let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
 
+        let failure_values = failure_args[..failure_block_arg_count].to_vec();
         let _ = self.builder.ins().brif(
             is_boxed,
             pointer_block,
             &[subject],
             failure_block,
-            failure_args,
+            &failure_values,
         );
         self.seal_block(current_block);
 
@@ -2145,7 +2250,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             tuple_block,
             &[tuple_subject],
             failure_block,
-            failure_args,
+            &failure_values,
         );
         self.seal_block(pointer_block);
 
@@ -2256,6 +2361,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         for (index, capture) in capture_heads.iter().enumerate() {
             if self.builder.current_block() != Some(current_block) {
+                #[cfg(debug_assertions)]
+                self.assert_block_open(current_block, "entering list head loop");
                 self.builder.switch_to_block(current_block);
             }
 
@@ -2311,6 +2418,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             );
             self.seal_block(current_block);
 
+            #[cfg(debug_assertions)]
+            self.assert_block_open(pointer_block, "list pattern pointer block entry");
             self.builder.switch_to_block(pointer_block);
             current_block = pointer_block;
             subjects = self.builder.block_params(current_block).to_vec();
@@ -2344,6 +2453,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             );
             self.seal_block(current_block);
 
+            #[cfg(debug_assertions)]
+            self.assert_block_open(list_block, "list pattern list block entry");
             self.builder.switch_to_block(list_block);
             current_block = list_block;
             subjects = self.builder.block_params(current_block).to_vec();
@@ -2361,6 +2472,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 let (block, params, extras) = match pattern {
                     ListHeadMatch::Constructor(info) => {
                         let alias_counts = vec![0; info.capture_flags.len()];
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "native lowering: list head constructor subjects={}, failure_params={}",
+                            subjects.len(),
+                            failure_block_arg_count
+                        );
                         self.branch_on_constructor_pattern(
                             current_block,
                             head_value,
@@ -2369,8 +2486,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                             info.capture_flags.as_slice(),
                             alias_counts.as_slice(),
                             failure_block,
-                            &subjects[..subject_count],
-                            subject_count,
+                            subjects.as_slice(),
+                            failure_block_arg_count,
+                            subjects.len(),
                         )?
                     }
                     ListHeadMatch::Tuple(info) => self.branch_on_tuple_pattern(
@@ -2379,8 +2497,9 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                         info.arity,
                         info.capture_flags.as_slice(),
                         failure_block,
-                        &subjects[..subject_count],
-                        subject_count,
+                        subjects.as_slice(),
+                        failure_block_arg_count,
+                        subjects.len(),
                     )?,
                 };
                 current_block = block;
@@ -2388,6 +2507,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 current_subject = subjects[subject_index];
                 head_extras = extras;
                 if self.builder.current_block() != Some(current_block) {
+                    #[cfg(debug_assertions)]
+                    self.assert_block_open(current_block, "after lowering list head pattern");
                     self.builder.switch_to_block(current_block);
                 }
             }
@@ -2436,6 +2557,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         if ensure_exact {
             if self.builder.current_block() != Some(current_block) {
+                #[cfg(debug_assertions)]
+                self.assert_block_open(current_block, "ensuring exact list tail");
                 self.builder.switch_to_block(current_block);
             }
 
@@ -2499,6 +2622,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let _ = self.builder.ins().jump(success_block, &success_args);
         self.seal_block(current_block);
         self.builder.switch_to_block(success_block);
+        #[cfg(debug_assertions)]
+        self.assert_block_open(success_block, "before reading list success params");
         let params = self.builder.block_params(success_block).to_vec();
         self.seal_block(success_block);
         let new_subjects = params[..subject_count].to_vec();
@@ -2520,8 +2645,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         nested_args.push(head_value);
         let nested_index = nested_args.len() - 1;
 
-        let failure_subjects = &nested_args[..pattern_subjects.len()];
-
+        let failure_arg_count = self.builder.block_params(failure_block).len();
         let (block, params, extras) = self.branch_on_list_pattern(
             module,
             *pattern_block,
@@ -2531,8 +2655,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             info.pattern.capture_tail,
             info.pattern.ensure_exact,
             failure_block,
-            failure_subjects,
-            pattern_subjects.len(),
+            nested_args.as_slice(),
+            failure_arg_count,
             nested_args.len(),
         )?;
         *pattern_block = block;
@@ -2656,13 +2780,23 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         bindings: &mut Vec<(EcoString, BindingSource)>,
     ) -> Result<()> {
         let subject_count = pattern_subjects.len();
+        let failure_block_arg_count = self.builder.block_params(failure_block).len();
+        if failure_block_arg_count > subject_count {
+            return Err(crate::Error::NativeCodegen {
+                message: format!(
+                    "constructor tuple pattern requested {failure_block_arg_count} failure arguments, got {subject_count}"
+                )
+                .into(),
+            });
+        }
         let (block, params, extras) = self.branch_on_tuple_pattern(
             *pattern_block,
             tuple_value,
             info.capture_flags.len(),
             info.capture_flags.as_slice(),
             failure_block,
-            &pattern_subjects[..subject_count],
+            &pattern_subjects[..failure_block_arg_count],
+            failure_block_arg_count,
             subject_count,
         )?;
         *pattern_block = block;
