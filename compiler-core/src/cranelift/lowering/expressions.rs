@@ -632,6 +632,24 @@ pub(super) fn lower_expression(
                     continue;
                 }
 
+                if segment.type_.is_utf_codepoint() {
+                    if segment.has_utf16_codepoint_option() || segment.has_utf32_codepoint_option()
+                    {
+                        return Err(crate::Error::NativeCodegen {
+                            message:
+                                "utf16 and utf32 codepoint segments are not yet supported in native functions"
+                                    .into(),
+                        });
+                    }
+                    let value = lower_expression(module, &segment.value, ctx)?;
+                    let func_id =
+                        ctx.declare_runtime_bit_array_builder_append_utf8_codepoint(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
+                    builder_value = ctx.builder.inst_results(call)[0];
+                    continue;
+                }
+
                 if segment.type_.is_string() {
                     if segment.has_utf16_option() || segment.has_utf32_option() {
                         return Err(crate::Error::NativeCodegen {
@@ -788,7 +806,11 @@ fn lower_pattern_assignment(
     let mut current_pattern = pattern;
     loop {
         match current_pattern {
-            Pattern::Assign { name, pattern: inner, .. } => {
+            Pattern::Assign {
+                name,
+                pattern: inner,
+                ..
+            } => {
                 alias_names.push(name.clone());
                 current_pattern = inner;
             }
@@ -834,8 +856,7 @@ fn lower_pattern_assignment(
             let mut binding_names = Vec::with_capacity(arguments.len());
             let mut zero_arity_constructors: Vec<Option<(&PatternConstructor, &Arc<Type>)>> =
                 Vec::with_capacity(arguments.len());
-            let mut int_conditions: Vec<Option<BigInt>> =
-                Vec::with_capacity(arguments.len());
+            let mut int_conditions: Vec<Option<BigInt>> = Vec::with_capacity(arguments.len());
             for argument in arguments {
                 match &argument.value {
                     Pattern::Variable { name, .. } => {
@@ -928,7 +949,8 @@ fn lower_pattern_assignment(
                         });
                     };
 
-                    if let Some((nested_constructor, nested_type)) = zero_arity_constructors[index] {
+                    if let Some((nested_constructor, nested_type)) = zero_arity_constructors[index]
+                    {
                         ctx.ensure_zero_arity_constructor(
                             module,
                             &mut pattern_block,
@@ -1030,7 +1052,8 @@ fn lower_pattern_assignment(
                                 Pattern::String { value, .. } => {
                                     capture_flags.push(true);
                                     binding_names.push(None);
-                                    conditions.push(ListConstructorCondition::String(value.clone()));
+                                    conditions
+                                        .push(ListConstructorCondition::String(value.clone()));
                                 }
                                 Pattern::List { elements, tail, .. }
                                     if elements.is_empty() && tail.is_none() =>
@@ -1235,8 +1258,9 @@ fn lower_pattern_assignment(
                         type_,
                         ..
                     } if spread.is_none() => {
-                        let constructor = constructor
-                            .expect_ref("pattern constructor must be known during native code generation");
+                        let constructor = constructor.expect_ref(
+                            "pattern constructor must be known during native code generation",
+                        );
 
                         let mut nested_capture_flags = Vec::with_capacity(arguments.len());
                         let mut nested_binding_names = Vec::with_capacity(arguments.len());
@@ -1357,9 +1381,8 @@ fn lower_pattern_assignment(
 
             if extras_iter.next().is_some() {
                 return Err(crate::Error::NativeCodegen {
-                    message:
-                        "unexpected extra tuple capture values in native assignment lowering"
-                            .into(),
+                    message: "unexpected extra tuple capture values in native assignment lowering"
+                        .into(),
                 });
             }
 
@@ -1914,12 +1937,13 @@ fn lower_pattern_assignment(
     ctx.seal_block(pattern_block);
 
     if !alias_names.is_empty() {
-        let subject_value = pattern_params
-            .get(0)
-            .copied()
-            .ok_or_else(|| crate::Error::NativeCodegen {
-                message: "missing subject value for assign pattern in native lowering".into(),
-            })?;
+        let subject_value =
+            pattern_params
+                .get(0)
+                .copied()
+                .ok_or_else(|| crate::Error::NativeCodegen {
+                    message: "missing subject value for assign pattern in native lowering".into(),
+                })?;
         for name in alias_names {
             bindings.push((name, subject_value));
         }
@@ -2403,8 +2427,10 @@ fn lower_case(
                                     }
 
                                     let mut nested_aliases = Vec::new();
-                                    let nested_pattern =
-                                        strip_assign_aliases(&nested_argument.value, &mut nested_aliases);
+                                    let nested_pattern = strip_assign_aliases(
+                                        &nested_argument.value,
+                                        &mut nested_aliases,
+                                    );
 
                                     match nested_pattern {
                                         Pattern::Variable { name, .. } => {
@@ -3407,23 +3433,21 @@ fn lower_case(
                     let mut extra_position = 0usize;
                     let extras_total = extras.len();
 
-                    for (element_index, (capture_flag, binding_name)) in capture_flags
-                        .iter()
-                        .zip(binding_names.iter())
-                        .enumerate()
+                    for (element_index, (capture_flag, binding_name)) in
+                        capture_flags.iter().zip(binding_names.iter()).enumerate()
                     {
                         if !*capture_flag {
                             continue;
                         }
 
                         let param_index = subject_count + extra_position;
-                        let mut value = block_params
-                            .get(param_index)
-                            .copied()
-                            .ok_or_else(|| crate::Error::NativeCodegen {
-                                message:
-                                    "missing tuple capture parameter in native case lowering"
-                                        .into(),
+                        let mut value =
+                            block_params.get(param_index).copied().ok_or_else(|| {
+                                crate::Error::NativeCodegen {
+                                    message:
+                                        "missing tuple capture parameter in native case lowering"
+                                            .into(),
+                                }
                             })?;
                         extra_position += 1;
 
@@ -3454,18 +3478,16 @@ fn lower_case(
                             );
                             ctx.seal_block(pattern_block);
                             pattern_block = continue_block;
-                            pattern_subjects = ctx.builder.block_params(pattern_block)
-                                [..subject_count]
-                                .to_vec();
+                            pattern_subjects =
+                                ctx.builder.block_params(pattern_block)[..subject_count].to_vec();
                             block_params = ctx.builder.block_params(pattern_block).to_vec();
-                            value = block_params
-                                .get(param_index)
-                                .copied()
-                                .ok_or_else(|| crate::Error::NativeCodegen {
+                            value = block_params.get(param_index).copied().ok_or_else(|| {
+                                crate::Error::NativeCodegen {
                                     message:
                                         "missing tuple capture parameter in native case lowering"
                                             .into(),
-                                })?;
+                                }
+                            })?;
                         }
 
                         if let Some(name) = binding_name {

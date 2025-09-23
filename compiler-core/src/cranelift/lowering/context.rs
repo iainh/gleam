@@ -61,6 +61,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_bit_array_builder_append_int: Option<FuncId>,
     pub(super) runtime_bit_array_builder_append_bit_array: Option<FuncId>,
     pub(super) runtime_bit_array_builder_append_string_utf8: Option<FuncId>,
+    pub(super) runtime_bit_array_builder_append_utf8_codepoint: Option<FuncId>,
     pub(super) runtime_bit_array_builder_finish: Option<FuncId>,
     pub(super) runtime_bool_true: Option<FuncId>,
     pub(super) runtime_bool_false: Option<FuncId>,
@@ -86,8 +87,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             if self.builder.func.dfg.insts[inst].opcode().is_terminator() {
                 panic!(
                     "native lowering: attempted to insert into filled block {:?} while {}",
-                    block,
-                    context
+                    block, context
                 );
             }
         }
@@ -134,6 +134,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_bit_array_builder_append_int: None,
             runtime_bit_array_builder_append_bit_array: None,
             runtime_bit_array_builder_append_string_utf8: None,
+            runtime_bit_array_builder_append_utf8_codepoint: None,
             runtime_bit_array_builder_finish: None,
             runtime_bool_true: None,
             runtime_bool_false: None,
@@ -1115,6 +1116,32 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_bit_array_builder_append_string_utf8 = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_bit_array_builder_append_utf8_codepoint(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_bit_array_builder_append_utf8_codepoint {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function(
+                "bit_array_builder_append_utf8_codepoint",
+                Linkage::Import,
+                &signature,
+            )
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_bit_array_builder_append_utf8_codepoint = Some(id);
         Ok(id)
     }
 
@@ -2559,14 +2586,20 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         let func_id = self.declare_runtime_string_equal(module)?;
                                         let func_ref = module
                                             .declare_func_in_func(func_id, &mut self.builder.func);
-                                        let call =
-                                            self.builder.ins().call(func_ref, &[value, expected_value]);
+                                        let call = self
+                                            .builder
+                                            .ins()
+                                            .call(func_ref, &[value, expected_value]);
                                         let result = self.builder.inst_results(call)[0];
                                         let true_value = self.bool_constant(module, true)?;
-                                        let is_equal =
-                                            self.builder.ins().icmp(IntCC::Equal, result, true_value);
+                                        let is_equal = self.builder.ins().icmp(
+                                            IntCC::Equal,
+                                            result,
+                                            true_value,
+                                        );
 
-                                        let continue_block = self.create_subject_block(subject_count);
+                                        let continue_block =
+                                            self.create_subject_block(subject_count);
                                         let failure_values: Vec<_> =
                                             subjects[..failure_block_arg_count].to_vec();
                                         let success_values = subjects.clone();
@@ -2590,12 +2623,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                             .declare_func_in_func(nil_func, &mut self.builder.func);
                                         let nil_call = self.builder.ins().call(nil_ref, &[]);
                                         let nil_value = self.builder.inst_results(nil_call)[0];
-                                        let is_nil = self
-                                            .builder
-                                            .ins()
-                                            .icmp(IntCC::Equal, value, nil_value);
+                                        let is_nil =
+                                            self.builder.ins().icmp(IntCC::Equal, value, nil_value);
 
-                                        let continue_block = self.create_subject_block(subject_count);
+                                        let continue_block =
+                                            self.create_subject_block(subject_count);
                                         let failure_values: Vec<_> =
                                             subjects[..failure_block_arg_count].to_vec();
                                         let success_values = subjects.clone();
@@ -2914,14 +2946,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let mut extras_iter = extras.into_iter();
-        for (capture_flag, binding_name) in
-            info.capture_flags.iter().zip(info.binding_names.iter())
+        for (capture_flag, binding_name) in info.capture_flags.iter().zip(info.binding_names.iter())
         {
             if *capture_flag {
                 let Some(value) = extras_iter.next() else {
                     return Err(crate::Error::NativeCodegen {
-                        message:
-                            "missing nested constructor capture in native case lowering".into(),
+                        message: "missing nested constructor capture in native case lowering"
+                            .into(),
                     });
                 };
                 if let Some(name) = binding_name {
@@ -3039,11 +3070,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         int_value: &BigInt,
         failure_block: ir::Block,
     ) -> Result<()> {
-        let number = int_value.to_i64().ok_or_else(|| crate::Error::NativeCodegen {
-            message: format!(
-                "integer literal out of range for Gleam immediate: {int_value}"
-            ),
-        })?;
+        let number = int_value
+            .to_i64()
+            .ok_or_else(|| crate::Error::NativeCodegen {
+                message: format!("integer literal out of range for Gleam immediate: {int_value}"),
+            })?;
         let encoded = encode_small_int(number)?;
         let expected = self.builder.ins().iconst(self.pointer_type, encoded);
         let is_equal = self.builder.ins().icmp(IntCC::Equal, value, expected);
@@ -3294,7 +3325,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .iconst(self.pointer_type, HEADER_FIELD_MASK);
         let header_tag = self.builder.ins().band(header, header_mask);
         let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
-        let is_record = self.builder.ins().icmp(IntCC::Equal, header_tag, record_tag);
+        let is_record = self
+            .builder
+            .ins()
+            .icmp(IntCC::Equal, header_tag, record_tag);
 
         let record_block = self.builder.create_block();
         let _ = self
@@ -3303,10 +3337,13 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let _ = self
             .builder
             .append_block_param(record_block, self.pointer_type);
-        let _ = self
-            .builder
-            .ins()
-            .brif(is_record, record_block, &[record_ptr, header], failure_block, &[]);
+        let _ = self.builder.ins().brif(
+            is_record,
+            record_block,
+            &[record_ptr, header],
+            failure_block,
+            &[],
+        );
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(record_block);

@@ -1940,6 +1940,26 @@ pub extern "C" fn bit_array_builder_append_string_utf8(builder_raw: u64, string_
 }
 
 #[no_mangle]
+pub extern "C" fn bit_array_builder_append_utf8_codepoint(
+    builder_raw: u64,
+    codepoint_raw: u64,
+) -> u64 {
+    let builder = builder_ref(builder_raw);
+    let codepoint = value_to_i63(
+        Value::from_raw(codepoint_raw),
+        "bit array codepoint segment value",
+    );
+    let Some(character) = char::from_u32(codepoint as u32) else {
+        panic!("runtime bit array builder received invalid codepoint");
+    };
+
+    let mut buffer = [0u8; 4];
+    let encoded = character.encode_utf8(&mut buffer);
+    builder.append_bytes(encoded.as_bytes());
+    builder_raw
+}
+
+#[no_mangle]
 pub extern "C" fn bit_array_builder_finish(builder_raw: u64) -> u64 {
     let builder_ptr = builder_from_raw(builder_raw);
     let builder = unsafe { Box::from_raw(builder_ptr) };
