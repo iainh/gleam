@@ -11,6 +11,7 @@ pub(super) struct ListConstructorInfo<'a> {
     pub(super) constructor: &'a PatternConstructor,
     pub(super) type_: &'a Arc<Type>,
     pub(super) capture_flags: Vec<bool>,
+    pub(super) conditions: Vec<ListConstructorCondition>,
 }
 
 #[derive(Debug)]
@@ -32,6 +33,13 @@ impl<'a> ListHeadMatch<'a> {
             ListHeadMatch::Tuple(info) => &info.capture_flags,
         }
     }
+}
+
+#[derive(Debug)]
+pub(super) enum ListConstructorCondition {
+    None,
+    String(EcoString),
+    EmptyList,
 }
 
 #[derive(Debug)]
@@ -63,6 +71,14 @@ pub(super) struct ConstructorTupleInfo {
 pub(super) enum ConstructorTupleCondition {
     None,
     String(EcoString),
+}
+
+#[derive(Debug)]
+pub(super) struct NestedConstructorInfo<'a> {
+    pub(super) constructor: &'a PatternConstructor,
+    pub(super) type_: &'a Arc<Type>,
+    pub(super) capture_flags: Vec<bool>,
+    pub(super) binding_names: Vec<Option<EcoString>>,
 }
 
 pub(super) fn collect_list_pattern_info<'a>(
@@ -137,16 +153,31 @@ pub(super) fn collect_list_pattern_info<'a>(
 
                 let mut capture_flags = Vec::with_capacity(arguments.len());
                 let mut binding_names = Vec::with_capacity(arguments.len());
+                let mut conditions = Vec::with_capacity(arguments.len());
 
                 for argument in arguments {
                     match &argument.value {
                         Pattern::Variable { name, .. } => {
                             capture_flags.push(true);
                             binding_names.push(Some(name.clone()));
+                            conditions.push(ListConstructorCondition::None);
                         }
                         Pattern::Discard { .. } => {
                             capture_flags.push(false);
                             binding_names.push(None);
+                            conditions.push(ListConstructorCondition::None);
+                        }
+                        Pattern::String { value, .. } => {
+                            capture_flags.push(true);
+                            binding_names.push(None);
+                            conditions.push(ListConstructorCondition::String(value.clone()));
+                        }
+                        Pattern::List { elements, tail, .. }
+                            if elements.is_empty() && tail.is_none() =>
+                        {
+                            capture_flags.push(true);
+                            binding_names.push(None);
+                            conditions.push(ListConstructorCondition::EmptyList);
                         }
                         other => {
                             return Err(crate::Error::NativeCodegen {
@@ -164,6 +195,7 @@ pub(super) fn collect_list_pattern_info<'a>(
                     constructor,
                     type_,
                     capture_flags,
+                    conditions,
                 })));
                 head_field_bindings.push(Some(binding_names));
                 head_extra_bindings.push(Vec::new());

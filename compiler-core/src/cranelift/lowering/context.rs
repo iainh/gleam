@@ -24,7 +24,8 @@ use super::expressions::{
     function_symbol_name, lower_expression, lower_record_constructor_function,
 };
 use super::patterns::{
-    ConstructorTupleCondition, ConstructorTupleInfo, ListHeadMatch, NestedListInfo,
+    ConstructorTupleCondition, ConstructorTupleInfo, ListConstructorCondition, ListHeadMatch,
+    NestedConstructorInfo, NestedListInfo,
 };
 use super::{
     BOOLEAN_FALSE_ARITY, BOOLEAN_TRUE_ARITY, BindingSource, FLOAT_HEADER, FunctionIdMap,
@@ -636,7 +637,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let data_id = if let Some(id) = self.float_constants.get(&key) {
             *id
         } else {
-            let number = literal
+            let cleaned = literal.replace('_', "");
+            let number = cleaned
                 .parse::<f64>()
                 .map_err(|err| crate::Error::NativeCodegen {
                     message: format!("invalid float literal `{literal}`: {err}"),
@@ -2532,21 +2534,127 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             }
 
             if let Some(pattern) = head_pattern {
-                let mut extras_iter = head_extras.into_iter();
-                for capture_flag in pattern.capture_flags() {
-                    if *capture_flag {
-                        let Some(value) = extras_iter.next() else {
+                match pattern {
+                    ListHeadMatch::Constructor(info) => {
+                        let mut extras_iter = head_extras.into_iter();
+                        for (index, capture_flag) in info.capture_flags.iter().enumerate() {
+                            if *capture_flag {
+                                let Some(value) = extras_iter.next() else {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message:
+                                            "missing head capture value in native list pattern lowering"
+                                                .into(),
+                                    });
+                                };
+
+                                match info
+                                    .conditions
+                                    .get(index)
+                                    .unwrap_or(&ListConstructorCondition::None)
+                                {
+                                    ListConstructorCondition::None => {}
+                                    ListConstructorCondition::String(expected) => {
+                                        let expected_value =
+                                            self.string_constant(module, expected.as_str())?;
+                                        let func_id = self.declare_runtime_string_equal(module)?;
+                                        let func_ref = module
+                                            .declare_func_in_func(func_id, &mut self.builder.func);
+                                        let call =
+                                            self.builder.ins().call(func_ref, &[value, expected_value]);
+                                        let result = self.builder.inst_results(call)[0];
+                                        let true_value = self.bool_constant(module, true)?;
+                                        let is_equal =
+                                            self.builder.ins().icmp(IntCC::Equal, result, true_value);
+
+                                        let continue_block = self.create_subject_block(subject_count);
+                                        let failure_values: Vec<_> =
+                                            subjects[..failure_block_arg_count].to_vec();
+                                        let success_values = subjects.clone();
+                                        let _ = self.builder.ins().brif(
+                                            is_equal,
+                                            continue_block,
+                                            success_values.as_slice(),
+                                            failure_block,
+                                            &failure_values,
+                                        );
+                                        self.seal_block(current_block);
+                                        self.builder.switch_to_block(continue_block);
+                                        current_block = continue_block;
+                                        subjects =
+                                            self.builder.block_params(current_block).to_vec();
+                                        current_subject = subjects[subject_index];
+                                    }
+                                    ListConstructorCondition::EmptyList => {
+                                        let nil_func = self.declare_runtime_nil(module)?;
+                                        let nil_ref = module
+                                            .declare_func_in_func(nil_func, &mut self.builder.func);
+                                        let nil_call = self.builder.ins().call(nil_ref, &[]);
+                                        let nil_value = self.builder.inst_results(nil_call)[0];
+                                        let is_nil = self
+                                            .builder
+                                            .ins()
+                                            .icmp(IntCC::Equal, value, nil_value);
+
+                                        let continue_block = self.create_subject_block(subject_count);
+                                        let failure_values: Vec<_> =
+                                            subjects[..failure_block_arg_count].to_vec();
+                                        let success_values = subjects.clone();
+                                        let _ = self.builder.ins().brif(
+                                            is_nil,
+                                            continue_block,
+                                            success_values.as_slice(),
+                                            failure_block,
+                                            &failure_values,
+                                        );
+                                        self.seal_block(current_block);
+                                        self.builder.switch_to_block(continue_block);
+                                        current_block = continue_block;
+                                        subjects =
+                                            self.builder.block_params(current_block).to_vec();
+                                        current_subject = subjects[subject_index];
+                                    }
+                                }
+
+                                if let Some(slot) = storage_slot {
+                                    let offset = (stored * pointer_bytes) as i32;
+                                    let _ = self.builder.ins().stack_store(value, slot, offset);
+                                }
+                                stored += 1;
+                            }
+                        }
+                        if extras_iter.next().is_some() {
                             return Err(crate::Error::NativeCodegen {
                                 message:
-                                    "missing head capture value in native list pattern lowering"
+                                    "unexpected extra constructor capture values in native list pattern lowering"
                                         .into(),
                             });
-                        };
-                        if let Some(slot) = storage_slot {
-                            let offset = (stored * pointer_bytes) as i32;
-                            let _ = self.builder.ins().stack_store(value, slot, offset);
                         }
-                        stored += 1;
+                    }
+                    ListHeadMatch::Tuple(info) => {
+                        let mut extras_iter = head_extras.into_iter();
+                        for capture_flag in info.capture_flags.iter() {
+                            if *capture_flag {
+                                let Some(value) = extras_iter.next() else {
+                                    return Err(crate::Error::NativeCodegen {
+                                        message:
+                                            "missing head capture value in native list pattern lowering"
+                                                .into(),
+                                    });
+                                };
+                                if let Some(slot) = storage_slot {
+                                    let offset = (stored * pointer_bytes) as i32;
+                                    let _ = self.builder.ins().stack_store(value, slot, offset);
+                                }
+                                stored += 1;
+                            }
+                        }
+                        if extras_iter.next().is_some() {
+                            return Err(crate::Error::NativeCodegen {
+                                message:
+                                    "unexpected extra tuple capture values in native list pattern lowering"
+                                        .into(),
+                            });
+                        }
                     }
                 }
             }
@@ -2769,6 +2877,195 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(())
     }
 
+    pub(super) fn lower_nested_constructor(
+        &mut self,
+        _module: &mut ObjectModule,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        constructor_value: Value,
+        info: &NestedConstructorInfo<'_>,
+        failure_block: ir::Block,
+        bindings: &mut Vec<(EcoString, BindingSource)>,
+    ) -> Result<()> {
+        let mut nested_subjects = pattern_subjects.clone();
+        nested_subjects.push(constructor_value);
+        let failure_block_arg_count = self.builder.block_params(failure_block).len();
+        let alias_counts = vec![0; info.capture_flags.len()];
+        let subject_count = nested_subjects.len();
+        let (block, params, extras) = self.branch_on_constructor_pattern(
+            *pattern_block,
+            constructor_value,
+            info.constructor,
+            info.type_,
+            info.capture_flags.as_slice(),
+            alias_counts.as_slice(),
+            failure_block,
+            nested_subjects.as_slice(),
+            failure_block_arg_count,
+            subject_count,
+        )?;
+        *pattern_block = block;
+        let mut new_subjects = params;
+        let _ = new_subjects.pop();
+        *pattern_subjects = new_subjects;
+
+        if self.builder.current_block() != Some(*pattern_block) {
+            self.builder.switch_to_block(*pattern_block);
+        }
+
+        let mut extras_iter = extras.into_iter();
+        for (capture_flag, binding_name) in
+            info.capture_flags.iter().zip(info.binding_names.iter())
+        {
+            if *capture_flag {
+                let Some(value) = extras_iter.next() else {
+                    return Err(crate::Error::NativeCodegen {
+                        message:
+                            "missing nested constructor capture in native case lowering".into(),
+                    });
+                };
+                if let Some(name) = binding_name {
+                    bindings.push((name.clone(), BindingSource::Value(value)));
+                }
+            }
+        }
+
+        if extras_iter.next().is_some() {
+            return Err(crate::Error::NativeCodegen {
+                message:
+                    "unexpected extra values after lowering nested constructor pattern in native backend"
+                        .into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn ensure_zero_arity_constructor(
+        &mut self,
+        module: &mut ObjectModule,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        value: Value,
+        constructor: &PatternConstructor,
+        type_: &Arc<Type>,
+        failure_block: ir::Block,
+    ) -> Result<()> {
+        let expected = if type_.is_bool() {
+            let bool_value = match constructor.name.as_str() {
+                "True" => true,
+                "False" => false,
+                other => {
+                    return Err(crate::Error::NativeCodegen {
+                        message: format!(
+                            "unsupported boolean constructor `{other}` in native functions"
+                        ),
+                    });
+                }
+            };
+            self.bool_constant(module, bool_value)?
+        } else {
+            self.zero_arity_record_constant(
+                module,
+                &constructor.module,
+                constructor.constructor_index,
+            )?
+        };
+
+        let is_equal = self.builder.ins().icmp(IntCC::Equal, value, expected);
+        let subject_count = pattern_subjects.len();
+        let continue_block = self.create_subject_block(subject_count);
+        let failure_args = pattern_subjects.clone();
+        let success_args = pattern_subjects.clone();
+        let _ = self.builder.ins().brif(
+            is_equal,
+            continue_block,
+            success_args.as_slice(),
+            failure_block,
+            &failure_args,
+        );
+        self.seal_block(*pattern_block);
+        self.builder.switch_to_block(continue_block);
+        *pattern_block = continue_block;
+        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+        Ok(())
+    }
+
+    pub(super) fn lower_nested_constructor_assignment(
+        &mut self,
+        module: &mut ObjectModule,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        constructor_value: Value,
+        info: &NestedConstructorInfo<'_>,
+        failure_block: ir::Block,
+    ) -> Result<Vec<(EcoString, Value)>> {
+        let mut nested_bindings = Vec::new();
+        self.lower_nested_constructor(
+            module,
+            pattern_block,
+            pattern_subjects,
+            constructor_value,
+            info,
+            failure_block,
+            &mut nested_bindings,
+        )?;
+
+        let mut results = Vec::with_capacity(nested_bindings.len());
+        for (name, source) in nested_bindings {
+            let value = match source {
+                BindingSource::Value(value) => value,
+                BindingSource::BlockParam { value, .. } => value,
+                BindingSource::Subject(index) => pattern_subjects
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| crate::Error::NativeCodegen {
+                        message:
+                            "subject index out of bounds while lowering nested constructor assignment"
+                                .into(),
+                    })?,
+            };
+            results.push((name, value));
+        }
+
+        Ok(results)
+    }
+
+    pub(super) fn ensure_int_value(
+        &mut self,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        value: Value,
+        int_value: &BigInt,
+        failure_block: ir::Block,
+    ) -> Result<()> {
+        let number = int_value.to_i64().ok_or_else(|| crate::Error::NativeCodegen {
+            message: format!(
+                "integer literal out of range for Gleam immediate: {int_value}"
+            ),
+        })?;
+        let encoded = encode_small_int(number)?;
+        let expected = self.builder.ins().iconst(self.pointer_type, encoded);
+        let is_equal = self.builder.ins().icmp(IntCC::Equal, value, expected);
+
+        let subject_count = pattern_subjects.len();
+        let continue_block = self.create_subject_block(subject_count);
+        let failure_args = pattern_subjects.clone();
+        let success_args = pattern_subjects.clone();
+        let _ = self.builder.ins().brif(
+            is_equal,
+            continue_block,
+            success_args.as_slice(),
+            failure_block,
+            &failure_args,
+        );
+        self.seal_block(*pattern_block);
+        self.builder.switch_to_block(continue_block);
+        *pattern_block = continue_block;
+        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+        Ok(())
+    }
+
     pub(super) fn lower_constructor_tuple(
         &mut self,
         module: &mut ObjectModule,
@@ -2965,6 +3262,106 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .load(self.pointer_type, mem_flags, tuple_ptr, offset);
         self.seal_block(element_block);
         Ok(element)
+    }
+
+    pub(super) fn record_field(&mut self, record: Value, index: u64) -> Result<Value> {
+        let pointer_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(pointer_block, self.pointer_type);
+        let failure_block = self.builder.create_block();
+
+        let mem_flags = MemFlags::trusted();
+        let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
+        let boxed_check = self.builder.ins().band(record, value_tag_mask);
+        let zero = self.builder.ins().iconst(self.pointer_type, 0);
+        let is_boxed = self.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_boxed, pointer_block, &[record], failure_block, &[]);
+
+        self.builder.switch_to_block(pointer_block);
+        let record_ptr = self.builder.block_params(pointer_block)[0];
+        let header = self
+            .builder
+            .ins()
+            .load(self.pointer_type, mem_flags, record_ptr, 0);
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let header_tag = self.builder.ins().band(header, header_mask);
+        let record_tag = self.builder.ins().iconst(self.pointer_type, TAG_RECORD);
+        let is_record = self.builder.ins().icmp(IntCC::Equal, header_tag, record_tag);
+
+        let record_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(record_block, self.pointer_type);
+        let _ = self
+            .builder
+            .append_block_param(record_block, self.pointer_type);
+        let _ = self
+            .builder
+            .ins()
+            .brif(is_record, record_block, &[record_ptr, header], failure_block, &[]);
+        self.seal_block(pointer_block);
+
+        self.builder.switch_to_block(record_block);
+        let record_ptr = self.builder.block_params(record_block)[0];
+        let record_header = self.builder.block_params(record_block)[1];
+        let header_mask = self
+            .builder
+            .ins()
+            .iconst(self.pointer_type, HEADER_FIELD_MASK);
+        let arity_shifted = self
+            .builder
+            .ins()
+            .ushr_imm(record_header, HEADER_ARITY_SHIFT);
+        let arity_value = self.builder.ins().band(arity_shifted, header_mask);
+
+        let index_i64 = i64::try_from(index).map_err(|_| crate::Error::NativeCodegen {
+            message: "record index exceeds native backend limits".into(),
+        })?;
+        let index_value = self.builder.ins().iconst(self.pointer_type, index_i64);
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, index_value, arity_value);
+
+        let field_block = self.builder.create_block();
+        let _ = self
+            .builder
+            .append_block_param(field_block, self.pointer_type);
+        let _ = self
+            .builder
+            .ins()
+            .brif(in_bounds, field_block, &[record_ptr], failure_block, &[]);
+        self.seal_block(record_block);
+
+        self.builder.switch_to_block(failure_block);
+        let _ = self.builder.ins().trap(TrapCode::User(0));
+        self.seal_block(failure_block);
+
+        self.builder.switch_to_block(field_block);
+        let record_ptr = self.builder.block_params(field_block)[0];
+        let index_usize = usize::try_from(index).map_err(|_| crate::Error::NativeCodegen {
+            message: "record index exceeds native backend limits".into(),
+        })?;
+        let index_i32 = i32::try_from(index_usize).map_err(|_| crate::Error::NativeCodegen {
+            message: "record field offset exceeds native backend limits".into(),
+        })?;
+        let pointer_stride = self.pointer_bytes() as i32;
+        let base_offset = HEADER_SIZE + (2 * size_of::<u32>() as i32);
+        let offset = base_offset + index_i32 * pointer_stride;
+        let field = self
+            .builder
+            .ins()
+            .load(self.pointer_type, mem_flags, record_ptr, offset);
+        self.seal_block(field_block);
+        Ok(field)
     }
 
     pub(super) fn declare_runtime_gleeunit_main(
