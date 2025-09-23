@@ -766,6 +766,29 @@ fn lower_pattern_assignment(
     let mut bindings = Vec::new();
 
     match pattern {
+        Pattern::Int { int_value, .. } => {
+            let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
+            let (block, _params) = ctx.branch_on_int_pattern(
+                pattern_block,
+                subjects[0],
+                int_value,
+                failure_block,
+                &failure_args,
+                subject_count,
+            )?;
+            pattern_block = block;
+
+            if ctx.builder.current_block() != Some(pattern_block) {
+                ctx.builder.switch_to_block(pattern_block);
+            }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
+        }
         Pattern::Constructor {
             constructor,
             arguments,
