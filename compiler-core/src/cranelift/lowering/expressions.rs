@@ -658,6 +658,8 @@ pub(super) fn lower_expression(
 
         TypedExpr::Call { fun, arguments, .. } => lower_call(module, fun, arguments, ctx),
 
+        TypedExpr::Panic { message, .. } => lower_panic(module, message.as_deref(), ctx),
+
         TypedExpr::Case {
             subjects, clauses, ..
         } => lower_case(module, subjects, clauses, ctx),
@@ -823,6 +825,7 @@ fn lower_pattern_assignment(
 
             let failure_args = subjects.clone();
             let failure_block = ctx.create_subject_block(subject_count);
+            let failure_subjects = &failure_args[..subject_count];
             let alias_counts: Vec<usize> = capture_flags.iter().map(|_| 0).collect();
             let (block, _params, extras) = ctx.branch_on_constructor_pattern(
                 pattern_block,
@@ -832,7 +835,7 @@ fn lower_pattern_assignment(
                 &capture_flags,
                 alias_counts.as_slice(),
                 failure_block,
-                &failure_args,
+                failure_subjects,
                 subject_count,
             )?;
             pattern_block = block;
@@ -984,6 +987,7 @@ fn lower_pattern_assignment(
 
             let failure_args = subjects.clone();
             let failure_block = ctx.create_subject_block(subject_count);
+            let failure_subjects = &failure_args[..subject_count];
             let (block, _params, extras) = ctx.branch_on_list_pattern(
                 module,
                 pattern_block,
@@ -993,8 +997,7 @@ fn lower_pattern_assignment(
                 capture_tail,
                 tail.is_none(),
                 failure_block,
-                &failure_args,
-                subject_count,
+                failure_subjects,
                 subject_count,
             )?;
             pattern_block = block;
@@ -1103,13 +1106,14 @@ fn lower_pattern_assignment(
 
             let failure_args = subjects.clone();
             let failure_block = ctx.create_subject_block(subject_count);
+            let failure_subjects = &failure_args[..subject_count];
             let (block, _params, extras) = ctx.branch_on_tuple_pattern(
                 pattern_block,
                 subjects[0],
                 elements.len(),
                 &capture_flags,
                 failure_block,
-                &failure_args,
+                failure_subjects,
                 subject_count,
             )?;
             pattern_block = block;
@@ -1685,6 +1689,24 @@ fn lower_pattern_assignment(
     Ok(())
 }
 
+fn lower_panic(
+    module: &mut ObjectModule,
+    message: Option<&TypedExpr>,
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Value> {
+    let message_value = if let Some(message) = message {
+        lower_expression(module, message, ctx)?
+    } else {
+        ctx.string_constant(module, "`panic` expression evaluated.")?
+    };
+
+    let panic_func = ctx.declare_runtime_panic(module)?;
+    let panic_ref = module.declare_func_in_func(panic_func, &mut ctx.builder.func);
+    let call = ctx.builder.ins().call(panic_ref, &[message_value]);
+    let results = ctx.builder.inst_results(call);
+    Ok(results[0])
+}
+
 fn lower_call(
     module: &mut ObjectModule,
     fun: &TypedExpr,
@@ -2136,7 +2158,7 @@ fn lower_case(
                         &capture_flags,
                         alias_counts.as_slice(),
                         next_block,
-                        &pattern_subjects,
+                        &pattern_subjects[..subject_count],
                         subject_count,
                     )?;
                     pattern_block = block;
@@ -2224,8 +2246,7 @@ fn lower_case(
                         info.capture_tail,
                         info.ensure_exact,
                         next_block,
-                        pattern_subjects.as_slice(),
-                        subject_count,
+                        &pattern_subjects[..subject_count],
                         subject_count,
                     )?;
                     pattern_block = block;
@@ -3009,7 +3030,7 @@ fn lower_case(
                         elements.len(),
                         &capture_flags,
                         next_block,
-                        pattern_subjects.as_slice(),
+                        &pattern_subjects[..subject_count],
                         subject_count,
                     )?;
                     pattern_block = block;

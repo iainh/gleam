@@ -88,6 +88,13 @@ pub extern "C" fn gleam_int_negate(raw: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn gleam_panic(message_raw: u64) -> u64 {
+    let default_message = "`panic` expression evaluated.".to_string();
+    let message = value_to_string(Value::from_raw(message_raw)).unwrap_or(default_message);
+    panic!("{message}");
+}
+
+#[no_mangle]
 pub extern "C" fn gleam_alloc_closure(code_ptr: u64, env_ptr: *const u64, env_len: usize) -> u64 {
     let code = unsafe { std::mem::transmute::<usize, ClosureFn>(code_ptr as usize) };
     let env_values = env_ptr as *const Value;

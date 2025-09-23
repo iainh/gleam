@@ -69,6 +69,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_alloc_closure: Option<FuncId>,
     pub(super) runtime_apply_closure: Option<FuncId>,
     pub(super) runtime_alloc_record: Option<FuncId>,
+    pub(super) runtime_panic: Option<FuncId>,
     pub(super) runtime_gleeunit_main: Option<FuncId>,
     pub(super) runtime_gleeunit_do_main: Option<FuncId>,
     pub(super) pointer_bytes: u8,
@@ -128,6 +129,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_alloc_closure: None,
             runtime_apply_closure: None,
             runtime_alloc_record: None,
+            runtime_panic: None,
             runtime_gleeunit_main: None,
             runtime_gleeunit_do_main: None,
             pointer_bytes,
@@ -734,6 +736,24 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_alloc_record = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_panic(&mut self, module: &mut ObjectModule) -> Result<FuncId> {
+        if let Some(id) = self.runtime_panic {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(ir::types::I64));
+
+        let id = module
+            .declare_function("gleam_panic", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_panic = Some(id);
         Ok(id)
     }
 
@@ -2349,7 +2369,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                             info.capture_flags.as_slice(),
                             alias_counts.as_slice(),
                             failure_block,
-                            &subjects,
+                            &subjects[..subject_count],
                             subject_count,
                         )?
                     }
@@ -2359,7 +2379,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                         info.arity,
                         info.capture_flags.as_slice(),
                         failure_block,
-                        &subjects,
+                        &subjects[..subject_count],
                         subject_count,
                     )?,
                 };
@@ -2500,6 +2520,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         nested_args.push(head_value);
         let nested_index = nested_args.len() - 1;
 
+        let failure_subjects = &nested_args[..pattern_subjects.len()];
+
         let (block, params, extras) = self.branch_on_list_pattern(
             module,
             *pattern_block,
@@ -2509,7 +2531,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             info.pattern.capture_tail,
             info.pattern.ensure_exact,
             failure_block,
-            nested_args.as_slice(),
+            failure_subjects,
             pattern_subjects.len(),
             nested_args.len(),
         )?;
@@ -2640,7 +2662,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             info.capture_flags.len(),
             info.capture_flags.as_slice(),
             failure_block,
-            pattern_subjects.as_slice(),
+            &pattern_subjects[..subject_count],
             subject_count,
         )?;
         *pattern_block = block;
