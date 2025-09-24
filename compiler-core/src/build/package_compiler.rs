@@ -398,16 +398,14 @@ where
                     && cranelift::module_contains_public_main(&module.ast)
             })
             .map(|(index, _)| index);
-        let mut has_entrypoint = primary_entry_index.is_some();
+        let mut has_entrypoint = self.write_entrypoint && primary_entry_index.is_some();
 
         for (index, module) in modules.iter().enumerate() {
             let object_name = format!("{}.o", module.name.replace("/", "__"));
             let output_path = artefact_dir.join(&object_name);
-            let module_config = cranelift::ModuleConfig::with_entrypoint(
-                module,
-                self.root,
-                primary_entry_index == Some(index),
-            );
+            let wants_entrypoint = self.write_entrypoint && primary_entry_index == Some(index);
+            let module_config =
+                cranelift::ModuleConfig::with_entrypoint(module, self.root, wants_entrypoint);
             cranelift::emit_object(&self.io, module_config, &output_path)?;
             object_paths.push(output_path);
         }
@@ -480,7 +478,11 @@ where
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::NativeCodegen {
-                message: format!("linker failed: {}", stderr.trim()),
+                message: format!(
+                    "linker failed: {}\ncommand: cc {}",
+                    stderr.trim(),
+                    args.join(" ")
+                ),
             });
         }
 
@@ -508,30 +510,36 @@ where
     fn collect_dependency_native_objects(&self) -> Result<Vec<String>, Error> {
         let mut collected = Vec::new();
 
-        let dependencies = self.config.dependencies_for(self.mode)?;
+        if let Ok(entries) = self.io.read_dir(self.lib) {
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                let path = entry.into_path();
+                if !self.io.is_directory(&path) {
+                    continue;
+                }
 
-        for (name, _) in dependencies.iter() {
-            if name == &self.config.name {
-                continue;
+                if let Some(dir_name) = path.file_name() {
+                    if dir_name == self.config.name.as_str() {
+                        continue;
+                    }
+                }
+
+                let artefacts_dir = path.join(paths::ARTEFACT_DIRECTORY_NAME);
+                if !self.io.is_directory(&artefacts_dir) {
+                    continue;
+                }
+
+                if let Ok(objects) = self.io.read_dir(&artefacts_dir) {
+                    for entry in objects {
+                        if let Ok(entry) = entry {
+                            let path = entry.into_path();
+                            if path.extension() == Some("o") {
+                                collected.push(path.to_string());
+                            }
+                        }
+                    }
+                }
             }
-
-            let artefacts_dir = self
-                .lib
-                .join(name.as_str())
-                .join(paths::ARTEFACT_DIRECTORY_NAME);
-            let manifest_path = artefacts_dir.join("manifest.json");
-
-            if !self.io.is_file(&manifest_path) {
-                continue;
-            }
-
-            let manifest_text = self.io.read(&manifest_path)?;
-            let manifest: CraneliftManifest =
-                serde_json::from_str(&manifest_text).map_err(|err| Error::NativeCodegen {
-                    message: format!("failed to parse native manifest `{}`: {err}", manifest_path),
-                })?;
-
-            collected.extend(manifest.objects);
         }
 
         Ok(collected)

@@ -243,7 +243,7 @@ fn declare_module_functions(
         signature.returns.push(ir::AbiParam::new(pointer_type));
 
         let func_id = module
-            .declare_function(&symbol, Linkage::Local, &signature)
+            .declare_function(&symbol, Linkage::Export, &signature)
             .map_err(|err| crate::Error::NativeCodegen {
                 message: err.to_string(),
             })?;
@@ -4306,7 +4306,7 @@ pub(super) fn lower_record_constructor_function(
 
     let symbol = record_constructor_symbol(module_name, constructor_module, variant_index, arity);
     let func_id = module
-        .declare_function(&symbol, Linkage::Local, &signature)
+        .declare_function(&symbol, Linkage::Export, &signature)
         .map_err(|err| crate::Error::NativeCodegen {
             message: err.to_string(),
         })?;
