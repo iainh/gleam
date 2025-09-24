@@ -25,8 +25,9 @@ use crate::{
 };
 use askama::Template;
 use ecow::EcoString;
-use std::collections::HashSet;
-use std::{collections::HashMap, env, fmt::write, fs, path::Path, time::SystemTime};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::{env, fmt::write, fs, path::Path, time::SystemTime};
 use vec1::Vec1;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -41,6 +42,11 @@ pub struct Compiled {
     pub modules: Vec<Module>,
     /// The names of all cached modules, which are not present in the `modules` field.
     pub cached_module_names: Vec<EcoString>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CraneliftManifest {
+    objects: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -437,8 +443,21 @@ where
 
         let runtime = locate_runtime_artifacts()?;
 
-        let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 6);
-        args.extend(objects.iter().map(|path| path.as_str().to_string()));
+        let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 12);
+        let mut seen = HashSet::new();
+
+        for path in objects {
+            if seen.insert(path.as_str().to_string()) {
+                args.push(path.as_str().to_string());
+            }
+        }
+
+        for dependency in self.collect_dependency_native_objects()? {
+            if seen.insert(dependency.clone()) {
+                args.push(dependency);
+            }
+        }
+
         args.push(runtime.runtime_lib.as_str().to_string());
         for lib in &runtime.additional_libs {
             args.push(lib.as_str().to_string());
@@ -473,13 +492,8 @@ where
         artefact_dir: &Utf8Path,
         objects: &[Utf8PathBuf],
     ) -> Result<(), Error> {
-        #[derive(serde::Serialize)]
-        struct Manifest<'a> {
-            objects: Vec<&'a str>,
-        }
-
-        let manifest = Manifest {
-            objects: objects.iter().map(|p| p.as_str()).collect(),
+        let manifest = CraneliftManifest {
+            objects: objects.iter().map(|p| p.as_str().to_string()).collect(),
         };
 
         let manifest_text =
@@ -489,6 +503,38 @@ where
 
         self.io
             .write(&artefact_dir.join("manifest.json"), &manifest_text)
+    }
+
+    fn collect_dependency_native_objects(&self) -> Result<Vec<String>, Error> {
+        let mut collected = Vec::new();
+
+        let dependencies = self.config.dependencies_for(self.mode)?;
+
+        for (name, _) in dependencies.iter() {
+            if name == &self.config.name {
+                continue;
+            }
+
+            let artefacts_dir = self
+                .lib
+                .join(name.as_str())
+                .join(paths::ARTEFACT_DIRECTORY_NAME);
+            let manifest_path = artefacts_dir.join("manifest.json");
+
+            if !self.io.is_file(&manifest_path) {
+                continue;
+            }
+
+            let manifest_text = self.io.read(&manifest_path)?;
+            let manifest: CraneliftManifest =
+                serde_json::from_str(&manifest_text).map_err(|err| Error::NativeCodegen {
+                    message: format!("failed to parse native manifest `{}`: {err}", manifest_path),
+                })?;
+
+            collected.extend(manifest.objects);
+        }
+
+        Ok(collected)
     }
 
     fn perform_erlang_codegen(
