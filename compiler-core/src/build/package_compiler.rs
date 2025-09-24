@@ -387,17 +387,17 @@ where
         }
 
         let mut object_paths = Vec::with_capacity(modules.len());
-        let src_root = self.root.join(Origin::Src.folder_name());
         let primary_entry_index = modules
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, module)| {
-                module.origin == Origin::Src
-                    && module.input_path.starts_with(&src_root)
-                    && cranelift::module_contains_public_main(&module.ast)
-            })
+            .find(|(_, module)| cranelift::module_contains_public_main(&module.ast))
             .map(|(index, _)| index);
+        tracing::debug!(
+            module_count = %modules.len(),
+            ?primary_entry_index,
+            "native_primary_entry"
+        );
         let mut has_entrypoint = self.write_entrypoint && primary_entry_index.is_some();
 
         for (index, module) in modules.iter().enumerate() {
@@ -410,7 +410,25 @@ where
             object_paths.push(output_path);
         }
 
-        self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+        let compiled_any = !object_paths.is_empty();
+        if compiled_any {
+            self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+        } else {
+            if let Some(existing) = self.read_cranelift_manifest(&artefact_dir)? {
+                object_paths = existing;
+            } else {
+                object_paths = self.discover_cranelift_objects(&artefact_dir)?;
+            }
+
+            if object_paths.is_empty() {
+                tracing::debug!("native_no_objects_to_link");
+                return Ok(());
+            }
+
+            self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+        }
+
+        let _ = self.create_cranelift_archive(&artefact_dir, &object_paths)?;
         if has_entrypoint {
             self.link_cranelift_objects(&artefact_dir, &object_paths)
         } else {
@@ -507,8 +525,121 @@ where
             .write(&artefact_dir.join("manifest.json"), &manifest_text)
     }
 
+    fn read_cranelift_manifest(
+        &self,
+        artefact_dir: &Utf8Path,
+    ) -> Result<Option<Vec<Utf8PathBuf>>, Error> {
+        let manifest_path = artefact_dir.join("manifest.json");
+        if !self.io.is_file(&manifest_path) {
+            return Ok(None);
+        }
+
+        let manifest_text = self.io.read(&manifest_path)?;
+        let manifest: CraneliftManifest =
+            serde_json::from_str(&manifest_text).map_err(|err| Error::NativeCodegen {
+                message: format!("failed to parse native manifest `{}`: {err}", manifest_path),
+            })?;
+
+        let paths = manifest
+            .objects
+            .into_iter()
+            .map(Utf8PathBuf::from)
+            .collect();
+
+        Ok(Some(paths))
+    }
+
+    fn discover_cranelift_objects(
+        &self,
+        artefact_dir: &Utf8Path,
+    ) -> Result<Vec<Utf8PathBuf>, Error> {
+        if !self.io.is_directory(artefact_dir) {
+            return Ok(Vec::new());
+        }
+
+        let mut objects = Vec::new();
+        if let Ok(entries) = self.io.read_dir(artefact_dir) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let path = entry.into_path();
+                    if path.extension() == Some("o") {
+                        objects.push(path);
+                    }
+                }
+            }
+        }
+
+        Ok(objects)
+    }
+
+    fn create_cranelift_archive(
+        &self,
+        artefact_dir: &Utf8Path,
+        objects: &[Utf8PathBuf],
+    ) -> Result<Option<Utf8PathBuf>, Error> {
+        if objects.is_empty() {
+            return Ok(None);
+        }
+
+        let mut archive_name = format!("lib{}", self.config.name.as_str().replace('/', "__"));
+        if !archive_name.ends_with(".a") {
+            archive_name.push_str(".a");
+        }
+        let archive_path = artefact_dir.join(archive_name);
+
+        #[cfg(target_os = "windows")]
+        let status = {
+            let mut command = std::process::Command::new("lib");
+            let _ = command.arg(format!("/OUT:{}", archive_path.as_str()));
+            for object in objects {
+                let _ = command.arg(object.as_str());
+            }
+            command.status()
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let status = {
+            let mut command = std::process::Command::new("ar");
+            let _ = command.arg("crs");
+            let _ = command.arg(archive_path.as_str());
+            for object in objects {
+                let _ = command.arg(object.as_str());
+            }
+            command.status()
+        };
+
+        let status = status.map_err(|err| Error::NativeCodegen {
+            message: format!("failed to create native archive: {err}"),
+        })?;
+
+        if !status.success() {
+            return Err(Error::NativeCodegen {
+                message: format!("failed to create native archive `{}`", archive_path),
+            });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let ranlib_status = std::process::Command::new("ranlib")
+                .arg(archive_path.as_str())
+                .status()
+                .map_err(|err| Error::NativeCodegen {
+                    message: format!("failed to index native archive: {err}"),
+                })?;
+
+            if !ranlib_status.success() {
+                return Err(Error::NativeCodegen {
+                    message: format!("failed to index native archive `{}`", archive_path),
+                });
+            }
+        }
+
+        Ok(Some(archive_path))
+    }
+
     fn collect_dependency_native_objects(&self) -> Result<Vec<String>, Error> {
-        let mut collected = Vec::new();
+        let mut libraries = Vec::new();
+        let mut objects = Vec::new();
 
         if let Ok(entries) = self.io.read_dir(self.lib) {
             for entry in entries {
@@ -529,12 +660,14 @@ where
                     continue;
                 }
 
-                if let Ok(objects) = self.io.read_dir(&artefacts_dir) {
-                    for entry in objects {
+                if let Ok(entries) = self.io.read_dir(&artefacts_dir) {
+                    for entry in entries {
                         if let Ok(entry) = entry {
                             let path = entry.into_path();
-                            if path.extension() == Some("o") {
-                                collected.push(path.to_string());
+                            if path.extension() == Some("a") {
+                                libraries.push(path.to_string());
+                            } else if path.extension() == Some("o") {
+                                objects.push(path.to_string());
                             }
                         }
                     }
@@ -542,7 +675,8 @@ where
             }
         }
 
-        Ok(collected)
+        libraries.extend(objects);
+        Ok(libraries)
     }
 
     fn perform_erlang_codegen(
