@@ -1051,6 +1051,32 @@ fn lower_pattern_assignment(
             ctx.seal_block(failure_block);
             ctx.builder.switch_to_block(pattern_block);
         }
+        Pattern::String { value, .. } => {
+            let literal = ctx.string_constant(module, value.as_str())?;
+            let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
+            let (block, params) = ctx.branch_on_string_pattern(
+                module,
+                pattern_block,
+                subjects[0],
+                literal,
+                failure_block,
+                failure_args.as_slice(),
+                subject_count,
+            )?;
+            pattern_block = block;
+            subjects = params;
+
+            if ctx.builder.current_block() != Some(pattern_block) {
+                ctx.builder.switch_to_block(pattern_block);
+            }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
+        }
         Pattern::List { elements, tail, .. } => {
             let mut capture_heads = Vec::with_capacity(elements.len());
             let mut head_names = Vec::with_capacity(elements.len());
