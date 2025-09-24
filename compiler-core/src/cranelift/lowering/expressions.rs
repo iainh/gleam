@@ -3666,6 +3666,28 @@ fn lower_case(
         let mut final_subjects = ctx.builder.block_params(pattern_block).to_vec();
 
         if let Some(guard) = &clause.guard {
+            let mut guard_inputs = final_subjects.clone();
+            for (_, source) in &bindings {
+                match source {
+                    BindingSource::Value(value) => {
+                        if !guard_inputs.iter().any(|input| *input == *value) {
+                            guard_inputs.push(*value);
+                        }
+                    }
+                    BindingSource::BlockParam { value, .. } => {
+                        if !guard_inputs.iter().any(|input| *input == *value) {
+                            guard_inputs.push(*value);
+                        }
+                    }
+                    BindingSource::Subject(index) => {
+                        let subject_value = final_subjects[*index];
+                        if !guard_inputs.iter().any(|input| *input == subject_value) {
+                            guard_inputs.push(subject_value);
+                        }
+                    }
+                }
+            }
+
             ctx.push_scope();
             for (name, source) in &bindings {
                 let value = match source {
@@ -3678,7 +3700,6 @@ fn lower_case(
             let guard_condition = ctx.lower_clause_guard_condition(module, guard)?;
             ctx.pop_scope();
 
-            let guard_inputs = final_subjects.clone();
             let guard_success_block = ctx.builder.create_block();
             for _ in 0..guard_inputs.len() {
                 let _ = ctx
