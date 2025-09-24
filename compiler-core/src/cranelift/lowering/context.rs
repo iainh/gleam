@@ -52,6 +52,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_println_error: Option<FuncId>,
     pub(super) runtime_string_add: Option<FuncId>,
     pub(super) runtime_string_equal: Option<FuncId>,
+    pub(super) runtime_string_prefix_split: Option<FuncId>,
     pub(super) runtime_bit_array_utf8_split: Option<FuncId>,
     pub(super) runtime_bit_array_bit_size: Option<FuncId>,
     pub(super) runtime_bit_array_to_int: Option<FuncId>,
@@ -125,6 +126,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_println_error: None,
             runtime_string_add: None,
             runtime_string_equal: None,
+            runtime_string_prefix_split: None,
             runtime_bit_array_utf8_split: None,
             runtime_bit_array_bit_size: None,
             runtime_bit_array_to_int: None,
@@ -914,6 +916,28 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 message: err.to_string(),
             })?;
         self.runtime_string_equal = Some(id);
+        Ok(id)
+    }
+
+    pub(super) fn declare_runtime_string_prefix_split(
+        &mut self,
+        module: &mut ObjectModule,
+    ) -> Result<FuncId> {
+        if let Some(id) = self.runtime_string_prefix_split {
+            return Ok(id);
+        }
+
+        let mut signature = module.make_signature();
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.params.push(ir::AbiParam::new(self.pointer_type));
+        signature.returns.push(ir::AbiParam::new(self.pointer_type));
+
+        let id = module
+            .declare_function("string_prefix_split", Linkage::Import, &signature)
+            .map_err(|err| crate::Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        self.runtime_string_prefix_split = Some(id);
         Ok(id)
     }
 
@@ -1724,6 +1748,67 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         let params = self.builder.func.dfg.block_params(success_block).to_vec();
         Ok((success_block, params))
+    }
+
+    pub(super) fn branch_on_string_prefix_pattern(
+        &mut self,
+        module: &mut ObjectModule,
+        current_block: ir::Block,
+        subject: Value,
+        prefix_value: Value,
+        failure_block: ir::Block,
+        failure_args: &[Value],
+        subject_count: usize,
+    ) -> Result<(ir::Block, Vec<Value>, Vec<Value>)> {
+        let extract_block = self.builder.create_block();
+        let success_block = self.builder.create_block();
+        for _ in 0..subject_count {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+        for _ in 0..2 {
+            let _ = self
+                .builder
+                .append_block_param(success_block, self.pointer_type);
+        }
+
+        if self.builder.current_block() != Some(current_block) {
+            self.builder.switch_to_block(current_block);
+        }
+        let failure_values = failure_args.to_vec();
+        let func_id = self.declare_runtime_string_prefix_split(module)?;
+        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[subject, prefix_value]);
+        let result = self.builder.inst_results(call)[0];
+
+        let flag = self.tuple_element(result, 0)?;
+        let true_value = self.bool_constant(module, true)?;
+        let condition = self.builder.ins().icmp(IntCC::Equal, flag, true_value);
+
+        let _ = self.builder.ins().brif(
+            condition,
+            extract_block,
+            &[],
+            failure_block,
+            &failure_values,
+        );
+        self.seal_block(current_block);
+
+        self.builder.switch_to_block(extract_block);
+        let matched_prefix = self.tuple_element(result, 1)?;
+        let rest = self.tuple_element(result, 2)?;
+        let mut success_args = failure_args.to_vec();
+        success_args.push(matched_prefix);
+        success_args.push(rest);
+        let _ = self.builder.ins().jump(success_block, &success_args);
+        self.seal_block(extract_block);
+
+        self.builder.switch_to_block(success_block);
+        let params = self.builder.block_params(success_block).to_vec();
+        let new_subjects = params[..subject_count].to_vec();
+        let extras = params[subject_count..].to_vec();
+        Ok((success_block, new_subjects, extras))
     }
 
     pub(super) fn branch_on_utf8_codepoint_pattern(

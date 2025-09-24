@@ -1242,6 +1242,30 @@ pub extern "C" fn string_starts_with(string_raw: u64, prefix_raw: u64) -> u64 {
 }
 
 #[no_mangle]
+pub extern "C" fn string_prefix_split(string_raw: u64, prefix_raw: u64) -> u64 {
+    let string = value_to_string(Value::from_raw(string_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+    let prefix = value_to_string(Value::from_raw(prefix_raw))
+        .unwrap_or_else(|_| panic!("expected String value"));
+
+    if let Some(rest) = string.strip_prefix(prefix.as_str()) {
+        let prefix_value = string_to_value(prefix.as_str());
+        let rest_value = string_to_value(rest);
+        let tuple = tuple_from(
+            &[Value::from_bool(true), prefix_value, rest_value],
+            "string prefix split tuple",
+        );
+        tuple.to_raw()
+    } else {
+        let tuple = tuple_from(
+            &[Value::from_bool(false), Value::nil(), Value::nil()],
+            "string prefix split failure",
+        );
+        tuple.to_raw()
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn string_ends_with(string_raw: u64, suffix_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));

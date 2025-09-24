@@ -1,9 +1,9 @@
 use crate::{
     Result,
     ast::{
-        AssignmentKind, BinOp, BitArrayOption, BitArraySize, Endianness, Function, ModuleConstant,
-        Pattern, PipelineAssignmentKind, Statement, TypedArg, TypedAssert, TypedDefinition,
-        TypedExpr, TypedPipelineAssignment, TypedStatement,
+        AssignName, AssignmentKind, BinOp, BitArrayOption, BitArraySize, Endianness, Function,
+        ModuleConstant, Pattern, PipelineAssignmentKind, Statement, TypedArg, TypedAssert,
+        TypedDefinition, TypedExpr, TypedPipelineAssignment, TypedStatement,
     },
     bit_array::GetLiteralValue,
     type_::{ModuleValueConstructor, PatternConstructor, Type, ValueConstructorVariant},
@@ -992,6 +992,57 @@ fn lower_pattern_assignment(
                         "unexpected extra constructor capture values in native assignment lowering"
                             .into(),
                 });
+            }
+
+            ctx.builder.switch_to_block(failure_block);
+            let params = ctx.builder.block_params(failure_block).to_vec();
+            let _ = ctx.builder.ins().jump(trap_block, &params);
+            ctx.seal_block(failure_block);
+            ctx.builder.switch_to_block(pattern_block);
+        }
+        Pattern::StringPrefix {
+            left_side_string,
+            left_side_assignment,
+            right_side_assignment,
+            ..
+        } => {
+            let literal = ctx.string_constant(module, left_side_string.as_str())?;
+            let failure_args = subjects.clone();
+            let failure_block = ctx.create_subject_block(subject_count);
+            let (block, params, extras) = ctx.branch_on_string_prefix_pattern(
+                module,
+                pattern_block,
+                subjects[0],
+                literal,
+                failure_block,
+                failure_args.as_slice(),
+                subject_count,
+            )?;
+            pattern_block = block;
+            subjects = params;
+
+            if ctx.builder.current_block() != Some(pattern_block) {
+                ctx.builder.switch_to_block(pattern_block);
+            }
+
+            if extras.len() != 2 {
+                return Err(crate::Error::NativeCodegen {
+                    message: "unexpected string prefix extras in native assignment lowering".into(),
+                });
+            }
+
+            let matched_prefix = extras[0];
+            let rest_value = extras[1];
+
+            if let Some((name, _)) = left_side_assignment {
+                bindings.push((name.clone(), matched_prefix));
+            }
+
+            match right_side_assignment {
+                AssignName::Variable(name) => {
+                    bindings.push((name.clone(), rest_value));
+                }
+                AssignName::Discard(_) => {}
             }
 
             ctx.builder.switch_to_block(failure_block);
@@ -2301,6 +2352,50 @@ fn lower_case(
                     )?;
                     pattern_block = block;
                     pattern_subjects = params;
+                }
+                Pattern::StringPrefix {
+                    left_side_string,
+                    left_side_assignment,
+                    right_side_assignment,
+                    ..
+                } => {
+                    let literal = ctx.string_constant(module, left_side_string.as_str())?;
+                    let (block, params, extras) = ctx.branch_on_string_prefix_pattern(
+                        module,
+                        pattern_block,
+                        pattern_subjects[subject_index],
+                        literal,
+                        next_block,
+                        &pattern_subjects,
+                        subject_count,
+                    )?;
+                    pattern_block = block;
+                    pattern_subjects = params;
+
+                    if ctx.builder.current_block() != Some(pattern_block) {
+                        ctx.builder.switch_to_block(pattern_block);
+                    }
+
+                    if extras.len() != 2 {
+                        return Err(crate::Error::NativeCodegen {
+                            message: "unexpected string prefix extras in native case lowering"
+                                .into(),
+                        });
+                    }
+
+                    let matched_prefix = extras[0];
+                    let rest_value = extras[1];
+
+                    if let Some((name, _)) = left_side_assignment {
+                        bindings.push((name.clone(), BindingSource::Value(matched_prefix)));
+                    }
+
+                    match right_side_assignment {
+                        AssignName::Variable(name) => {
+                            bindings.push((name.clone(), BindingSource::Value(rest_value)));
+                        }
+                        AssignName::Discard(_) => {}
+                    }
                 }
                 Pattern::Constructor {
                     constructor,
