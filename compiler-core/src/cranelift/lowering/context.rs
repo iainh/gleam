@@ -2700,7 +2700,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         current_block = continue_block;
                                         subjects =
                                             self.builder.block_params(current_block).to_vec();
-                                        current_subject = subjects[subject_index];
                                     }
                                     ListConstructorCondition::EmptyList => {
                                         let nil_func = self.declare_runtime_nil(module)?;
@@ -2728,7 +2727,6 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         current_block = continue_block;
                                         subjects =
                                             self.builder.block_params(current_block).to_vec();
-                                        current_subject = subjects[subject_index];
                                     }
                                 }
 

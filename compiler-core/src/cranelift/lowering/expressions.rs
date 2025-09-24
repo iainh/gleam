@@ -1165,7 +1165,8 @@ fn lower_pattern_assignment(
                 subject_count,
             )?;
             pattern_block = block;
-            subjects = params;
+
+            let _ = params;
 
             if ctx.builder.current_block() != Some(pattern_block) {
                 ctx.builder.switch_to_block(pattern_block);
@@ -1211,7 +1212,8 @@ fn lower_pattern_assignment(
                 subject_count,
             )?;
             pattern_block = block;
-            subjects = params;
+
+            let _ = params;
 
             if ctx.builder.current_block() != Some(pattern_block) {
                 ctx.builder.switch_to_block(pattern_block);
@@ -2199,7 +2201,7 @@ fn lower_panic(
 fn lower_call(
     module: &mut ObjectModule,
     fun: &TypedExpr,
-    arguments: &[crate::ast::CallArg<TypedExpr>],
+    arguments: &[CallArg<TypedExpr>],
     ctx: &mut LoweringContext<'_, '_, '_>,
 ) -> Result<Value> {
     if let TypedExpr::ModuleSelect {
@@ -2310,7 +2312,7 @@ fn lower_call(
 fn try_lower_defined_function(
     module: &mut ObjectModule,
     fun: &TypedExpr,
-    arguments: &[crate::ast::CallArg<TypedExpr>],
+    arguments: &[CallArg<TypedExpr>],
     ctx: &mut LoweringContext<'_, '_, '_>,
 ) -> Result<Option<Value>> {
     if let TypedExpr::Var { constructor, .. } = fun {
@@ -2572,7 +2574,7 @@ fn lower_case(
                 Pattern::Constructor {
                     constructor,
                     arguments,
-                    spread,
+                    spread: _,
                     type_,
                     ..
                 } => {
