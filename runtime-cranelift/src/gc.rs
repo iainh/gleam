@@ -17,6 +17,12 @@ pub unsafe fn malloc(size: usize) -> *mut c_void {
     unsafe { bdwgc_sys::GC_malloc(size) }
 }
 
+/// Allocate `size` bytes for data that does not contain pointers to GC-managed memory.
+pub unsafe fn malloc_atomic(size: usize) -> *mut c_void {
+    ensure_initialised();
+    unsafe { bdwgc_sys::GC_malloc_atomic(size) }
+}
+
 /// Trigger a full garbage collection cycle.
 pub fn collect() {
     ensure_initialised();

@@ -63,7 +63,8 @@ impl Heap {
     ) -> Result<NonNull<BinaryData>, AllocationError> {
         gc::ensure_initialised();
         let layout = BinaryData::layout_for(capacity).map_err(AllocationError::from)?;
-        let ptr = unsafe { gc::malloc(layout.size()) } as *mut u8;
+        // Binary payloads never store GC pointers, so skip scanning by using atomic allocation.
+        let ptr = unsafe { gc::malloc_atomic(layout.size()) } as *mut u8;
         let ptr = NonNull::new(ptr).ok_or(AllocationError::OutOfMemory)?;
         unsafe {
             let data_ptr = ptr.cast::<BinaryData>().as_ptr();
