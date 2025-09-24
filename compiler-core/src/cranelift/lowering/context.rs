@@ -3182,6 +3182,33 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         Ok(())
     }
 
+    pub(super) fn ensure_string_value(
+        &mut self,
+        module: &mut ObjectModule,
+        pattern_block: &mut ir::Block,
+        pattern_subjects: &mut Vec<Value>,
+        value: Value,
+        string_literal: &str,
+        failure_block: ir::Block,
+    ) -> Result<()> {
+        let literal = self.string_constant(module, string_literal)?;
+        let (block, params) = self.branch_on_string_pattern(
+            module,
+            *pattern_block,
+            value,
+            literal,
+            failure_block,
+            pattern_subjects.as_slice(),
+            pattern_subjects.len(),
+        )?;
+        *pattern_block = block;
+        *pattern_subjects = params;
+        if self.builder.current_block() != Some(*pattern_block) {
+            self.builder.switch_to_block(*pattern_block);
+        }
+        Ok(())
+    }
+
     pub(super) fn lower_constructor_tuple(
         &mut self,
         module: &mut ObjectModule,
