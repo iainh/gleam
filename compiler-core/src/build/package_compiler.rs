@@ -574,7 +574,7 @@ where
         }
         let output = artefact_dir.join(output_name);
 
-        let runtime = locate_runtime_artifacts()?;
+        let runtime = locate_runtime_artifacts(&self.io)?;
 
         let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 12);
         let mut seen = HashSet::new();

@@ -1,11 +1,8 @@
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 
-use crate::Error;
+use crate::{Error, io::FileSystemReader};
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::{env, path::PathBuf};
 
 #[derive(Debug)]
 pub struct RuntimeArtifacts {
@@ -13,29 +10,40 @@ pub struct RuntimeArtifacts {
     pub additional_libs: Vec<Utf8PathBuf>,
 }
 
-pub fn locate_runtime_artifacts() -> Result<RuntimeArtifacts, Error> {
+pub fn locate_runtime_artifacts(io: &impl FileSystemReader) -> Result<RuntimeArtifacts, Error> {
     if let Some(path) = env::var_os("GLEAM_RUNTIME_LIB") {
         let path = PathBuf::from(path);
-        return runtime_artifacts_from_lib(path).ok_or_else(|| missing_runtime_error(vec![]));
+        if let Ok(path) = Utf8PathBuf::from_path_buf(path) {
+            if let Some(artifacts) = runtime_artifacts_from_lib(io, &path) {
+                return Ok(artifacts);
+            } else {
+                return Err(missing_runtime_error(vec![path]));
+            }
+        } else {
+            return Err(missing_runtime_error(vec![]));
+        }
     }
 
-    let mut searched = Vec::new();
+    let mut searched: Vec<Utf8PathBuf> = Vec::new();
 
     if let Some(dir) = env::var_os("GLEAM_RUNTIME_LIB_DIR") {
         let dir = PathBuf::from(dir);
-        searched.push(dir.clone());
-        if let Some(artifacts) = runtime_artifacts_from_dir(&dir) {
-            return Ok(artifacts);
+        if let Ok(dir) = Utf8PathBuf::from_path_buf(dir) {
+            searched.push(dir.clone());
+            if let Some(artifacts) = runtime_artifacts_from_dir(io, &dir) {
+                return Ok(artifacts);
+            }
         }
     }
 
     if let Ok(exe) = env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let candidates = candidate_directories(exe_dir);
-            for dir in candidates {
-                searched.push(dir.clone());
-                if let Some(artifacts) = runtime_artifacts_from_dir(&dir) {
-                    return Ok(artifacts);
+        if let Ok(exe) = Utf8PathBuf::from_path_buf(exe) {
+            if let Some(exe_dir) = exe.parent() {
+                for dir in candidate_directories(io, exe_dir) {
+                    searched.push(dir.clone());
+                    if let Some(artifacts) = runtime_artifacts_from_dir(io, &dir) {
+                        return Ok(artifacts);
+                    }
                 }
             }
         }
@@ -44,13 +52,16 @@ pub fn locate_runtime_artifacts() -> Result<RuntimeArtifacts, Error> {
     Err(missing_runtime_error(searched))
 }
 
-fn runtime_artifacts_from_lib(path: PathBuf) -> Option<RuntimeArtifacts> {
-    if !path.exists() {
+fn runtime_artifacts_from_lib(
+    io: &impl FileSystemReader,
+    path: &Utf8Path,
+) -> Option<RuntimeArtifacts> {
+    if !io.is_file(path) {
         return None;
     }
     let dir = path.parent()?.to_path_buf();
-    let runtime_lib = Utf8PathBuf::from_path_buf(path).ok()?;
-    let (mut additional_libs, has_gc) = collect_supporting_libs(&dir);
+    let runtime_lib = path.to_path_buf();
+    let (mut additional_libs, has_gc) = collect_supporting_libs(io, dir.as_path());
     if !has_gc {
         return None;
     }
@@ -61,63 +72,69 @@ fn runtime_artifacts_from_lib(path: PathBuf) -> Option<RuntimeArtifacts> {
     })
 }
 
-fn runtime_artifacts_from_dir(dir: &Path) -> Option<RuntimeArtifacts> {
+fn runtime_artifacts_from_dir(
+    io: &impl FileSystemReader,
+    dir: &Utf8Path,
+) -> Option<RuntimeArtifacts> {
     let runtime = dir.join("libruntime_cranelift.a");
-    runtime_artifacts_from_lib(runtime)
+    runtime_artifacts_from_lib(io, &runtime)
 }
 
-fn collect_supporting_libs(dir: &Path) -> (Vec<Utf8PathBuf>, bool) {
+fn collect_supporting_libs(io: &impl FileSystemReader, dir: &Utf8Path) -> (Vec<Utf8PathBuf>, bool) {
     let mut libs = Vec::new();
     let mut has_gc = false;
 
-    if let Some(gc) = find_library(dir, "libgc.a") {
+    if let Some(gc) = find_library(io, dir, "libgc.a") {
         has_gc = true;
         libs.push(gc);
     }
 
-    if let Some(cord) = find_library(dir, "libcord.a") {
+    if let Some(cord) = find_library(io, dir, "libcord.a") {
         libs.push(cord);
     }
 
     (libs, has_gc)
 }
 
-fn find_library(dir: &Path, name: &str) -> Option<Utf8PathBuf> {
+fn find_library(io: &impl FileSystemReader, dir: &Utf8Path, name: &str) -> Option<Utf8PathBuf> {
     let direct = dir.join(name);
-    if direct.exists() {
-        return Utf8PathBuf::from_path_buf(direct).ok();
+    if io.is_file(&direct) {
+        return Some(direct);
     }
 
     let mut current = Some(dir.to_path_buf());
     while let Some(path) = current {
         let build_dir = path.join("build");
-        if let Some(found) = find_in_build_dir(&build_dir, name) {
+        if let Some(found) = find_in_build_dir(io, &build_dir, name) {
             return Some(found);
         }
-        current = path.parent().map(Path::to_path_buf);
+        current = path.parent().map(|parent| parent.to_path_buf());
     }
 
     None
 }
 
-fn find_in_build_dir(build_dir: &Path, name: &str) -> Option<Utf8PathBuf> {
-    if !build_dir.is_dir() {
+fn find_in_build_dir(
+    io: &impl FileSystemReader,
+    build_dir: &Utf8Path,
+    name: &str,
+) -> Option<Utf8PathBuf> {
+    if !io.is_directory(build_dir) {
         return None;
     }
 
-    let entries = fs::read_dir(build_dir).ok()?;
-    for entry in entries.flatten() {
-        let candidate = entry.path().join("out").join("lib").join(name);
-        if candidate.exists() {
-            if let Ok(path) = Utf8PathBuf::from_path_buf(candidate) {
-                return Some(path);
-            }
+    let entries = io.read_dir(build_dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let candidate = entry.into_path().join("out").join("lib").join(name);
+        if io.is_file(&candidate) {
+            return Some(candidate);
         }
     }
     None
 }
 
-fn candidate_directories(exe_dir: &Path) -> Vec<PathBuf> {
+fn candidate_directories(io: &impl FileSystemReader, exe_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
     let mut dirs = Vec::new();
     dirs.push(exe_dir.to_path_buf());
     dirs.push(exe_dir.join("deps"));
@@ -132,14 +149,13 @@ fn candidate_directories(exe_dir: &Path) -> Vec<PathBuf> {
         dirs.push(parent.join("lib/gleam"));
     }
 
-    dirs.into_iter().filter(|d| d.exists()).collect()
+    dirs.into_iter()
+        .filter(|dir| io.is_directory(dir))
+        .collect()
 }
 
-fn missing_runtime_error(searched: Vec<PathBuf>) -> Error {
-    let searched: Vec<String> = searched
-        .into_iter()
-        .map(|p| p.display().to_string())
-        .collect();
+fn missing_runtime_error(searched: Vec<Utf8PathBuf>) -> Error {
+    let searched: Vec<String> = searched.into_iter().map(|p| p.to_string()).collect();
     Error::NativeCodegen {
         message: format!(
             "unable to locate native (Cranelift) runtime static library. Set the \"GLEAM_RUNTIME_LIB\" \
