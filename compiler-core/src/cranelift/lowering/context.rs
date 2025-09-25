@@ -85,6 +85,27 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
+    fn expect_result(&mut self, inst: ir::Inst, context: &'static str) -> Value {
+        self.builder
+            .inst_results(inst)
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("native lowering: {context} produced no value"))
+    }
+
+    fn expect_block_param(
+        &mut self,
+        block: ir::Block,
+        index: usize,
+        context: &'static str,
+    ) -> Value {
+        self.builder
+            .block_params(block)
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| panic!("native lowering: {context} missing block param {index}"))
+    }
+
     #[cfg(debug_assertions)]
     fn assert_block_open(&self, block: ir::Block, context: &str) {
         if let Some(inst) = self.builder.func.layout.last_inst(block) {
@@ -255,8 +276,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .call(apply_ref, &[fun_value, args_ptr, argc]);
-        let results = self.builder.inst_results(call);
-        Ok(results[0])
+        let result = self.expect_result(call, "apply closure");
+        Ok(result)
     }
 
     pub(super) fn lower_constant(
@@ -281,8 +302,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     let func_id = self.declare_runtime_nil(module)?;
                     let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     let call = self.builder.ins().call(func_ref, &[]);
-                    let results = self.builder.inst_results(call);
-                    return Ok(results[0]);
+                    return Ok(self.expect_result(call, "nil constructor"));
                 }
 
                 let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -305,8 +325,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 let func_id = self.declare_runtime_alloc_tuple(module)?;
                 let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[base_ptr, len_value]);
-                let results = self.builder.inst_results(call);
-                Ok(results[0])
+                Ok(self.expect_result(call, "tuple allocation"))
             }
             Constant::List { elements, .. } => {
                 let mut values = Vec::with_capacity(elements.len());
@@ -318,7 +337,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     let func_id = self.declare_runtime_nil(module)?;
                     let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     let call = self.builder.ins().call(func_ref, &[]);
-                    self.builder.inst_results(call)[0]
+                    self.expect_result(call, "list nil constructor")
                 };
 
                 if !values.is_empty() {
@@ -326,8 +345,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     for value in values.into_iter().rev() {
                         let call = self.builder.ins().call(func_ref, &[value, current]);
-                        let results = self.builder.inst_results(call);
-                        current = results[0];
+                        current = self.expect_result(call, "list cons");
                     }
                 }
 
@@ -524,8 +542,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .builder
             .ins()
             .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
-        let results = self.builder.inst_results(call);
-        Ok(results[0])
+        Ok(self.expect_result(call, "record constructor closure"))
     }
 
     pub(super) fn ensure_module_function(
@@ -1211,7 +1228,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_bit_array_bit_size(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
-        let size_value = self.builder.inst_results(call)[0];
+        let size_value = self.expect_result(call, "call result");
 
         let zero_encoded = encode_small_int(0)?;
         let zero_value = self.builder.ins().iconst(self.pointer_type, zero_encoded);
@@ -1258,7 +1275,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_bit_array_to_int(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
-        let tuple = self.builder.inst_results(call)[0];
+        let tuple = self.expect_result(call, "call result");
 
         let value = self.tuple_element(tuple, 0)?;
         let size_value = self.tuple_element(tuple, 1)?;
@@ -1319,7 +1336,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_bit_array_pop_byte(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
-        let result = self.builder.inst_results(call)[0];
+        let result = self.expect_result(call, "call result");
 
         let flag = self.tuple_element(result, 0)?;
         let true_value = self.bool_constant(module, true)?;
@@ -1377,7 +1394,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_bit_array_split_bits(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject, size_value]);
-        let result = self.builder.inst_results(call)[0];
+        let result = self.expect_result(call, "call result");
 
         let flag = self.tuple_element(result, 0)?;
         let true_value = self.bool_constant(module, true)?;
@@ -1667,7 +1684,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
-        let pointer_subject = self.builder.block_params(pointer_block)[0];
+        let pointer_subject = self.expect_block_param(pointer_block, 0, "block param");
         let header =
             self.builder
                 .ins()
@@ -1731,12 +1748,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let eq_func = self.declare_runtime_string_equal(module)?;
         let eq_ref = module.declare_func_in_func(eq_func, self.builder.func);
         let compare_call = self.builder.ins().call(eq_ref, &[subject, string_value]);
-        let compare_value = self.builder.inst_results(compare_call)[0];
+        let compare_value = self.expect_result(compare_call, "call result");
 
         let true_func = self.declare_runtime_bool_true(module)?;
         let true_ref = module.declare_func_in_func(true_func, self.builder.func);
         let true_call = self.builder.ins().call(true_ref, &[]);
-        let true_value = self.builder.inst_results(true_call)[0];
+        let true_value = self.expect_result(true_call, "call result");
 
         let is_equal = self
             .builder
@@ -1783,7 +1800,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_string_prefix_split(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject, prefix_value]);
-        let result = self.builder.inst_results(call)[0];
+        let result = self.expect_result(call, "call result");
 
         let flag = self.tuple_element(result, 0)?;
         let true_value = self.bool_constant(module, true)?;
@@ -1841,7 +1858,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let func_id = self.declare_runtime_bit_array_utf8_split(module)?;
         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
-        let result = self.builder.inst_results(call)[0];
+        let result = self.expect_result(call, "call result");
 
         let flag = self.tuple_element(result, 0)?;
         let true_value = self.bool_constant(module, true)?;
@@ -2096,7 +2113,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
-        let pointer_subject = self.builder.block_params(pointer_block)[0];
+        let pointer_subject = self.expect_block_param(pointer_block, 0, "block param");
         let header = self
             .builder
             .ins()
@@ -2108,8 +2125,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tag_block);
-        let tag_subject = self.builder.block_params(tag_block)[0];
-        let tag_header = self.builder.block_params(tag_block)[1];
+        let tag_subject = self.expect_block_param(tag_block, 0, "block param");
+        let tag_header = self.expect_block_param(tag_block, 1, "block param");
         let header_mask = self
             .builder
             .ins()
@@ -2179,7 +2196,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             self.seal_block(tag_block);
 
             self.builder.switch_to_block(record_block);
-            let record_subject = self.builder.block_params(record_block)[0];
+            let record_subject = self.expect_block_param(record_block, 0, "block param");
             let constructor_offset = self.pointer_bytes() as i32;
             let ctor_index = self.builder.ins().load(
                 ir::types::I32,
@@ -2332,7 +2349,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(current_block);
 
         self.builder.switch_to_block(pointer_block);
-        let tuple_subject = self.builder.block_params(pointer_block)[0];
+        let tuple_subject = self.expect_block_param(pointer_block, 0, "block param");
         let header = self
             .builder
             .ins()
@@ -2372,7 +2389,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tuple_block);
-        let tuple_subject = self.builder.block_params(tuple_block)[0];
+        let tuple_subject = self.expect_block_param(tuple_block, 0, "block param");
 
         if capture_flags.len() != arity {
             return Err(crate::Error::NativeCodegen {
@@ -2486,7 +2503,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let nil_func = self.declare_runtime_nil(module)?;
             let nil_ref = module.declare_func_in_func(nil_func, self.builder.func);
             let nil_call = self.builder.ins().call(nil_ref, &[]);
-            let nil_value = self.builder.inst_results(nil_call)[0];
+            let nil_value = self.expect_result(nil_call, "call result");
 
             let is_nil = self
                 .builder
@@ -2678,7 +2695,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                             .builder
                                             .ins()
                                             .call(func_ref, &[value, expected_value]);
-                                        let result = self.builder.inst_results(call)[0];
+                                        let result = self.expect_result(call, "call result");
                                         let true_value = self.bool_constant(module, true)?;
                                         let is_equal = self.builder.ins().icmp(
                                             IntCC::Equal,
@@ -2709,7 +2726,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         let nil_ref = module
                                             .declare_func_in_func(nil_func, self.builder.func);
                                         let nil_call = self.builder.ins().call(nil_ref, &[]);
-                                        let nil_value = self.builder.inst_results(nil_call)[0];
+                                        let nil_value = self.expect_result(nil_call, "call result");
                                         let is_nil =
                                             self.builder.ins().icmp(IntCC::Equal, value, nil_value);
 
@@ -2791,7 +2808,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let nil_func = self.declare_runtime_nil(module)?;
             let nil_ref = module.declare_func_in_func(nil_func, self.builder.func);
             let nil_call = self.builder.ins().call(nil_ref, &[]);
-            let nil_value = self.builder.inst_results(nil_call)[0];
+            let nil_value = self.expect_result(nil_call, "call result");
 
             let is_nil = self
                 .builder
@@ -3269,7 +3286,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                         let func_id = self.declare_runtime_string_equal(module)?;
                         let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                         let call = self.builder.ins().call(func_ref, &[value, expected_value]);
-                        let result = self.builder.inst_results(call)[0];
+                        let result = self.expect_result(call, "call result");
                         let true_value = self.bool_constant(module, true)?;
                         let is_equal = self.builder.ins().icmp(IntCC::Equal, result, true_value);
 
@@ -3325,7 +3342,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(is_boxed, pointer_block, &[tuple], failure_block, &[]);
 
         self.builder.switch_to_block(pointer_block);
-        let pointer_subject = self.builder.block_params(pointer_block)[0];
+        let pointer_subject = self.expect_block_param(pointer_block, 0, "block param");
         let header = self
             .builder
             .ins()
@@ -3355,8 +3372,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(tuple_block);
-        let tuple_ptr = self.builder.block_params(tuple_block)[0];
-        let tuple_header = self.builder.block_params(tuple_block)[1];
+        let tuple_ptr = self.expect_block_param(tuple_block, 0, "block param");
+        let tuple_header = self.expect_block_param(tuple_block, 1, "block param");
         let header_mask = self
             .builder
             .ins()
@@ -3391,7 +3408,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(failure_block);
 
         self.builder.switch_to_block(element_block);
-        let tuple_ptr = self.builder.block_params(element_block)[0];
+        let tuple_ptr = self.expect_block_param(element_block, 0, "block param");
         let index_usize = usize::try_from(index).map_err(|_| crate::Error::NativeCodegen {
             message: "tuple index exceeds native backend limits".into(),
         })?;
@@ -3427,7 +3444,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(is_boxed, pointer_block, &[record], failure_block, &[]);
 
         self.builder.switch_to_block(pointer_block);
-        let record_ptr = self.builder.block_params(pointer_block)[0];
+        let record_ptr = self.expect_block_param(pointer_block, 0, "block param");
         let header = self
             .builder
             .ins()
@@ -3460,8 +3477,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(record_block);
-        let record_ptr = self.builder.block_params(record_block)[0];
-        let record_header = self.builder.block_params(record_block)[1];
+        let record_ptr = self.expect_block_param(record_block, 0, "block param");
+        let record_header = self.expect_block_param(record_block, 1, "block param");
         let header_mask = self
             .builder
             .ins()
@@ -3496,7 +3513,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(failure_block);
 
         self.builder.switch_to_block(field_block);
-        let record_ptr = self.builder.block_params(field_block)[0];
+        let record_ptr = self.expect_block_param(field_block, 0, "block param");
         let index_usize = usize::try_from(index).map_err(|_| crate::Error::NativeCodegen {
             message: "record index exceeds native backend limits".into(),
         })?;
