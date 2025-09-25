@@ -479,8 +479,7 @@ pub(super) fn lower_expression(
             let func_id = ctx.declare_runtime_binary_from_slice(module)?;
             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[data_ptr, len_value]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            Ok(ctx.expect_result(call, "binary from slice"))
         }
 
         TypedExpr::Var {
@@ -548,8 +547,7 @@ pub(super) fn lower_expression(
             let func_id = ctx.declare_runtime_int_negate(module)?;
             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[inner]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            Ok(ctx.expect_result(call, "int negate"))
         }
 
         TypedExpr::Tuple { elements, .. } => {
@@ -557,8 +555,7 @@ pub(super) fn lower_expression(
                 let func_id = ctx.declare_runtime_nil(module)?;
                 let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 let call = ctx.builder.ins().call(func_ref, &[]);
-                let results = ctx.builder.inst_results(call);
-                return Ok(results[0]);
+                return Ok(ctx.expect_result(call, "tuple nil"));
             }
 
             let count = elements.len();
@@ -579,8 +576,7 @@ pub(super) fn lower_expression(
             let func_id = ctx.declare_runtime_alloc_tuple(module)?;
             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[base_ptr, len_value]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            Ok(ctx.expect_result(call, "tuple allocation"))
         }
         TypedExpr::List { elements, tail, .. } => {
             let mut values = Vec::with_capacity(elements.len());
@@ -594,8 +590,7 @@ pub(super) fn lower_expression(
                 let func_id = ctx.declare_runtime_nil(module)?;
                 let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 let call = ctx.builder.ins().call(func_ref, &[]);
-                let results = ctx.builder.inst_results(call);
-                results[0]
+                ctx.expect_result(call, "list nil")
             };
 
             if !values.is_empty() {
@@ -603,8 +598,7 @@ pub(super) fn lower_expression(
                 let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 for value in values.into_iter().rev() {
                     let call = ctx.builder.ins().call(func_ref, &[value, current]);
-                    let results = ctx.builder.inst_results(call);
-                    current = results[0];
+                    current = ctx.expect_result(call, "list cons");
                 }
             }
             Ok(current)
@@ -666,13 +660,13 @@ pub(super) fn lower_expression(
             let builder_id = ctx.declare_runtime_bit_array_builder_new(module)?;
             let builder_ref = module.declare_func_in_func(builder_id, ctx.builder.func);
             let call = ctx.builder.ins().call(builder_ref, &[]);
-            let mut builder_value = ctx.builder.inst_results(call)[0];
+            let mut builder_value = ctx.expect_result(call, "bit array builder new");
 
             if segments.is_empty() {
                 let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
                 let finish_ref = module.declare_func_in_func(finish_id, ctx.builder.func);
                 let finish_call = ctx.builder.ins().call(finish_ref, &[builder_value]);
-                let result = ctx.builder.inst_results(finish_call)[0];
+                let result = ctx.expect_result(finish_call, "bit array builder finish");
                 return Ok(result);
             }
 
@@ -698,7 +692,7 @@ pub(super) fn lower_expression(
                         func_ref,
                         &[builder_value, value, size_value, has_size_value, unit_value],
                     );
-                    builder_value = ctx.builder.inst_results(call)[0];
+                    builder_value = ctx.expect_result(call, "bit array builder append bit array");
                     continue;
                 }
 
@@ -742,7 +736,7 @@ pub(super) fn lower_expression(
                             endianness_value,
                         ],
                     );
-                    builder_value = ctx.builder.inst_results(call)[0];
+                    builder_value = ctx.expect_result(call, "bit array builder append int");
                     continue;
                 }
 
@@ -760,7 +754,7 @@ pub(super) fn lower_expression(
                         ctx.declare_runtime_bit_array_builder_append_utf8_codepoint(module)?;
                     let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
-                    builder_value = ctx.builder.inst_results(call)[0];
+                    builder_value = ctx.expect_result(call, "bit array builder append codepoint");
                     continue;
                 }
 
@@ -776,7 +770,7 @@ pub(super) fn lower_expression(
                         ctx.declare_runtime_bit_array_builder_append_string_utf8(module)?;
                     let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
-                    builder_value = ctx.builder.inst_results(call)[0];
+                    builder_value = ctx.expect_result(call, "bit array builder append string");
                     continue;
                 }
 
@@ -791,7 +785,7 @@ pub(super) fn lower_expression(
             let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
             let finish_ref = module.declare_func_in_func(finish_id, ctx.builder.func);
             let call = ctx.builder.ins().call(finish_ref, &[builder_value]);
-            let result = ctx.builder.inst_results(call)[0];
+            let result = ctx.expect_result(call, "bit array builder finish");
             Ok(result)
         }
 
@@ -1828,7 +1822,7 @@ fn lower_pattern_assignment(
                         let func_id = ctx.declare_runtime_bit_array_bit_size(module)?;
                         let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                         let call = ctx.builder.ins().call(func_ref, &[rest_value]);
-                        let actual_size = ctx.builder.inst_results(call)[0];
+                        let actual_size = ctx.expect_result(call, "bit array actual size");
                         let expected_value = ctx
                             .builder
                             .ins()
@@ -2010,7 +2004,7 @@ fn lower_pattern_assignment(
                         let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
                         let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                         let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
-                        let tuple = ctx.builder.inst_results(call)[0];
+                        let tuple = ctx.expect_result(call, "bit array builder tuple");
                         let head_value = ctx.tuple_element(tuple, 0)?;
                         let actual_size = ctx.tuple_element(tuple, 1)?;
                         let mismatch =
@@ -2202,8 +2196,7 @@ fn lower_panic(
     let panic_func = ctx.declare_runtime_panic(module)?;
     let panic_ref = module.declare_func_in_func(panic_func, ctx.builder.func);
     let call = ctx.builder.ins().call(panic_ref, &[message_value]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "panic"))
 }
 
 fn lower_call(
@@ -2313,8 +2306,7 @@ fn lower_call(
         .builder
         .ins()
         .call(apply_ref, &[fun_value, args_ptr, arg_count]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "apply closure"))
 }
 
 fn try_lower_defined_function(
@@ -2355,8 +2347,7 @@ fn lower_gleeunit_main(
     let func_id = ctx.declare_runtime_gleeunit_main(module)?;
     let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "gleeunit main"))
 }
 
 fn skip_gleeunit_do_main(
@@ -2367,8 +2358,7 @@ fn skip_gleeunit_do_main(
     let func_id = ctx.declare_runtime_gleeunit_do_main(module)?;
     let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "gleeunit do main"))
 }
 
 fn lower_print_call(
@@ -2389,8 +2379,7 @@ fn lower_print_call(
 
     let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[value]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "print"))
 }
 
 fn lower_case(
@@ -3082,50 +3071,55 @@ fn lower_case(
                             .all(|option| matches!(option, BitArrayOption::Bytes { .. }));
 
                         if !is_bytes {
-                            if let Some(size_pattern) = segment.size()
-                                && segment.type_.is_int()
-                                && let Some(size_bits) = size_pattern.as_int_literal()
-                                && let Some(size_bits) = size_bits.to_i64()
-                            {
-                                let (block, params, _value) = ctx
-                                    .branch_on_sized_int_bit_array_pattern(
-                                        module,
-                                        pattern_block,
-                                        pattern_subjects[subject_index],
-                                        size_bits,
-                                        next_block,
-                                        pattern_subjects.as_slice(),
-                                        subject_count,
-                                    )?;
-                                pattern_block = block;
-                                pattern_subjects = params;
+                            if let Some(size_pattern) = segment.size() {
+                                if segment.type_.is_int() {
+                                    if let Some(size_literal) = size_pattern.as_int_literal() {
+                                        if let Some(size_bits) = size_literal.to_i64() {
+                                            let (block, params, _value) = ctx
+                                                .branch_on_sized_int_bit_array_pattern(
+                                                    module,
+                                                    pattern_block,
+                                                    pattern_subjects[subject_index],
+                                                    size_bits,
+                                                    next_block,
+                                                    pattern_subjects.as_slice(),
+                                                    subject_count,
+                                                )?;
+                                            pattern_block = block;
+                                            pattern_subjects = params;
 
-                                match segment.value.as_ref() {
-                                    Pattern::Variable { name, .. } => {
-                                        let block_params =
-                                            ctx.builder.block_params(pattern_block).to_vec();
-                                        let base_index = pattern_subjects.len();
-                                        let captured = block_params
-                                            .get(base_index)
-                                            .copied()
-                                            .ok_or_else(|| crate::Error::NativeCodegen {
-                                                message:
-                                                    "missing sized int capture parameter in native case lowering"
-                                                        .into(),
-                                            })?;
-                                        bindings
-                                            .push((name.clone(), BindingSource::Value(captured)));
-                                    }
-                                    Pattern::Discard { .. } => {}
-                                    _ => {
-                                        return Err(crate::Error::NativeCodegen {
-                                            message:
-                                                "only variable or discard patterns are supported for sized int segments in native functions"
-                                                    .into(),
-                                        });
+                                            match segment.value.as_ref() {
+                                                Pattern::Variable { name, .. } => {
+                                                    let block_params = ctx
+                                                        .builder
+                                                        .block_params(pattern_block)
+                                                        .to_vec();
+                                                    let base_index = pattern_subjects.len();
+                                                    let captured = block_params
+                                                        .get(base_index)
+                                                        .copied()
+                                                        .ok_or_else(|| {
+                                                            crate::Error::NativeCodegen {
+                                                                message: "missing sized int capture parameter in native case lowering".into(),
+                                                            }
+                                                        })?;
+                                                    bindings.push((
+                                                        name.clone(),
+                                                        BindingSource::Value(captured),
+                                                    ));
+                                                }
+                                                Pattern::Discard { .. } => {}
+                                                _ => {
+                                                    return Err(crate::Error::NativeCodegen {
+                                                        message: "only variable or discard patterns are supported for sized int segments in native functions".into(),
+                                                    });
+                                                }
+                                            }
+
+                                            continue;
+                                        }
                                     }
                                 }
-                                continue;
                             }
 
                             return Err(crate::Error::NativeCodegen {
@@ -3485,7 +3479,7 @@ fn lower_case(
                             let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
                             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                             let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
-                            let tuple = ctx.builder.inst_results(call)[0];
+                            let tuple = ctx.expect_result(call, "constructor tuple helper");
                             let head_value = ctx.tuple_element(tuple, 0)?;
                             let actual_size = ctx.tuple_element(tuple, 1)?;
                             let mismatch =
@@ -3782,7 +3776,7 @@ fn lower_case(
                             let nil_func = ctx.declare_runtime_nil(module)?;
                             let nil_ref = module.declare_func_in_func(nil_func, ctx.builder.func);
                             let nil_call = ctx.builder.ins().call(nil_ref, &[]);
-                            let nil_value = ctx.builder.inst_results(nil_call)[0];
+                            let nil_value = ctx.expect_result(nil_call, "list nil helper");
                             let is_nil = ctx.builder.ins().icmp(IntCC::Equal, value, nil_value);
 
                             let continue_block = ctx.builder.create_block();
@@ -3993,7 +3987,7 @@ fn lower_case(
 
     ctx.seal_block(exit_block);
     ctx.builder.switch_to_block(exit_block);
-    let result = ctx.builder.block_params(exit_block)[0];
+    let result = ctx.expect_block_param(exit_block, 0, "case exit result");
     Ok(result)
 }
 
@@ -4094,7 +4088,7 @@ fn lower_bin_op(
 
             ctx.builder.switch_to_block(exit_block);
             ctx.seal_block(exit_block);
-            let result = ctx.builder.block_params(exit_block)[0];
+            let result = ctx.expect_block_param(exit_block, 0, "case exit result");
             Ok(result)
         }
         BinOp::AddFloat | BinOp::SubFloat | BinOp::MultFloat | BinOp::DivFloat => {
@@ -4112,8 +4106,7 @@ fn lower_bin_op(
             let func_id = ctx.declare_runtime_float_from_f64(module)?;
             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[result]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            Ok(ctx.expect_result(call, "float from f64"))
         }
         BinOp::AddInt | BinOp::SubInt | BinOp::MultInt | BinOp::DivInt | BinOp::RemainderInt => {
             let left_value = lower_expression(module, left, ctx)?;
@@ -4140,8 +4133,7 @@ fn lower_bin_op(
             let func_id = ctx.declare_runtime_string_add(module)?;
             let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[left_value, right_value]);
-            let results = ctx.builder.inst_results(call);
-            Ok(results[0])
+            Ok(ctx.expect_result(call, "string append"))
         }
     }
 }
@@ -4234,9 +4226,10 @@ fn lower_closure_function(
     builder.switch_to_block(block);
     builder.seal_block(block);
 
-    let env_ptr = builder.block_params(block)[0];
-    let args_ptr = builder.block_params(block)[1];
-    let _arg_count = builder.block_params(block)[2];
+    let params = builder.block_params(block);
+    let env_ptr = *params.get(0).expect("closure env param");
+    let args_ptr = *params.get(1).expect("closure args param");
+    let _arg_count = *params.get(2).expect("closure argc param");
 
     {
         let mut lowering = LoweringContext::new(
@@ -4329,13 +4322,17 @@ pub(super) fn lower_record_constructor_function(
     builder.switch_to_block(block);
     builder.seal_block(block);
 
-    let args_ptr = builder.block_params(block)[1];
-    let argc = builder.block_params(block)[2];
+    let params = builder.block_params(block);
+    let args_ptr = *params.get(1).expect("closure args param");
+    let argc = *params.get(2).expect("closure argc param");
 
     let ctor_index = builder.ins().iconst(pointer_type, i64::from(variant_index));
     let alloc_ref = module.declare_func_in_func(alloc_record, builder.func);
     let call = builder.ins().call(alloc_ref, &[ctor_index, args_ptr, argc]);
-    let result = builder.inst_results(call)[0];
+    let result = *builder
+        .inst_results(call)
+        .first()
+        .expect("closure record alloc result");
     let _ = builder.ins().return_(&[result]);
 
     builder.finalize();
@@ -4419,6 +4416,5 @@ fn lower_function_literal(
         .builder
         .ins()
         .call(alloc_ref, &[code_ptr, env_ptr, env_len]);
-    let results = ctx.builder.inst_results(call);
-    Ok(results[0])
+    Ok(ctx.expect_result(call, "closure allocation"))
 }

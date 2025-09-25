@@ -85,7 +85,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
-    fn expect_result(&mut self, inst: ir::Inst, context: &'static str) -> Value {
+    pub(super) fn expect_result(&mut self, inst: ir::Inst, context: &'static str) -> Value {
         self.builder
             .inst_results(inst)
             .first()
@@ -93,7 +93,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .unwrap_or_else(|| panic!("native lowering: {context} produced no value"))
     }
 
-    fn expect_block_param(
+    pub(super) fn expect_block_param(
         &mut self,
         block: ir::Block,
         index: usize,
