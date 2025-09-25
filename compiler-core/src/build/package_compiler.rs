@@ -24,6 +24,8 @@ use crate::{
     warning::{TypeWarningEmitter, WarningEmitter},
 };
 use askama::Template;
+use cranelift_codegen::{ir::InstBuilder, settings::Configurable};
+use cranelift_module::Module as _;
 use ecow::EcoString;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -46,7 +48,17 @@ pub struct Compiled {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CraneliftManifest {
+    #[serde(default)]
+    app_objects: Vec<String>,
+    #[serde(default)]
+    test_objects: Vec<String>,
+    #[serde(default)]
     objects: Vec<String>,
+}
+
+struct NativeObjectGroups {
+    app_objects: Vec<Utf8PathBuf>,
+    test_objects: Vec<Utf8PathBuf>,
 }
 
 #[derive(Debug)]
@@ -386,68 +398,173 @@ where
             self.io.mkdir(&artefact_dir)?;
         }
 
-        let mut object_paths = Vec::with_capacity(modules.len());
-        let primary_entry_index = modules
+        let preferred_test_module = format!("{}_test", self.config.name.as_str());
+
+        let app_entry_index = modules
             .iter()
             .enumerate()
-            .rev()
-            .find(|(_, module)| cranelift::module_contains_public_main(&module.ast))
+            .filter(|(_, module)| module.origin != Origin::Test)
+            .filter(|(_, module)| cranelift::module_contains_public_main(&module.ast))
+            .min_by_key(|(_, module)| {
+                (
+                    match module.origin {
+                        Origin::Src => 0_u8,
+                        Origin::Dev => 1,
+                        Origin::Test => 2,
+                    },
+                    if module.name == self.config.name {
+                        0_u8
+                    } else {
+                        1
+                    },
+                    module.name.clone(),
+                )
+            })
             .map(|(index, _)| index);
+
+        let test_entry_index = modules
+            .iter()
+            .enumerate()
+            .filter(|(_, module)| module.origin == Origin::Test)
+            .filter(|(_, module)| cranelift::module_contains_public_main(&module.ast))
+            .min_by_key(|(_, module)| {
+                (
+                    if module.name.as_str() == preferred_test_module {
+                        0_u8
+                    } else {
+                        1
+                    },
+                    module.name.clone(),
+                )
+            })
+            .map(|(index, _)| index);
+
         tracing::debug!(
             module_count = %modules.len(),
-            ?primary_entry_index,
+            ?app_entry_index,
+            ?test_entry_index,
             "native_primary_entry"
         );
-        let mut has_entrypoint = self.write_entrypoint && primary_entry_index.is_some();
+
+        let mut app_objects = Vec::new();
+        let mut test_objects = Vec::new();
+        let mut all_objects = Vec::new();
+        let mut main_symbols: Vec<Option<String>> = Vec::with_capacity(modules.len());
+        let mut compiled_any = false;
 
         for (index, module) in modules.iter().enumerate() {
             let object_name = format!("{}.o", module.name.replace("/", "__"));
             let output_path = artefact_dir.join(&object_name);
-            let wants_entrypoint = self.write_entrypoint && primary_entry_index == Some(index);
-            let module_config =
-                cranelift::ModuleConfig::with_entrypoint(module, self.root, wants_entrypoint);
-            cranelift::emit_object(&self.io, module_config, &output_path)?;
-            object_paths.push(output_path);
+            let wants_app_entry = self.write_entrypoint && app_entry_index == Some(index);
+            let wants_test_entry = self.write_entrypoint && test_entry_index == Some(index);
+            let module_config = cranelift::ModuleConfig::with_entrypoint(
+                module,
+                self.root,
+                wants_app_entry || wants_test_entry,
+            );
+            let main_symbol = cranelift::emit_object(&self.io, module_config, &output_path)?;
+            main_symbols.push(main_symbol);
+            compiled_any = true;
+
+            if module.origin != Origin::Test {
+                app_objects.push(output_path.clone());
+            }
+            if module.origin == Origin::Test {
+                test_objects.push(output_path.clone());
+            }
+            all_objects.push(output_path);
         }
 
-        let compiled_any = !object_paths.is_empty();
         if compiled_any {
-            self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+            self.write_cranelift_manifest(&artefact_dir, &app_objects, &test_objects)?;
         } else {
             if let Some(existing) = self.read_cranelift_manifest(&artefact_dir)? {
-                object_paths = existing;
+                app_objects = existing.app_objects;
+                test_objects = existing.test_objects;
             } else {
-                object_paths = self.discover_cranelift_objects(&artefact_dir)?;
+                app_objects = self.discover_cranelift_objects(&artefact_dir)?;
+                test_objects = Vec::new();
             }
 
-            if object_paths.is_empty() {
+            if app_objects.is_empty() && test_objects.is_empty() {
                 tracing::debug!("native_no_objects_to_link");
                 return Ok(());
             }
 
-            self.write_cranelift_manifest(&artefact_dir, &object_paths)?;
+            self.write_cranelift_manifest(&artefact_dir, &app_objects, &test_objects)?;
+
+            all_objects = app_objects
+                .iter()
+                .cloned()
+                .chain(test_objects.iter().cloned())
+                .collect();
         }
 
-        let _ = self.create_cranelift_archive(&artefact_dir, &object_paths)?;
-        if has_entrypoint {
-            self.link_cranelift_objects(&artefact_dir, &object_paths)
+        let _ = self.create_cranelift_archive(&artefact_dir, &all_objects)?;
+
+        let app_entry_symbol = app_entry_index
+            .and_then(|index| main_symbols.get(index))
+            .cloned()
+            .flatten();
+        let should_link_app =
+            self.write_entrypoint && app_entry_symbol.is_some() && !app_objects.is_empty();
+        if should_link_app {
+            let mut app_link_objects = app_objects.clone();
+            if let (Some(index), Some(symbol)) = (app_entry_index, app_entry_symbol.as_deref()) {
+                let stub_name = format!("{}__entry_app.o", modules[index].name.replace("/", "__"));
+                let stub_path =
+                    self.emit_cranelift_entrypoint_object(&artefact_dir, &stub_name, symbol)?;
+                app_link_objects.push(stub_path);
+            }
+
+            self.link_cranelift_objects(
+                &artefact_dir,
+                &app_link_objects,
+                self.config.name.as_str(),
+            )?;
         } else {
-            tracing::debug!(reason = "no entrypoint", "native_link_skipped");
-            Ok(())
+            tracing::debug!(reason = "no app entrypoint", "native_link_skipped_app");
         }
+
+        let test_entry_symbol = test_entry_index
+            .and_then(|index| main_symbols.get(index))
+            .cloned()
+            .flatten();
+        let should_link_tests = self.write_entrypoint && test_entry_symbol.is_some();
+        if should_link_tests {
+            let mut test_link_objects = app_objects.clone();
+            test_link_objects.extend(test_objects.clone());
+
+            if let (Some(index), Some(symbol)) = (test_entry_index, test_entry_symbol.as_deref()) {
+                let stub_name = format!("{}__entry_test.o", modules[index].name.replace("/", "__"));
+                let stub_path =
+                    self.emit_cranelift_entrypoint_object(&artefact_dir, &stub_name, symbol)?;
+                test_link_objects.push(stub_path);
+            }
+
+            if !test_link_objects.is_empty() {
+                let test_output = format!("{}_test", self.config.name.as_str());
+                self.link_cranelift_objects(&artefact_dir, &test_link_objects, &test_output)?;
+            }
+        } else if !test_objects.is_empty() {
+            tracing::debug!(reason = "no test entrypoint", "native_link_skipped_tests");
+        }
+
+        Ok(())
     }
 
     fn link_cranelift_objects(
         &self,
         artefact_dir: &Utf8Path,
         objects: &[Utf8PathBuf],
+        output_basename: &str,
     ) -> Result<(), Error> {
         if objects.is_empty() {
             tracing::debug!("no_objects_to_link");
             return Ok(());
         }
 
-        let mut output_name = self.config.name.as_str().replace('/', "__");
+        let mut output_name = output_basename.replace('/', "__");
         if output_name.is_empty() {
             output_name = "module".into();
         }
@@ -510,10 +627,16 @@ where
     fn write_cranelift_manifest(
         &self,
         artefact_dir: &Utf8Path,
-        objects: &[Utf8PathBuf],
+        app_objects: &[Utf8PathBuf],
+        test_objects: &[Utf8PathBuf],
     ) -> Result<(), Error> {
         let manifest = CraneliftManifest {
-            objects: objects.iter().map(|p| p.as_str().to_string()).collect(),
+            app_objects: app_objects.iter().map(|p| p.as_str().to_string()).collect(),
+            test_objects: test_objects
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect(),
+            objects: Vec::new(),
         };
 
         let manifest_text =
@@ -528,25 +651,42 @@ where
     fn read_cranelift_manifest(
         &self,
         artefact_dir: &Utf8Path,
-    ) -> Result<Option<Vec<Utf8PathBuf>>, Error> {
+    ) -> Result<Option<NativeObjectGroups>, Error> {
         let manifest_path = artefact_dir.join("manifest.json");
         if !self.io.is_file(&manifest_path) {
             return Ok(None);
         }
 
         let manifest_text = self.io.read(&manifest_path)?;
-        let manifest: CraneliftManifest =
+        let mut manifest: CraneliftManifest =
             serde_json::from_str(&manifest_text).map_err(|err| Error::NativeCodegen {
                 message: format!("failed to parse native manifest `{}`: {err}", manifest_path),
             })?;
 
-        let paths = manifest
-            .objects
+        let mut app_objects = manifest
+            .app_objects
             .into_iter()
             .map(Utf8PathBuf::from)
-            .collect();
+            .collect::<Vec<_>>();
 
-        Ok(Some(paths))
+        let mut test_objects = manifest
+            .test_objects
+            .into_iter()
+            .map(Utf8PathBuf::from)
+            .collect::<Vec<_>>();
+
+        if app_objects.is_empty() && test_objects.is_empty() && !manifest.objects.is_empty() {
+            app_objects = manifest
+                .objects
+                .into_iter()
+                .map(Utf8PathBuf::from)
+                .collect();
+        }
+
+        Ok(Some(NativeObjectGroups {
+            app_objects,
+            test_objects,
+        }))
     }
 
     fn discover_cranelift_objects(
@@ -754,6 +894,113 @@ where
         }
 
         Ok(())
+    }
+
+    fn emit_cranelift_entrypoint_object(
+        &self,
+        artefact_dir: &Utf8Path,
+        filename: &str,
+        main_symbol: &str,
+    ) -> Result<Utf8PathBuf, Error> {
+        let isa_builder = cranelift_native::builder().map_err(|err| Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+
+        let mut flag_builder = cranelift_codegen::settings::builder();
+        flag_builder
+            .set("is_pic", "true")
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        let flags = cranelift_codegen::settings::Flags::new(flag_builder);
+
+        let isa = isa_builder
+            .finish(flags)
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+
+        let mut module = cranelift_object::ObjectModule::new(
+            cranelift_object::ObjectBuilder::new(
+                isa,
+                format!("gleam_entry_{}", filename.replace('.', "_")),
+                cranelift_module::default_libcall_names(),
+            )
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?,
+        );
+
+        let pointer_type = module.target_config().pointer_type();
+        let mut signature = module.make_signature();
+        signature
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(pointer_type));
+        let main_func = module
+            .declare_function(main_symbol, cranelift_module::Linkage::Import, &signature)
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+
+        let mut ctx = module.make_context();
+        ctx.func
+            .signature
+            .returns
+            .push(cranelift_codegen::ir::AbiParam::new(
+                cranelift_codegen::ir::types::I32,
+            ));
+
+        let mut func_ctx = cranelift_frontend::FunctionBuilderContext::new();
+        let mut builder = cranelift_frontend::FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let init_signature = module.make_signature();
+        let runtime_init = module
+            .declare_function(
+                "gleam_runtime_init",
+                cranelift_module::Linkage::Import,
+                &init_signature,
+            )
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        let runtime_init_ref = module.declare_func_in_func(runtime_init, &mut builder.func);
+        let _ = builder.ins().call(runtime_init_ref, &[]);
+
+        let main_ref = module.declare_func_in_func(main_func, &mut builder.func);
+        let _ = builder.ins().call(main_ref, &[]);
+
+        let zero = builder.ins().iconst(cranelift_codegen::ir::types::I32, 0);
+        let _ = builder.ins().return_(&[zero]);
+        builder.finalize();
+
+        let func_id = module
+            .declare_function(
+                "main",
+                cranelift_module::Linkage::Export,
+                &ctx.func.signature,
+            )
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+
+        module
+            .define_function(func_id, &mut ctx)
+            .map_err(|err| Error::NativeCodegen {
+                message: err.to_string(),
+            })?;
+        module.clear_context(&mut ctx);
+
+        let product = module.finish();
+        let bytes = product.emit().map_err(|err| Error::NativeCodegen {
+            message: err.to_string(),
+        })?;
+
+        let output_path = artefact_dir.join(filename);
+        self.io.write_bytes(&output_path, &bytes)?;
+        Ok(output_path)
     }
 
     fn render_erlang_entrypoint_module(
