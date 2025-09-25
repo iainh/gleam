@@ -153,7 +153,9 @@ pub fn setup(
                 run_javascript_bun_command(paths, &main_function.package, &module, arguments)
             }
         },
-        Target::Native => run_native_command(paths, &main_function.package, &module, arguments),
+        Target::Native => {
+            run_native_command(paths, &main_function.package, &module, which, arguments)
+        }
     }
 }
 
@@ -161,10 +163,14 @@ fn run_native_command(
     paths: &ProjectPaths,
     package: &str,
     module: &str,
+    which: Which,
     arguments: Vec<String>,
 ) -> Result<Command, Error> {
     let package_dir = paths.build_directory_for_package(Mode::Dev, Target::Native, package);
-    let mut binary_name = package.replace('/', "__");
+    let mut binary_name = match which {
+        Which::Test => format!("{}_test", package).replace('/', "__"),
+        _ => package.replace('/', "__"),
+    };
     if binary_name.is_empty() {
         binary_name = "module".into();
     }
