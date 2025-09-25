@@ -1,3 +1,5 @@
+//! Crate entry point exposing the public surface of the native runtime used by
+//! the Cranelift backend.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 

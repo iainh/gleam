@@ -1,3 +1,5 @@
+//! Shared header metadata stored at the start of every boxed runtime value.
+
 use std::alloc::{Layout, LayoutError};
 
 /// Primary tag describing a boxed runtime value.

@@ -1,3 +1,5 @@
+//! `extern "C"` entry points and helpers invoked from native Gleam code.
+
 use std::{
     convert::TryFrom,
     fs,

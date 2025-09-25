@@ -1,3 +1,6 @@
+//! Tagged pointer-sized representation for values passed between runtime and
+//! generated code.
+
 use std::ptr::NonNull;
 
 use crate::header::{Header, Tag};

@@ -1,3 +1,5 @@
+//! Thin wrapper around the Boehm GC initialisation and allocation APIs.
+
 use std::ffi::c_void;
 use std::sync::Once;
 

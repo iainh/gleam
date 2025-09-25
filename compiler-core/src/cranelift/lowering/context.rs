@@ -1,3 +1,5 @@
+//! Shared lowering state used while building Cranelift functions.
+
 use crate::{
     Result,
     ast::{ClauseGuard, Constant, TypedClauseGuard, TypedConstant, TypedExpr},
@@ -33,6 +35,7 @@ use super::{
     TAG_RECORD, TAG_TUPLE, VALUE_TAG_MASK,
 };
 
+/// Mutable state threaded through expression lowering.
 pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) builder: &'a mut FunctionBuilder<'b>,
     pub(super) pointer_type: ir::Type,
@@ -3579,6 +3582,7 @@ fn constant_string_value(constant: &TypedConstant) -> Option<String> {
     }
 }
 
+/// Encodes an i63 immediate using the runtime tagging scheme.
 pub(super) fn encode_small_int(value: i64) -> Result<i64, crate::Error> {
     const MIN_I63: i64 = -(1i64 << 61);
     const MAX_I63: i64 = (1i64 << 61) - 1;

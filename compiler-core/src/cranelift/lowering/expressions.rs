@@ -1,3 +1,5 @@
+//! Expression lowering entry points and helpers for Cranelift generation.
+
 use crate::{
     Result,
     ast::{
@@ -33,6 +35,8 @@ struct OrderedConstructorArg<'a> {
     pattern: &'a Pattern<Arc<Type>>,
 }
 
+/// Orders constructor arguments to match the runtime layout, expanding field
+/// map indices and tracking aliases introduced by pattern assignments.
 fn order_constructor_arguments<'a>(
     constructor: &'a PatternConstructor,
     arguments: &'a [CallArg<Pattern<Arc<Type>>>],
@@ -133,6 +137,7 @@ fn order_constructor_arguments<'a>(
         .collect())
 }
 
+/// Builds the runtime symbol name for a Gleam function.
 pub(super) fn function_symbol_name(module: &str, name: &EcoString, arity: usize) -> String {
     format!("gleam${}_{}__{}", module.replace('/', "$"), name, arity)
 }
@@ -255,6 +260,8 @@ fn declare_module_functions(
     Ok(ids)
 }
 
+/// Lowers every function in the module into the provided Cranelift module and
+/// returns the optional entrypoint identifier when present.
 pub(crate) fn lower_module_functions(
     module: &mut ObjectModule,
     config: &ModuleConfig<'_>,
@@ -443,6 +450,7 @@ fn lower_block(
     Ok(last)
 }
 
+/// Lowers a single Gleam expression into Cranelift instructions.
 pub(super) fn lower_expression(
     module: &mut ObjectModule,
     expression: &TypedExpr,
@@ -4289,6 +4297,8 @@ fn lower_closure_function(
     Ok(func_id)
 }
 
+/// Synthesises a helper function that constructs a record for pattern matches
+/// on modules compiled from Erlang or JavaScript code.
 pub(super) fn lower_record_constructor_function(
     module: &mut ObjectModule,
     pointer_type: ir::Type,

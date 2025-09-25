@@ -1,3 +1,5 @@
+//! Emits compiled Gleam modules as native object files.
+
 use crate::{Result, io::FileSystemWriter};
 use camino::Utf8Path;
 use cranelift_codegen::settings::{self, Configurable};
@@ -6,6 +8,9 @@ use tracing::instrument;
 
 use super::{config::ModuleConfig, lowering::lower_module_functions};
 
+/// Lowers the given module to a native object file and writes it to
+/// `output_path`. Returns the symbol name of `main/0` when the module exports
+/// an entrypoint.
 #[instrument(skip_all, fields(module = %config.module.name, output = %output_path))]
 pub fn emit_object(
     writer: &impl FileSystemWriter,

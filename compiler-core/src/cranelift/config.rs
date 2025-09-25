@@ -1,3 +1,6 @@
+//! Per-module configuration helpers shared between lowering and object
+//! emission for the Cranelift backend.
+
 use crate::{
     ast::{Function, Publicity, TypedDefinition},
     build::Module as GleamModule,
@@ -5,6 +8,7 @@ use crate::{
 };
 use camino::Utf8Path;
 
+/// Metadata gathered before lowering a module to Cranelift IR.
 #[derive(Debug)]
 pub struct ModuleConfig<'a> {
     pub module: &'a GleamModule,
@@ -14,6 +18,8 @@ pub struct ModuleConfig<'a> {
 }
 
 impl<'a> ModuleConfig<'a> {
+    /// Construct a config and explicitly mark whether the module exports a
+    /// zero-argument `main` function.
     pub fn with_entrypoint(
         module: &'a GleamModule,
         project_root: &'a Utf8Path,
@@ -27,6 +33,8 @@ impl<'a> ModuleConfig<'a> {
         }
     }
 
+    /// Build a config and infers the entrypoint flag by scanning the module
+    /// definitions.
     pub fn new(module: &'a GleamModule, project_root: &'a Utf8Path) -> Self {
         Self::with_entrypoint(
             module,
@@ -36,6 +44,7 @@ impl<'a> ModuleConfig<'a> {
     }
 }
 
+/// Returns `true` when the module exports `pub fn main() -> _`.
 pub(crate) fn module_contains_public_main(module: &crate::ast::TypedModule) -> bool {
     module
         .definitions

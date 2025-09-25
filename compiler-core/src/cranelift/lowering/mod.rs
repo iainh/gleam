@@ -1,3 +1,5 @@
+//! Converts typed Gleam AST into Cranelift IR.
+
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::Value;
@@ -21,6 +23,8 @@ pub(super) const FLOAT_HEADER: u64 = (1u64 << 32) | TAG_FLOAT;
 
 pub(super) type FunctionIdMap = HashMap<(EcoString, usize), FuncId>;
 
+/// Describes the origin of a value bound during pattern lowering so it can be
+/// materialised later.
 #[derive(Clone, Copy)]
 pub(super) enum BindingSource {
     Subject(usize),

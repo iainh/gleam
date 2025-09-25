@@ -1,3 +1,5 @@
+//! Safe allocation facade that constructs runtime values using the GC.
+
 use std::alloc::{Layout, LayoutError};
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;

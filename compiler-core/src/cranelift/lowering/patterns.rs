@@ -1,3 +1,5 @@
+//! Pattern analysis structures shared between list and constructor lowering.
+
 use crate::{
     Result,
     ast::Pattern,
@@ -6,6 +8,7 @@ use crate::{
 use ecow::EcoString;
 use std::sync::Arc;
 
+/// Metadata about a list constructor pattern used to drive lowering.
 #[derive(Debug)]
 pub(super) struct ListConstructorInfo<'a> {
     pub(super) constructor: &'a PatternConstructor,
@@ -14,12 +17,14 @@ pub(super) struct ListConstructorInfo<'a> {
     pub(super) conditions: Vec<ListConstructorCondition>,
 }
 
+/// Describes a tuple pattern matched against a list head.
 #[derive(Debug)]
 pub(super) struct ListTupleInfo {
     pub(super) arity: usize,
     pub(super) capture_flags: Vec<bool>,
 }
 
+/// Represents the possible matchers that can consume a list head.
 #[derive(Debug)]
 pub(super) enum ListHeadMatch<'a> {
     Constructor(ListConstructorInfo<'a>),
@@ -35,6 +40,7 @@ impl<'a> ListHeadMatch<'a> {
     }
 }
 
+/// Additional runtime guards that must hold for a list head match.
 #[derive(Debug)]
 pub(super) enum ListConstructorCondition {
     None,
@@ -42,6 +48,7 @@ pub(super) enum ListConstructorCondition {
     EmptyList,
 }
 
+/// Aggregated information about an entire list pattern.
 #[derive(Debug)]
 pub(super) struct ListPatternInfo<'a> {
     pub(super) capture_heads: Vec<bool>,
@@ -55,11 +62,13 @@ pub(super) struct ListPatternInfo<'a> {
     pub(super) ensure_exact: bool,
 }
 
+/// Recursive detail for nested list patterns.
 #[derive(Debug)]
 pub(super) struct NestedListInfo<'a> {
     pub(super) pattern: Box<ListPatternInfo<'a>>,
 }
 
+/// Metadata for tuple constructors used within patterns.
 #[derive(Debug)]
 pub(super) struct ConstructorTupleInfo {
     pub(super) capture_flags: Vec<bool>,
@@ -67,12 +76,14 @@ pub(super) struct ConstructorTupleInfo {
     pub(super) conditions: Vec<ConstructorTupleCondition>,
 }
 
+/// Guards applied to constructor tuple matches.
 #[derive(Debug)]
 pub(super) enum ConstructorTupleCondition {
     None,
     String(EcoString),
 }
 
+/// Captures nested constructor details to reuse matches.
 #[derive(Debug)]
 pub(super) struct NestedConstructorInfo<'a> {
     pub(super) constructor: &'a PatternConstructor,
@@ -81,6 +92,7 @@ pub(super) struct NestedConstructorInfo<'a> {
     pub(super) binding_names: Vec<Option<EcoString>>,
 }
 
+/// Analyses a list pattern to drive the lowering of pattern matching logic.
 pub(super) fn collect_list_pattern_info<'a>(
     elements: &'a [Pattern<Arc<Type>>],
     tail: Option<&'a Pattern<Arc<Type>>>,

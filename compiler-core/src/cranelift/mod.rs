@@ -1,3 +1,5 @@
+//! Native code generation pipeline targeting the Cranelift backend.
+
 mod config;
 mod emit;
 mod lowering;

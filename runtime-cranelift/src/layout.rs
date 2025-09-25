@@ -1,3 +1,5 @@
+//! Concrete in-memory layouts for boxed Gleam runtime values.
+
 use std::alloc::{Layout, LayoutError};
 use std::sync::atomic::AtomicUsize;
 

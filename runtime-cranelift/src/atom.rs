@@ -1,3 +1,5 @@
+//! Global atom registry shared by the runtime and generated code.
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

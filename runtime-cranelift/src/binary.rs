@@ -1,3 +1,5 @@
+//! Reference counting helpers for binary and bit-array buffers.
+
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
