@@ -14,12 +14,20 @@ pub fn ensure_initialised() {
 }
 
 /// Allocate `size` bytes from the GC heap, returning a null pointer on failure.
+///
+/// # Safety
+/// The caller must ensure the returned pointer is used according to the GC's
+/// expectations and eventually released or traced as appropriate.
 pub unsafe fn malloc(size: usize) -> *mut c_void {
     ensure_initialised();
     unsafe { bdwgc_sys::GC_malloc(size) }
 }
 
 /// Allocate `size` bytes for data that does not contain pointers to GC-managed memory.
+///
+/// # Safety
+/// The caller must ensure the region truly holds no GC-managed pointers and
+/// that the returned pointer is handled safely.
 pub unsafe fn malloc_atomic(size: usize) -> *mut c_void {
     ensure_initialised();
     unsafe { bdwgc_sys::GC_malloc_atomic(size) }

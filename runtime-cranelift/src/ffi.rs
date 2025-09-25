@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    Header, Heap, Tag, Value,
     atom::AtomTable,
     binary, gc,
     heap::AllocationError,
@@ -18,11 +19,10 @@ use crate::{
         Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ClosureFn, ConsCell,
         FloatBox, Map, MapEntry, MapTable,
     },
-    Header, Heap, Tag, Value,
 };
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
@@ -107,7 +107,10 @@ pub unsafe extern "C" fn gleam_alloc_closure(
     let code = unsafe { std::mem::transmute::<usize, ClosureFn>(code_ptr as usize) };
     let env_values = env_ptr as *const Value;
     let heap = Heap::new();
-    let value = unwrap_allocation(unsafe { heap.alloc_closure(code, env_values, env_len) }, "closure");
+    let value = unwrap_allocation(
+        unsafe { heap.alloc_closure(code, env_values, env_len) },
+        "closure",
+    );
     value.to_raw()
 }
 
@@ -340,7 +343,7 @@ fn bit_array_view(value: Value, context: &'static str) -> BitArrayView {
 fn bit_array_data_slice(view: &BitArrayView) -> &[u8] {
     unsafe {
         let data = view.data.as_ref();
-        let len = (view.capacity_bits + 7) / 8;
+        let len = view.capacity_bits.div_ceil(8);
         slice::from_raw_parts(data.as_ptr(), len)
     }
 }
@@ -361,7 +364,7 @@ fn copy_bits(view: &BitArrayView, start: usize, len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
-    let mut bytes = vec![0u8; (len + 7) / 8];
+    let mut bytes = vec![0u8; len.div_ceil(8)];
     copy_bits_into(view, start, len, &mut bytes, 0);
     bytes
 }
@@ -418,7 +421,7 @@ impl BitArrayBuilder {
         if bytes.is_empty() {
             return;
         }
-        if self.bit_len % 8 == 0 {
+        if self.bit_len.is_multiple_of(8) {
             self.bytes.extend_from_slice(bytes);
             self.bit_len += bytes.len() * 8;
         } else {
@@ -436,7 +439,7 @@ impl BitArrayBuilder {
             return;
         }
         let new_len = self.bit_len + len;
-        let required_bytes = (new_len + 7) / 8;
+        let required_bytes = new_len.div_ceil(8);
         if self.bytes.len() < required_bytes {
             self.bytes.resize(required_bytes, 0);
         }
@@ -566,7 +569,7 @@ fn padded_bytes(view: &BitArrayView) -> (Vec<u8>, usize) {
     let mut bytes = bit_array_bytes(view);
     let total_bits = view.bit_len + padding;
     if padding != 0 {
-        let required_len = (total_bits + 7) / 8;
+        let required_len = total_bits.div_ceil(8);
         if bytes.len() < required_len {
             bytes.resize(required_len, 0);
         }
@@ -1388,7 +1391,7 @@ pub extern "C" fn bit_array_bit_size(raw: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn bit_array_byte_size(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_byte_size");
-    let bytes = (view.bit_len + 7) / 8;
+    let bytes = view.bit_len.div_ceil(8);
     let size =
         i64::try_from(bytes).unwrap_or_else(|_| panic!("runtime bit_array_byte_size overflow"));
     Value::from_i63(size).to_raw()
@@ -1433,7 +1436,7 @@ pub extern "C" fn bit_array_slice(bits_raw: u64, pos_raw: u64, len_raw: u64) -> 
 #[no_mangle]
 pub extern "C" fn bit_array_to_string(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_to_string");
-    if view.bit_len % 8 != 0 {
+    if !view.bit_len.is_multiple_of(8) {
         return result_error(Value::nil());
     }
     let bytes = bit_array_bytes(&view);
@@ -1446,7 +1449,7 @@ pub extern "C" fn bit_array_to_string(raw: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn bit_array_unsafe_to_string(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_unsafe_to_string");
-    if view.bit_len % 8 != 0 {
+    if !view.bit_len.is_multiple_of(8) {
         panic!("runtime bit_array_unsafe_to_string expected byte-aligned bit array");
     }
     let bytes = bit_array_bytes(&view);
@@ -1468,7 +1471,7 @@ pub extern "C" fn bit_array_concat(list_raw: u64) -> u64 {
     if total_bits == 0 {
         return bit_array_from_bytes(&[], 0).to_raw();
     }
-    let mut bytes = vec![0u8; (total_bits + 7) / 8];
+    let mut bytes = vec![0u8; total_bits.div_ceil(8)];
     let mut offset = 0usize;
     for value in values {
         let view = bit_array_view(value, "bit_array_concat entry");
@@ -1516,7 +1519,7 @@ pub extern "C" fn base16_encode(bits_raw: u64) -> u64 {
 pub extern "C" fn base16_decode(string_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("runtime base16_decode expected String value"));
-    if string.len() % 2 != 0 {
+    if !string.len().is_multiple_of(2) {
         return result_error(Value::nil());
     }
     match hex_decode(string.as_bytes()) {
@@ -1628,7 +1631,7 @@ pub extern "C" fn dynamic_string(data_raw: u64) -> u64 {
         Some(Tag::Binary) | Some(Tag::BinarySlice) => result_ok(value),
         Some(Tag::BitArray) => {
             let view = bit_array_view(value, "string bit array view");
-            if view.bit_len % 8 != 0 {
+            if !view.bit_len.is_multiple_of(8) {
                 return result_error(string_to_value(""));
             }
             let bytes = bit_array_bytes(&view);
@@ -1807,7 +1810,7 @@ pub extern "C" fn string_to_utf8_bits(raw: u64) -> u64 {
 pub extern "C" fn bit_array_pop_utf8_codepoint(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_pop_utf8_codepoint");
 
-    if view.bit_offset % 8 != 0 {
+    if !view.bit_offset.is_multiple_of(8) {
         let tuple = tuple_from(
             &[Value::from_bool(false), Value::nil(), Value::nil()],
             "bit array utf8 split failure",
@@ -1943,7 +1946,7 @@ pub extern "C" fn bit_array_builder_append_bit_array(
 ) -> u64 {
     let builder = builder_ref(builder_raw);
     let has_size = has_size_raw != 0;
-    let unit = unit_raw as u64;
+    let unit = unit_raw;
     let take_bits = if has_size {
         let size_value = value_to_i63(Value::from_raw(size_raw), "bit array segment size");
         let bits = compute_size_bits(size_value, unit);
@@ -1968,7 +1971,7 @@ pub extern "C" fn bit_array_builder_append_int(
     endianness_raw: u64,
 ) -> u64 {
     let builder = builder_ref(builder_raw);
-    let unit = unit_raw as u64;
+    let unit = unit_raw;
     let default_size_bits = default_size_raw as i64;
     let base_size = if has_size_raw != 0 {
         value_to_i63(Value::from_raw(size_raw), "bit array segment size")
@@ -2369,7 +2372,7 @@ pub extern "C" fn graphemes(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
     let values = UnicodeSegmentation::graphemes(string.as_str(), true)
-        .map(|grapheme| string_to_value(grapheme))
+        .map(string_to_value)
         .collect::<Vec<_>>();
     list_from_vec(values).to_raw()
 }
@@ -2383,12 +2386,12 @@ pub extern "C" fn split_string_tree(tree_raw: u64, pattern_raw: u64, _direction_
 
     let values = if pattern.is_empty() {
         UnicodeSegmentation::graphemes(string.as_str(), true)
-            .map(|grapheme| string_to_value(grapheme))
+            .map(string_to_value)
             .collect::<Vec<_>>()
     } else {
         string
             .split(pattern.as_str())
-            .map(|segment| string_to_value(segment))
+            .map(string_to_value)
             .collect::<Vec<_>>()
     };
 
@@ -2422,7 +2425,7 @@ pub extern "C" fn int_from_base_string(string_raw: u64, base_raw: u64) -> u64 {
 }
 
 fn int_to_base_string_impl(number: i64, base: i64) -> Option<String> {
-    if base < 2 || base > 36 {
+    if !(2..=36).contains(&base) {
         return None;
     }
 

@@ -172,19 +172,31 @@ impl MapTable {
         Ok(layout)
     }
 
+    /// # Safety
+    /// The caller must ensure the returned pointer is not used after the
+    /// table is mutated or dropped.
     pub unsafe fn entries_ptr(&self) -> *const MapEntry {
         self.entries.as_ptr()
     }
 
+    /// # Safety
+    /// The caller must ensure the returned pointer is used safely and that
+    /// aliasing rules are respected when writing through it.
     pub unsafe fn entries_mut_ptr(&mut self) -> *mut MapEntry {
         self.entries.as_mut_ptr()
     }
 
+    /// # Safety
+    /// The resulting slice must not outlive the table and the caller must
+    /// avoid aliasing mutable references to the same entries.
     pub unsafe fn entries_slice(&self) -> &[MapEntry] {
         let ptr = unsafe { self.entries_ptr() };
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
+    /// # Safety
+    /// The caller must ensure no other references exist while the mutable
+    /// slice is active.
     pub unsafe fn entries_slice_mut(&mut self) -> &mut [MapEntry] {
         let ptr = unsafe { self.entries_mut_ptr() };
         unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
