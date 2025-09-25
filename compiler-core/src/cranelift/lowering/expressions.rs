@@ -477,7 +477,7 @@ pub(super) fn lower_expression(
                 })?;
             let len_value = ctx.builder.ins().iconst(ctx.pointer_type, len);
             let func_id = ctx.declare_runtime_binary_from_slice(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[data_ptr, len_value]);
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
@@ -546,7 +546,7 @@ pub(super) fn lower_expression(
         TypedExpr::NegateInt { value, .. } => {
             let inner = lower_expression(module, value, ctx)?;
             let func_id = ctx.declare_runtime_int_negate(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[inner]);
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
@@ -555,7 +555,7 @@ pub(super) fn lower_expression(
         TypedExpr::Tuple { elements, .. } => {
             if elements.is_empty() {
                 let func_id = ctx.declare_runtime_nil(module)?;
-                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 let call = ctx.builder.ins().call(func_ref, &[]);
                 let results = ctx.builder.inst_results(call);
                 return Ok(results[0]);
@@ -577,7 +577,7 @@ pub(super) fn lower_expression(
             let len_value = ctx.builder.ins().iconst(ctx.pointer_type, count as i64);
 
             let func_id = ctx.declare_runtime_alloc_tuple(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[base_ptr, len_value]);
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
@@ -592,7 +592,7 @@ pub(super) fn lower_expression(
                 lower_expression(module, tail_expr, ctx)?
             } else {
                 let func_id = ctx.declare_runtime_nil(module)?;
-                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 let call = ctx.builder.ins().call(func_ref, &[]);
                 let results = ctx.builder.inst_results(call);
                 results[0]
@@ -600,7 +600,7 @@ pub(super) fn lower_expression(
 
             if !values.is_empty() {
                 let func_id = ctx.declare_runtime_list_cons(module)?;
-                let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                 for value in values.into_iter().rev() {
                     let call = ctx.builder.ins().call(func_ref, &[value, current]);
                     let results = ctx.builder.inst_results(call);
@@ -664,13 +664,13 @@ pub(super) fn lower_expression(
 
         TypedExpr::BitArray { segments, .. } => {
             let builder_id = ctx.declare_runtime_bit_array_builder_new(module)?;
-            let builder_ref = module.declare_func_in_func(builder_id, &mut ctx.builder.func);
+            let builder_ref = module.declare_func_in_func(builder_id, ctx.builder.func);
             let call = ctx.builder.ins().call(builder_ref, &[]);
             let mut builder_value = ctx.builder.inst_results(call)[0];
 
             if segments.is_empty() {
                 let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
-                let finish_ref = module.declare_func_in_func(finish_id, &mut ctx.builder.func);
+                let finish_ref = module.declare_func_in_func(finish_id, ctx.builder.func);
                 let finish_call = ctx.builder.ins().call(finish_ref, &[builder_value]);
                 let result = ctx.builder.inst_results(finish_call)[0];
                 return Ok(result);
@@ -693,7 +693,7 @@ pub(super) fn lower_expression(
                         .ins()
                         .iconst(ctx.pointer_type, i64::from(segment.unit()));
                     let func_id = ctx.declare_runtime_bit_array_builder_append_bit_array(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(
                         func_ref,
                         &[builder_value, value, size_value, has_size_value, unit_value],
@@ -728,7 +728,7 @@ pub(super) fn lower_expression(
                         .ins()
                         .iconst(ctx.pointer_type, i64::from(endianness));
                     let func_id = ctx.declare_runtime_bit_array_builder_append_int(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(
                         func_ref,
                         &[
@@ -758,7 +758,7 @@ pub(super) fn lower_expression(
                     let value = lower_expression(module, &segment.value, ctx)?;
                     let func_id =
                         ctx.declare_runtime_bit_array_builder_append_utf8_codepoint(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
                     builder_value = ctx.builder.inst_results(call)[0];
                     continue;
@@ -774,7 +774,7 @@ pub(super) fn lower_expression(
                     let value = lower_expression(module, &segment.value, ctx)?;
                     let func_id =
                         ctx.declare_runtime_bit_array_builder_append_string_utf8(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                     let call = ctx.builder.ins().call(func_ref, &[builder_value, value]);
                     builder_value = ctx.builder.inst_results(call)[0];
                     continue;
@@ -789,7 +789,7 @@ pub(super) fn lower_expression(
             }
 
             let finish_id = ctx.declare_runtime_bit_array_builder_finish(module)?;
-            let finish_ref = module.declare_func_in_func(finish_id, &mut ctx.builder.func);
+            let finish_ref = module.declare_func_in_func(finish_id, ctx.builder.func);
             let call = ctx.builder.ins().call(finish_ref, &[builder_value]);
             let result = ctx.builder.inst_results(call)[0];
             Ok(result)
@@ -1687,7 +1687,7 @@ fn lower_pattern_assignment(
                                         .iconst(ctx.pointer_type, encoded);
                                 }
                                 BitArraySize::Variable { name, .. } => {
-                                    let Some(value) = ctx.lookup(&name) else {
+                                    let Some(value) = ctx.lookup(name) else {
                                         return Err(crate::Error::NativeCodegen {
                                             message: format!(
                                                 "bit array segment size variable `{name}` is not defined in native functions"
@@ -1826,7 +1826,7 @@ fn lower_pattern_assignment(
 
                     if expected_rest_bits >= 0 {
                         let func_id = ctx.declare_runtime_bit_array_bit_size(module)?;
-                        let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                        let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                         let call = ctx.builder.ins().call(func_ref, &[rest_value]);
                         let actual_size = ctx.builder.inst_results(call)[0];
                         let expected_value = ctx
@@ -1920,7 +1920,7 @@ fn lower_pattern_assignment(
                                         .iconst(ctx.pointer_type, encoded);
                                 }
                                 BitArraySize::Variable { name, .. } => {
-                                    let Some(value) = ctx.lookup(&name) else {
+                                    let Some(value) = ctx.lookup(name) else {
                                         return Err(crate::Error::NativeCodegen {
                                             message: format!(
                                                 "bit array segment size variable `{name}` is not defined in native functions"
@@ -2008,7 +2008,7 @@ fn lower_pattern_assignment(
 
                     if let Some(name) = head_binding {
                         let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
-                        let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                        let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                         let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
                         let tuple = ctx.builder.inst_results(call)[0];
                         let head_value = ctx.tuple_element(tuple, 0)?;
@@ -2200,7 +2200,7 @@ fn lower_panic(
     };
 
     let panic_func = ctx.declare_runtime_panic(module)?;
-    let panic_ref = module.declare_func_in_func(panic_func, &mut ctx.builder.func);
+    let panic_ref = module.declare_func_in_func(panic_func, ctx.builder.func);
     let call = ctx.builder.ins().call(panic_ref, &[message_value]);
     let results = ctx.builder.inst_results(call);
     Ok(results[0])
@@ -2308,7 +2308,7 @@ fn lower_call(
         .iconst(ctx.pointer_type, arguments.len() as i64);
 
     let apply_func = ctx.declare_runtime_apply_closure(module)?;
-    let apply_ref = module.declare_func_in_func(apply_func, &mut ctx.builder.func);
+    let apply_ref = module.declare_func_in_func(apply_func, ctx.builder.func);
     let call = ctx
         .builder
         .ins()
@@ -2353,7 +2353,7 @@ fn lower_gleeunit_main(
     ctx: &mut LoweringContext<'_, '_, '_>,
 ) -> Result<Value> {
     let func_id = ctx.declare_runtime_gleeunit_main(module)?;
-    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[]);
     let results = ctx.builder.inst_results(call);
     Ok(results[0])
@@ -2365,7 +2365,7 @@ fn skip_gleeunit_do_main(
 ) -> Result<Value> {
     tracing::warn!("Skipping gleeunit.do_main; test runner not yet supported on Cranelift");
     let func_id = ctx.declare_runtime_gleeunit_do_main(module)?;
-    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[]);
     let results = ctx.builder.inst_results(call);
     Ok(results[0])
@@ -2387,7 +2387,7 @@ fn lower_print_call(
         (true, true) => ctx.declare_runtime_println_error(module)?,
     };
 
-    let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
     let call = ctx.builder.ins().call(func_ref, &[value]);
     let results = ctx.builder.inst_results(call);
     Ok(results[0])
@@ -3483,8 +3483,7 @@ fn lower_case(
 
                         if let Some(name) = head_binding {
                             let func_id = ctx.declare_runtime_bit_array_to_int(module)?;
-                            let func_ref =
-                                module.declare_func_in_func(func_id, &mut ctx.builder.func);
+                            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
                             let call = ctx.builder.ins().call(func_ref, &[prefix_value]);
                             let tuple = ctx.builder.inst_results(call)[0];
                             let head_value = ctx.tuple_element(tuple, 0)?;
@@ -3781,8 +3780,7 @@ fn lower_case(
                                 ctx.builder.switch_to_block(pattern_block);
                             }
                             let nil_func = ctx.declare_runtime_nil(module)?;
-                            let nil_ref =
-                                module.declare_func_in_func(nil_func, &mut ctx.builder.func);
+                            let nil_ref = module.declare_func_in_func(nil_func, ctx.builder.func);
                             let nil_call = ctx.builder.ins().call(nil_ref, &[]);
                             let nil_value = ctx.builder.inst_results(nil_call)[0];
                             let is_nil = ctx.builder.ins().icmp(IntCC::Equal, value, nil_value);
@@ -4112,7 +4110,7 @@ fn lower_bin_op(
                 _ => unreachable!(),
             };
             let func_id = ctx.declare_runtime_float_from_f64(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[result]);
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
@@ -4140,7 +4138,7 @@ fn lower_bin_op(
             let left_value = lower_expression(module, left, ctx)?;
             let right_value = lower_expression(module, right, ctx)?;
             let func_id = ctx.declare_runtime_string_add(module)?;
-            let func_ref = module.declare_func_in_func(func_id, &mut ctx.builder.func);
+            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
             let call = ctx.builder.ins().call(func_ref, &[left_value, right_value]);
             let results = ctx.builder.inst_results(call);
             Ok(results[0])
@@ -4335,7 +4333,7 @@ pub(super) fn lower_record_constructor_function(
     let argc = builder.block_params(block)[2];
 
     let ctor_index = builder.ins().iconst(pointer_type, i64::from(variant_index));
-    let alloc_ref = module.declare_func_in_func(alloc_record, &mut builder.func);
+    let alloc_ref = module.declare_func_in_func(alloc_record, builder.func);
     let call = builder.ins().call(alloc_ref, &[ctor_index, args_ptr, argc]);
     let result = builder.inst_results(call)[0];
     let _ = builder.ins().return_(&[result]);
@@ -4393,7 +4391,7 @@ fn lower_function_literal(
         )?
     };
 
-    let func_ref = module.declare_func_in_func(closure_func_id, &mut ctx.builder.func);
+    let func_ref = module.declare_func_in_func(closure_func_id, ctx.builder.func);
     let code_ptr = ctx.builder.ins().func_addr(ctx.pointer_type, func_ref);
 
     let env_ptr = if captures.is_empty() {
@@ -4416,7 +4414,7 @@ fn lower_function_literal(
         .iconst(ctx.pointer_type, captures.len() as i64);
 
     let alloc_func = ctx.declare_runtime_alloc_closure(module)?;
-    let alloc_ref = module.declare_func_in_func(alloc_func, &mut ctx.builder.func);
+    let alloc_ref = module.declare_func_in_func(alloc_func, ctx.builder.func);
     let call = ctx
         .builder
         .ins()

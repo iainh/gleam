@@ -250,7 +250,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .iconst(self.pointer_type, arguments.len() as i64);
 
         let apply_func = self.declare_runtime_apply_closure(module)?;
-        let apply_ref = module.declare_func_in_func(apply_func, &mut self.builder.func);
+        let apply_ref = module.declare_func_in_func(apply_func, self.builder.func);
         let call = self
             .builder
             .ins()
@@ -279,7 +279,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             Constant::Tuple { elements, .. } => {
                 if elements.is_empty() {
                     let func_id = self.declare_runtime_nil(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     let call = self.builder.ins().call(func_ref, &[]);
                     let results = self.builder.inst_results(call);
                     return Ok(results[0]);
@@ -303,7 +303,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     .iconst(self.pointer_type, elements.len() as i64);
 
                 let func_id = self.declare_runtime_alloc_tuple(module)?;
-                let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[base_ptr, len_value]);
                 let results = self.builder.inst_results(call);
                 Ok(results[0])
@@ -316,14 +316,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
                 let mut current = {
                     let func_id = self.declare_runtime_nil(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     let call = self.builder.ins().call(func_ref, &[]);
                     self.builder.inst_results(call)[0]
                 };
 
                 if !values.is_empty() {
                     let func_id = self.declare_runtime_list_cons(module)?;
-                    let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                    let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                     for value in values.into_iter().rev() {
                         let call = self.builder.ins().call(func_ref, &[value, current]);
                         let results = self.builder.inst_results(call);
@@ -514,12 +514,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             variant_index,
             arity,
         )?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let code_ptr = self.builder.ins().func_addr(self.pointer_type, func_ref);
         let env_ptr = self.builder.ins().iconst(self.pointer_type, 0);
         let env_len = self.builder.ins().iconst(self.pointer_type, 0);
         let alloc_func = self.declare_runtime_alloc_closure(module)?;
-        let alloc_ref = module.declare_func_in_func(alloc_func, &mut self.builder.func);
+        let alloc_ref = module.declare_func_in_func(alloc_func, self.builder.func);
         let call = self
             .builder
             .ins()
@@ -564,12 +564,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         arity: usize,
     ) -> Result<Value> {
         let func_id = self.ensure_module_function(module, function_module, function_name, arity)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let code_ptr = self.builder.ins().func_addr(self.pointer_type, func_ref);
         let env_ptr = self.builder.ins().iconst(self.pointer_type, 0);
         let env_len = self.builder.ins().iconst(self.pointer_type, 0);
         let alloc_func = self.declare_runtime_alloc_closure(module)?;
-        let alloc_ref = module.declare_func_in_func(alloc_func, &mut self.builder.func);
+        let alloc_ref = module.declare_func_in_func(alloc_func, self.builder.func);
         let call = self
             .builder
             .ins()
@@ -594,7 +594,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             args.push(lower_expression(module, &argument.value, self)?);
         }
 
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &args);
         let results = self.builder.inst_results(call);
         Ok(Some(results[0]))
@@ -630,7 +630,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             id
         };
 
-        let gv = module.declare_data_in_func(data_id, &mut self.builder.func);
+        let gv = module.declare_data_in_func(data_id, self.builder.func);
         Ok(self.builder.ins().global_value(self.pointer_type, gv))
     }
 
@@ -672,7 +672,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             id
         };
 
-        let gv = module.declare_data_in_func(data_id, &mut self.builder.func);
+        let gv = module.declare_data_in_func(data_id, self.builder.func);
         Ok(self.builder.ins().global_value(self.pointer_type, gv))
     }
 
@@ -1209,7 +1209,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let func_id = self.declare_runtime_bit_array_bit_size(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
         let size_value = self.builder.inst_results(call)[0];
 
@@ -1256,7 +1256,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let func_id = self.declare_runtime_bit_array_to_int(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
         let tuple = self.builder.inst_results(call)[0];
 
@@ -1317,7 +1317,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let func_id = self.declare_runtime_bit_array_pop_byte(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
         let result = self.builder.inst_results(call)[0];
 
@@ -1375,7 +1375,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
 
         let func_id = self.declare_runtime_bit_array_split_bits(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject, size_value]);
         let result = self.builder.inst_results(call)[0];
 
@@ -1543,7 +1543,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         } else {
             self.declare_runtime_bool_false(module)?
         };
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[]);
         let results = self.builder.inst_results(call);
         Ok(results[0])
@@ -1587,7 +1587,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             id
         };
 
-        let gv = module.declare_data_in_func(data_id, &mut self.builder.func);
+        let gv = module.declare_data_in_func(data_id, self.builder.func);
         Ok(self.builder.ins().global_value(self.pointer_type, gv))
     }
 
@@ -1729,12 +1729,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let args = failure_args.to_vec();
 
         let eq_func = self.declare_runtime_string_equal(module)?;
-        let eq_ref = module.declare_func_in_func(eq_func, &mut self.builder.func);
+        let eq_ref = module.declare_func_in_func(eq_func, self.builder.func);
         let compare_call = self.builder.ins().call(eq_ref, &[subject, string_value]);
         let compare_value = self.builder.inst_results(compare_call)[0];
 
         let true_func = self.declare_runtime_bool_true(module)?;
-        let true_ref = module.declare_func_in_func(true_func, &mut self.builder.func);
+        let true_ref = module.declare_func_in_func(true_func, self.builder.func);
         let true_call = self.builder.ins().call(true_ref, &[]);
         let true_value = self.builder.inst_results(true_call)[0];
 
@@ -1781,7 +1781,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         }
         let failure_values = failure_args.to_vec();
         let func_id = self.declare_runtime_string_prefix_split(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject, prefix_value]);
         let result = self.builder.inst_results(call)[0];
 
@@ -1839,7 +1839,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.builder.switch_to_block(current_block);
         let args = failure_args.to_vec();
         let func_id = self.declare_runtime_bit_array_utf8_split(module)?;
-        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[subject]);
         let result = self.builder.inst_results(call)[0];
 
@@ -2484,7 +2484,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             }
 
             let nil_func = self.declare_runtime_nil(module)?;
-            let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
+            let nil_ref = module.declare_func_in_func(nil_func, self.builder.func);
             let nil_call = self.builder.ins().call(nil_ref, &[]);
             let nil_value = self.builder.inst_results(nil_call)[0];
 
@@ -2672,8 +2672,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         let expected_value =
                                             self.string_constant(module, expected.as_str())?;
                                         let func_id = self.declare_runtime_string_equal(module)?;
-                                        let func_ref = module
-                                            .declare_func_in_func(func_id, &mut self.builder.func);
+                                        let func_ref =
+                                            module.declare_func_in_func(func_id, self.builder.func);
                                         let call = self
                                             .builder
                                             .ins()
@@ -2707,7 +2707,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                     ListConstructorCondition::EmptyList => {
                                         let nil_func = self.declare_runtime_nil(module)?;
                                         let nil_ref = module
-                                            .declare_func_in_func(nil_func, &mut self.builder.func);
+                                            .declare_func_in_func(nil_func, self.builder.func);
                                         let nil_call = self.builder.ins().call(nil_ref, &[]);
                                         let nil_value = self.builder.inst_results(nil_call)[0];
                                         let is_nil =
@@ -2789,7 +2789,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             }
 
             let nil_func = self.declare_runtime_nil(module)?;
-            let nil_ref = module.declare_func_in_func(nil_func, &mut self.builder.func);
+            let nil_ref = module.declare_func_in_func(nil_func, self.builder.func);
             let nil_call = self.builder.ins().call(nil_ref, &[]);
             let nil_value = self.builder.inst_results(nil_call)[0];
 
@@ -3267,7 +3267,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                     ConstructorTupleCondition::String(expected) => {
                         let expected_value = self.string_constant(module, expected.as_str())?;
                         let func_id = self.declare_runtime_string_equal(module)?;
-                        let func_ref = module.declare_func_in_func(func_id, &mut self.builder.func);
+                        let func_ref = module.declare_func_in_func(func_id, self.builder.func);
                         let call = self.builder.ins().call(func_ref, &[value, expected_value]);
                         let result = self.builder.inst_results(call)[0];
                         let true_value = self.bool_constant(module, true)?;
