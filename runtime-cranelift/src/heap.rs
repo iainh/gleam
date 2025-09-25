@@ -213,7 +213,9 @@ impl Heap {
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }
 
-    pub fn alloc_closure(
+    /// # Safety
+    /// `env_ptr` must point to `env_len` consecutive, initialised `Value`s.
+    pub unsafe fn alloc_closure(
         &self,
         code_ptr: ClosureFn,
         env_ptr: *const Value,

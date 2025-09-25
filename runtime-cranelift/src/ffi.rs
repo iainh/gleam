@@ -97,11 +97,17 @@ pub extern "C" fn gleam_panic(message_raw: u64) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn gleam_alloc_closure(code_ptr: u64, env_ptr: *const u64, env_len: usize) -> u64 {
+/// # Safety
+/// `env_ptr` must reference `env_len` valid `Value` words captured by the closure.
+pub unsafe extern "C" fn gleam_alloc_closure(
+    code_ptr: u64,
+    env_ptr: *const u64,
+    env_len: usize,
+) -> u64 {
     let code = unsafe { std::mem::transmute::<usize, ClosureFn>(code_ptr as usize) };
     let env_values = env_ptr as *const Value;
     let heap = Heap::new();
-    let value = unwrap_allocation(heap.alloc_closure(code, env_values, env_len), "closure");
+    let value = unwrap_allocation(unsafe { heap.alloc_closure(code, env_values, env_len) }, "closure");
     value.to_raw()
 }
 
@@ -122,7 +128,9 @@ pub extern "C" fn gleam_apply_closure(closure_raw: u64, args_ptr: *const u64, ar
 }
 
 #[no_mangle]
-pub extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -> u64 {
+/// # Safety
+/// `values_ptr` must point to `len` valid `Value` words.
+pub unsafe extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -> u64 {
     gc::ensure_initialised();
     if len == 0 {
         return Value::nil().to_raw();
@@ -135,7 +143,9 @@ pub extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn gleam_alloc_record(
+/// # Safety
+/// `fields_ptr` must point to `len` valid `Value` words.
+pub unsafe extern "C" fn gleam_alloc_record(
     constructor_index: u64,
     fields_ptr: *const u64,
     len: usize,
@@ -158,7 +168,9 @@ pub extern "C" fn gleam_list_cons(head_raw: u64, tail_raw: u64) -> u64 {
 }
 
 #[no_mangle]
-pub extern "C" fn gleam_binary_from_slice(bytes_ptr: *const u8, len: usize) -> u64 {
+/// # Safety
+/// `bytes_ptr` must reference `len` initialised bytes.
+pub unsafe extern "C" fn gleam_binary_from_slice(bytes_ptr: *const u8, len: usize) -> u64 {
     gc::ensure_initialised();
     if len == 0 {
         return Value::nil().to_raw();
