@@ -6,6 +6,7 @@
 pub mod atom;
 pub mod binary;
 pub mod ffi;
+pub mod ffi_helpers;
 pub mod gc;
 pub mod header;
 pub mod heap;
@@ -23,3 +24,9 @@ pub use gc::{
 pub use header::{Header, Tag};
 pub use heap::{AllocationError, Heap};
 pub use value::Value;
+
+pub use ffi_helpers::{
+    decode_unsigned_int, encode_unsigned_int, list_from_values, list_to_values, resource_from_ptr,
+    resource_to_ptr, string_bytes, string_from_bytes, string_from_rust, string_to_rust,
+    ListDecodeError, ResourceDecodeError, StringDecodeError, UnsignedIntDecodeError,
+};

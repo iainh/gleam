@@ -176,7 +176,7 @@ pub struct PackageConfig {
     #[serde(default)]
     pub javascript: JavaScriptConfig,
     #[serde(default)]
-    pub native: NativeConfig,
+    pub cranelift: CraneliftConfig,
     #[serde(default = "erlang_target")]
     pub target: Target,
     #[serde(default)]
@@ -265,7 +265,7 @@ impl PackageConfig {
     }
 
     pub fn cranelift_linker_settings(&self, triple: Option<&str>) -> CraneliftLinkerSettings {
-        self.native.cranelift.linker_settings(triple)
+        self.cranelift.linker_settings(triple)
     }
 
     /// Determines whether the given module should be hidden in the docs or not
@@ -761,7 +761,7 @@ impl Default for PackageConfig {
             dependencies: Default::default(),
             erlang: Default::default(),
             javascript: Default::default(),
-            native: Default::default(),
+            cranelift: Default::default(),
             repository: Default::default(),
             dev_dependencies: Default::default(),
             licences: Default::default(),
@@ -788,12 +788,6 @@ pub struct JavaScriptConfig {
     pub runtime: Runtime,
     #[serde(default, rename = "deno")]
     pub deno: DenoConfig,
-}
-
-#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
-pub struct NativeConfig {
-    #[serde(default)]
-    pub cranelift: CraneliftConfig,
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]

@@ -2,6 +2,7 @@
 
 use std::{
     convert::TryFrom,
+    ffi::c_void,
     fs,
     io::{self, Write},
     mem,
@@ -11,18 +12,24 @@ use std::{
 };
 
 use crate::{
-    Header, Heap, Tag, Value,
     atom::AtomTable,
-    binary, gc,
+    binary,
+    ffi_helpers::{
+        decode_unsigned_int, encode_unsigned_int, list_from_values, list_to_values,
+        resource_from_ptr, resource_to_ptr, string_bytes, string_from_bytes, ListDecodeError,
+        ResourceDecodeError, StringDecodeError, UnsignedIntDecodeError,
+    },
+    gc,
     heap::AllocationError,
     layout::{
         Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ClosureFn, ConsCell,
         FloatBox, Map, MapEntry, MapTable,
     },
+    Header, Heap, Tag, Value,
 };
 
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::Engine;
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
@@ -2545,6 +2552,269 @@ pub extern "C" fn bitwise_shift_right(a_raw: u64, b_raw: u64) -> u64 {
 #[no_mangle]
 pub extern "C" fn identity(raw: u64) -> u64 {
     raw
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GleamFfiStatus {
+    Ok = 0,
+    NotAString = 1,
+    MissingData = 2,
+    InvalidUtf8 = 3,
+    NotAnInt = 4,
+    NegativeInt = 5,
+    InvalidArgument = 6,
+    NotAResource = 7,
+    NullPointer = 8,
+    NotAList = 9,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GleamFfiBytes {
+    pub status: GleamFfiStatus,
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GleamFfiValue {
+    pub status: GleamFfiStatus,
+    pub value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GleamFfiUint {
+    pub status: GleamFfiStatus,
+    pub value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GleamFfiResourcePtr {
+    pub status: GleamFfiStatus,
+    pub ptr: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GleamFfiValues {
+    pub status: GleamFfiStatus,
+    pub ptr: *mut u64,
+    pub len: usize,
+}
+
+fn string_error_to_status(error: StringDecodeError) -> GleamFfiStatus {
+    match error {
+        StringDecodeError::NotAString => GleamFfiStatus::NotAString,
+        StringDecodeError::MissingData => GleamFfiStatus::MissingData,
+        StringDecodeError::InvalidUtf8 => GleamFfiStatus::InvalidUtf8,
+    }
+}
+
+fn resource_error_to_status(error: ResourceDecodeError) -> GleamFfiStatus {
+    match error {
+        ResourceDecodeError::NotAResource => GleamFfiStatus::NotAResource,
+        ResourceDecodeError::NullPointer => GleamFfiStatus::NullPointer,
+    }
+}
+
+fn list_error_to_status(error: ListDecodeError) -> GleamFfiStatus {
+    match error {
+        ListDecodeError::NotAList => GleamFfiStatus::NotAList,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_string_to_utf8(value_raw: u64) -> GleamFfiBytes {
+    let value = Value::from_raw(value_raw);
+    match string_bytes(value) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                GleamFfiBytes {
+                    status: GleamFfiStatus::Ok,
+                    ptr: core::ptr::null_mut(),
+                    len: 0,
+                }
+            } else {
+                let mut boxed = bytes.into_boxed_slice();
+                let len = boxed.len();
+                let ptr = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                GleamFfiBytes {
+                    status: GleamFfiStatus::Ok,
+                    ptr,
+                    len,
+                }
+            }
+        }
+        Err(error) => GleamFfiBytes {
+            status: string_error_to_status(error),
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_bytes_free(bytes: GleamFfiBytes) {
+    if bytes.ptr.is_null() || bytes.len == 0 {
+        return;
+    }
+
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(bytes.ptr, bytes.len);
+        drop(Box::from_raw(slice));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_string_from_utf8(ptr: *const u8, len: usize) -> GleamFfiValue {
+    if len == 0 {
+        return GleamFfiValue {
+            status: GleamFfiStatus::Ok,
+            value: Value::nil().to_raw(),
+        };
+    }
+
+    if ptr.is_null() {
+        return GleamFfiValue {
+            status: GleamFfiStatus::InvalidArgument,
+            value: Value::nil().to_raw(),
+        };
+    }
+
+    let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+    let value = string_from_bytes(bytes);
+    GleamFfiValue {
+        status: GleamFfiStatus::Ok,
+        value: value.to_raw(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_encode_uint(value: u64) -> u64 {
+    encode_unsigned_int(value).to_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_decode_uint(value_raw: u64) -> GleamFfiUint {
+    let value = Value::from_raw(value_raw);
+    match decode_unsigned_int(value) {
+        Ok(result) => GleamFfiUint {
+            status: GleamFfiStatus::Ok,
+            value: result,
+        },
+        Err(UnsignedIntDecodeError::NotAnInt) => GleamFfiUint {
+            status: GleamFfiStatus::NotAnInt,
+            value: 0,
+        },
+        Err(UnsignedIntDecodeError::Negative) => GleamFfiUint {
+            status: GleamFfiStatus::NegativeInt,
+            value: 0,
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_resource_from_ptr(ptr: *mut c_void) -> GleamFfiValue {
+    if ptr.is_null() {
+        return GleamFfiValue {
+            status: GleamFfiStatus::InvalidArgument,
+            value: Value::nil().to_raw(),
+        };
+    }
+
+    let value = resource_from_ptr(ptr);
+    GleamFfiValue {
+        status: GleamFfiStatus::Ok,
+        value: value.to_raw(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_resource_to_ptr(value_raw: u64) -> GleamFfiResourcePtr {
+    let value = Value::from_raw(value_raw);
+    match resource_to_ptr(value) {
+        Ok(pointer) => GleamFfiResourcePtr {
+            status: GleamFfiStatus::Ok,
+            ptr: pointer,
+        },
+        Err(error) => GleamFfiResourcePtr {
+            status: resource_error_to_status(error),
+            ptr: core::ptr::null_mut(),
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_list_from_array(ptr: *const u64, len: usize) -> GleamFfiValue {
+    if len == 0 {
+        return GleamFfiValue {
+            status: GleamFfiStatus::Ok,
+            value: Value::nil().to_raw(),
+        };
+    }
+
+    if ptr.is_null() {
+        return GleamFfiValue {
+            status: GleamFfiStatus::InvalidArgument,
+            value: Value::nil().to_raw(),
+        };
+    }
+
+    let slice = unsafe { slice::from_raw_parts(ptr, len) };
+    let values: Vec<Value> = slice.iter().copied().map(Value::from_raw).collect();
+    let list = list_from_values(&values);
+    GleamFfiValue {
+        status: GleamFfiStatus::Ok,
+        value: list.to_raw(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_list_to_array(list_raw: u64) -> GleamFfiValues {
+    let value = Value::from_raw(list_raw);
+    match list_to_values(value) {
+        Ok(values) => {
+            if values.is_empty() {
+                GleamFfiValues {
+                    status: GleamFfiStatus::Ok,
+                    ptr: core::ptr::null_mut(),
+                    len: 0,
+                }
+            } else {
+                let mut buffer: Vec<u64> = values.into_iter().map(Value::to_raw).collect();
+                let len = buffer.len();
+                let ptr = buffer.as_mut_ptr();
+                std::mem::forget(buffer);
+                GleamFfiValues {
+                    status: GleamFfiStatus::Ok,
+                    ptr,
+                    len,
+                }
+            }
+        }
+        Err(error) => GleamFfiValues {
+            status: list_error_to_status(error),
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        },
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gleam_ffi_values_free(values: GleamFfiValues) {
+    if values.ptr.is_null() || values.len == 0 {
+        return;
+    }
+
+    unsafe {
+        let slice = std::ptr::slice_from_raw_parts_mut(values.ptr, values.len);
+        drop(Box::from_raw(slice));
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-name = "facil_io_demo"
+name = "facil_io"
 version = "0.1.0"
 description = "Example Gleam project that wraps a facil.io HTTP server"
 target = "native"
@@ -9,7 +9,7 @@ gleam_stdlib = { path = "../../../gleam-stdlib" }
 [dev-dependencies]
 
 [cranelift]
-linker-args = ["native/build/libfacil_io_demo.a"]
+search-paths = ["native/build"]
 
 [cranelift.targets."aarch64-apple-darwin"]
 linker-args = ["-framework", "Security"]

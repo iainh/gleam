@@ -1,6 +1,7 @@
 //! Safe allocation facade that constructs runtime values using the GC.
 
 use std::alloc::{Layout, LayoutError};
+use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 
@@ -8,7 +9,7 @@ use crate::gc;
 use crate::header::{Header, Tag};
 use crate::layout::{
     Binary, BinaryData, BinarySlice, BitArray, Closure, ClosureFn, ConsCell, FloatBox, Map,
-    MapTable, Record,
+    MapTable, Record, ResourceHandle,
 };
 use crate::value::Value;
 
@@ -213,6 +214,15 @@ impl Heap {
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }
 
+    pub fn alloc_resource(&self, pointer: *mut c_void) -> Result<Value, AllocationError> {
+        let ptr = self.allocate_box(ResourceHandle::HEADER)?;
+        unsafe {
+            let handle = ptr.cast::<ResourceHandle>().as_ptr();
+            (*handle).pointer = pointer;
+        }
+        Ok(Value::from_raw(ptr.as_ptr() as u64))
+    }
+
     /// # Safety
     /// `env_ptr` must point to `env_len` consecutive, initialised `Value`s.
     pub unsafe fn alloc_closure(
@@ -255,5 +265,14 @@ mod tests {
         let data = heap.alloc_binary_data(4).unwrap();
         let bytes = unsafe { std::slice::from_raw_parts((*data.as_ptr()).as_ptr(), 4) };
         assert_eq!(bytes, &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn alloc_resource_stores_pointer() {
+        let heap = Heap::new();
+        let pointer = 0x1234 as *mut core::ffi::c_void;
+        let value = heap.alloc_resource(pointer).unwrap();
+        let handle = unsafe { value.as_boxed::<ResourceHandle>().unwrap().as_ref() };
+        assert_eq!(handle.pointer, pointer);
     }
 }

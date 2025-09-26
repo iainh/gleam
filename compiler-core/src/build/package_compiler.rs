@@ -583,6 +583,11 @@ where
         linker_settings: &CraneliftLinkerSettings,
         external_libraries: &[EcoString],
     ) -> Result<(), Error> {
+        tracing::debug!(
+            search_paths = ?linker_settings.search_paths,
+            linker_args = ?linker_settings.linker_args,
+            "native_linker_settings",
+        );
         if objects.is_empty() {
             tracing::debug!("no_objects_to_link");
             return Ok(());
@@ -664,6 +669,12 @@ where
         args.push(output.as_str().to_string());
 
         let linker_program = linker_settings.linker.as_deref().unwrap_or("cc");
+        let command_for_display = args.join(" ");
+        tracing::debug!(
+            program = %linker_program,
+            command = %command_for_display,
+            "invoking_native_linker",
+        );
         let output = std::process::Command::new(linker_program)
             .args(&args)
             .output()
@@ -675,9 +686,10 @@ where
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(Error::NativeCodegen {
                 message: format!(
-                    "linker failed: {}\ncommand: cc {}",
+                    "linker failed: {}\ncommand: {} {}",
                     stderr.trim(),
-                    args.join(" ")
+                    linker_program,
+                    command_for_display
                 ),
             });
         }
