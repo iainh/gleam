@@ -175,6 +175,8 @@ pub struct PackageConfig {
     pub erlang: ErlangConfig,
     #[serde(default)]
     pub javascript: JavaScriptConfig,
+    #[serde(default)]
+    pub native: NativeConfig,
     #[serde(default = "erlang_target")]
     pub target: Target,
     #[serde(default)]
@@ -260,6 +262,10 @@ impl PackageConfig {
                 Ok(fresh_and_locked)
             }
         }
+    }
+
+    pub fn cranelift_linker_settings(&self, triple: Option<&str>) -> CraneliftLinkerSettings {
+        self.native.cranelift.linker_settings(triple)
     }
 
     /// Determines whether the given module should be hidden in the docs or not
@@ -695,6 +701,7 @@ impl Default for PackageConfig {
             dependencies: Default::default(),
             erlang: Default::default(),
             javascript: Default::default(),
+            native: Default::default(),
             repository: Default::default(),
             dev_dependencies: Default::default(),
             licences: Default::default(),
@@ -721,6 +728,65 @@ pub struct JavaScriptConfig {
     pub runtime: Runtime,
     #[serde(default, rename = "deno")]
     pub deno: DenoConfig,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
+pub struct NativeConfig {
+    #[serde(default)]
+    pub cranelift: CraneliftConfig,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
+pub struct CraneliftConfig {
+    #[serde(default)]
+    pub linker: Option<EcoString>,
+    #[serde(default, rename = "linker-args")]
+    pub linker_args: Vec<EcoString>,
+    #[serde(default, rename = "search-paths")]
+    pub search_paths: Vec<EcoString>,
+    #[serde(default)]
+    pub targets: HashMap<EcoString, CraneliftTargetConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
+pub struct CraneliftTargetConfig {
+    #[serde(default)]
+    pub linker: Option<EcoString>,
+    #[serde(default, rename = "linker-args")]
+    pub linker_args: Vec<EcoString>,
+    #[serde(default, rename = "search-paths")]
+    pub search_paths: Vec<EcoString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CraneliftLinkerSettings {
+    pub linker: Option<EcoString>,
+    pub linker_args: Vec<EcoString>,
+    pub search_paths: Vec<EcoString>,
+}
+
+impl CraneliftConfig {
+    pub fn linker_settings(&self, triple: Option<&str>) -> CraneliftLinkerSettings {
+        let mut linker = self.linker.clone();
+        let mut linker_args = self.linker_args.clone();
+        let mut search_paths = self.search_paths.clone();
+
+        if let Some(triple) = triple {
+            if let Some(overrides) = self.targets.get(triple) {
+                if let Some(linker_override) = &overrides.linker {
+                    linker = Some(linker_override.clone());
+                }
+                linker_args.extend(overrides.linker_args.clone());
+                search_paths.extend(overrides.search_paths.clone());
+            }
+        }
+
+        CraneliftLinkerSettings {
+            linker,
+            linker_args,
+            search_paths,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq, Clone)]

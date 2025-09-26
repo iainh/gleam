@@ -15,7 +15,7 @@ use crate::{
         package_loader::{CodegenRequired, PackageLoader, StaleTracker},
     },
     codegen::{Erlang, ErlangApp, JavaScript, TypeScriptDeclarations},
-    config::PackageConfig,
+    config::{CraneliftLinkerSettings, PackageConfig},
     dep_tree, error,
     io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter, Stdio},
     metadata::ModuleEncoder,
@@ -27,6 +27,7 @@ use crate::{
 use askama::Template;
 use cranelift_codegen::{ir::InstBuilder, settings::Configurable};
 use cranelift_module::Module as _;
+use cranelift_native;
 use ecow::EcoString;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -399,6 +400,11 @@ where
             self.io.mkdir(&artefact_dir)?;
         }
 
+        let triple = cranelift_native::builder()
+            .map(|builder| builder.triple().to_string())
+            .ok();
+        let linker_settings = self.config.cranelift_linker_settings(triple.as_deref());
+
         let preferred_test_module = format!("{}_test", self.config.name.as_str());
 
         let app_entry_index = modules
@@ -529,6 +535,7 @@ where
                 &artefact_dir,
                 &app_link_objects,
                 self.config.name.as_str(),
+                &linker_settings,
                 &external_modules,
             )?;
         } else {
@@ -557,6 +564,7 @@ where
                     &artefact_dir,
                     &test_link_objects,
                     &test_output,
+                    &linker_settings,
                     &external_modules,
                 )?;
             }
@@ -572,6 +580,7 @@ where
         artefact_dir: &Utf8Path,
         objects: &[Utf8PathBuf],
         output_basename: &str,
+        linker_settings: &CraneliftLinkerSettings,
         external_libraries: &[EcoString],
     ) -> Result<(), Error> {
         if objects.is_empty() {
@@ -593,6 +602,13 @@ where
 
         let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 12);
         let mut seen = HashSet::new();
+
+        for search_path in &linker_settings.search_paths {
+            let arg = format!("-L{}", search_path);
+            if seen.insert(arg.clone()) {
+                args.push(arg);
+            }
+        }
 
         for path in objects {
             if seen.insert(path.as_str().to_string()) {
@@ -626,6 +642,13 @@ where
                 args.push(argument);
             }
         }
+
+        args.extend(
+            linker_settings
+                .linker_args
+                .iter()
+                .map(|arg| arg.to_string()),
+        );
         args.push("-lpthread".into());
         #[cfg(target_os = "linux")]
         {
@@ -634,7 +657,8 @@ where
         args.push("-o".into());
         args.push(output.as_str().to_string());
 
-        let output = std::process::Command::new("cc")
+        let linker_program = linker_settings.linker.as_deref().unwrap_or("cc");
+        let output = std::process::Command::new(linker_program)
             .args(&args)
             .output()
             .map_err(|err| Error::NativeCodegen {
