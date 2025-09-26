@@ -604,7 +604,13 @@ where
         let mut seen = HashSet::new();
 
         for search_path in &linker_settings.search_paths {
-            let arg = format!("-L{}", search_path);
+            let path = Utf8Path::new(search_path);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.root.join(path)
+            };
+            let arg = format!("-L{}", resolved);
             if seen.insert(arg.clone()) {
                 args.push(arg);
             }

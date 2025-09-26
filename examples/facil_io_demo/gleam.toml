@@ -9,9 +9,7 @@ gleam_stdlib = { path = "../../../gleam-stdlib" }
 [dev-dependencies]
 
 [cranelift]
-search-paths = ["native/build"]
-linker-args = ["-lfacil_io_demo"]
+linker-args = ["native/build/libfacil_io_demo.a"]
 
 [cranelift.targets."aarch64-apple-darwin"]
 linker-args = ["-framework", "Security"]
-

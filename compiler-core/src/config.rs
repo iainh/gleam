@@ -385,7 +385,9 @@ fn locked_no_manifest() {
 
 #[test]
 fn cranelift_linker_settings_merge() {
-    let toml = r#"
+    let system = std::env::consts::OS;
+    let toml = format!(
+        r#"
 name = "link_demo"
 version = "1.0.0"
 
@@ -394,21 +396,32 @@ linker = "clang"
 linker-args = ["-Wl,-dead_strip"]
 search-paths = ["native/lib"]
 
+[cranelift.systems."{system}"]
+linker-args = ["-Wextra-system"]
+search-paths = ["system/lib"]
+
 [cranelift.targets."aarch64-apple-darwin"]
 linker = "zig clang"
 linker-args = ["-Wl,-rpath,@loader_path/../lib"]
 search-paths = ["native/macos"]
-"#;
+"#
+    );
 
-    let config = deserialise_config("gleam.toml", toml.into()).expect("config should parse");
+    let config = deserialise_config("gleam.toml", toml).expect("config should parse");
 
     let default = config.cranelift_linker_settings(None);
     assert_eq!(default.linker.as_deref(), Some("clang"));
     assert_eq!(
         default.linker_args,
-        vec![EcoString::from("-Wl,-dead_strip")]
+        vec![
+            EcoString::from("-Wl,-dead_strip"),
+            EcoString::from("-Wextra-system"),
+        ]
     );
-    assert_eq!(default.search_paths, vec![EcoString::from("native/lib")]);
+    assert_eq!(
+        default.search_paths,
+        vec![EcoString::from("native/lib"), EcoString::from("system/lib")]
+    );
 
     let darwin = config.cranelift_linker_settings(Some("aarch64-apple-darwin"));
     assert_eq!(darwin.linker.as_deref(), Some("zig clang"));
@@ -416,6 +429,7 @@ search-paths = ["native/macos"]
         darwin.linker_args,
         vec![
             EcoString::from("-Wl,-dead_strip"),
+            EcoString::from("-Wextra-system"),
             EcoString::from("-Wl,-rpath,@loader_path/../lib")
         ]
     );
@@ -423,6 +437,7 @@ search-paths = ["native/macos"]
         darwin.search_paths,
         vec![
             EcoString::from("native/lib"),
+            EcoString::from("system/lib"),
             EcoString::from("native/macos")
         ]
     );
@@ -790,7 +805,17 @@ pub struct CraneliftConfig {
     #[serde(default, rename = "search-paths")]
     pub search_paths: Vec<EcoString>,
     #[serde(default)]
+    pub systems: HashMap<EcoString, CraneliftSystemConfig>,
+    #[serde(default)]
     pub targets: HashMap<EcoString, CraneliftTargetConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
+pub struct CraneliftSystemConfig {
+    #[serde(default, rename = "linker-args")]
+    pub linker_args: Vec<EcoString>,
+    #[serde(default, rename = "search-paths")]
+    pub search_paths: Vec<EcoString>,
 }
 
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq, Clone, Default)]
@@ -815,6 +840,12 @@ impl CraneliftConfig {
         let mut linker = self.linker.clone();
         let mut linker_args = self.linker_args.clone();
         let mut search_paths = self.search_paths.clone();
+
+        let current_system = std::env::consts::OS;
+        if let Some(system) = self.systems.get(current_system) {
+            linker_args.extend(system.linker_args.clone());
+            search_paths.extend(system.search_paths.clone());
+        }
 
         if let Some(triple) = triple {
             if let Some(overrides) = self.targets.get(triple) {
