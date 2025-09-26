@@ -98,3 +98,27 @@ When a new intrinsic or standard library feature needs runtime support:
 
 The runtime is still evolving along with the native backend. Expect some of the
 APIs to change until the Cranelift target stabilises.
+
+## Linking External Libraries
+
+When a module uses `@external(cranelift, "lib", "symbol")`, the compiler now
+expects to find a native library called `lib` (or a static archive/path) at link
+time. You can configure additional linker arguments and search paths directly in
+`gleam.toml`:
+
+```toml
+[cranelift]
+linker = "clang"
+linker-args = ["-Wl,-rpath,$ORIGIN/lib"]
+search-paths = ["native/lib"]
+
+[cranelift.targets."aarch64-apple-darwin"]
+linker-args = ["-framework", "Security"]
+search-paths = ["native/macos"]
+```
+
+The top-level `[cranelift]` table sets defaults for every Cranelift build. Use
+`[cranelift.targets."<triple>"]` to extend or override those settings for a
+particular platform triple. The collected settings are applied after Gleam’s
+automatic `-l<library>` flags, so you can point the linker at custom locations
+or pass through additional options as required.

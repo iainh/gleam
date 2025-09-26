@@ -384,6 +384,51 @@ fn locked_no_manifest() {
 }
 
 #[test]
+fn cranelift_linker_settings_merge() {
+    let toml = r#"
+name = "link_demo"
+version = "1.0.0"
+
+[cranelift]
+linker = "clang"
+linker-args = ["-Wl,-dead_strip"]
+search-paths = ["native/lib"]
+
+[cranelift.targets."aarch64-apple-darwin"]
+linker = "zig clang"
+linker-args = ["-Wl,-rpath,@loader_path/../lib"]
+search-paths = ["native/macos"]
+"#;
+
+    let config = deserialise_config("gleam.toml", toml.into()).expect("config should parse");
+
+    let default = config.cranelift_linker_settings(None);
+    assert_eq!(default.linker.as_deref(), Some("clang"));
+    assert_eq!(
+        default.linker_args,
+        vec![EcoString::from("-Wl,-dead_strip")]
+    );
+    assert_eq!(default.search_paths, vec![EcoString::from("native/lib")]);
+
+    let darwin = config.cranelift_linker_settings(Some("aarch64-apple-darwin"));
+    assert_eq!(darwin.linker.as_deref(), Some("zig clang"));
+    assert_eq!(
+        darwin.linker_args,
+        vec![
+            EcoString::from("-Wl,-dead_strip"),
+            EcoString::from("-Wl,-rpath,@loader_path/../lib")
+        ]
+    );
+    assert_eq!(
+        darwin.search_paths,
+        vec![
+            EcoString::from("native/lib"),
+            EcoString::from("native/macos")
+        ]
+    );
+}
+
+#[test]
 fn locked_no_changes() {
     let mut config = PackageConfig::default();
     config.dependencies = [
