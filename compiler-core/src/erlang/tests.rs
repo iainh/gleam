@@ -123,6 +123,7 @@ pub fn compile_test_project(
         ast,
         extra: parsed.extra,
         dependencies: vec![],
+        cranelift_externals: vec![],
     };
     let root = Utf8Path::new("/root");
     built_module.attach_doc_and_module_comments();

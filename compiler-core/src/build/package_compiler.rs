@@ -9,6 +9,7 @@ use crate::{
     ast::{SrcSpan, TypedModule, UntypedModule},
     build::{
         Mode, Module, Origin, Outcome, Package, SourceFingerprint, Target,
+        collect_cranelift_external_modules,
         elixir_libraries::ElixirLibraries,
         native_file_copier::NativeFileCopier,
         package_loader::{CodegenRequired, PackageLoader, StaleTracker},
@@ -28,7 +29,7 @@ use cranelift_codegen::{ir::InstBuilder, settings::Configurable};
 use cranelift_module::Module as _;
 use ecow::EcoString;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::{env, fmt::write, fs, path::Path, time::SystemTime};
 use vec1::Vec1;
 
@@ -451,6 +452,7 @@ where
         let mut all_objects = Vec::new();
         let mut main_symbols: Vec<Option<String>> = Vec::with_capacity(modules.len());
         let mut compiled_any = false;
+        let mut external_modules = BTreeSet::new();
 
         for (index, module) in modules.iter().enumerate() {
             let object_name = format!("{}.o", module.name.replace("/", "__"));
@@ -465,6 +467,10 @@ where
             let main_symbol = cranelift::emit_object(&self.io, module_config, &output_path)?;
             main_symbols.push(main_symbol);
             compiled_any = true;
+
+            for lib in &module.cranelift_externals {
+                let _ = external_modules.insert(lib.clone());
+            }
 
             if module.origin != Origin::Test {
                 app_objects.push(output_path.clone());
@@ -500,6 +506,8 @@ where
                 .collect();
         }
 
+        let external_modules: Vec<EcoString> = external_modules.into_iter().collect();
+
         let _ = self.create_cranelift_archive(&artefact_dir, &all_objects)?;
 
         let app_entry_symbol = app_entry_index
@@ -521,6 +529,7 @@ where
                 &artefact_dir,
                 &app_link_objects,
                 self.config.name.as_str(),
+                &external_modules,
             )?;
         } else {
             tracing::debug!(reason = "no app entrypoint", "native_link_skipped_app");
@@ -544,7 +553,12 @@ where
 
             if !test_link_objects.is_empty() {
                 let test_output = format!("{}_test", self.config.name.as_str());
-                self.link_cranelift_objects(&artefact_dir, &test_link_objects, &test_output)?;
+                self.link_cranelift_objects(
+                    &artefact_dir,
+                    &test_link_objects,
+                    &test_output,
+                    &external_modules,
+                )?;
             }
         } else if !test_objects.is_empty() {
             tracing::debug!(reason = "no test entrypoint", "native_link_skipped_tests");
@@ -558,6 +572,7 @@ where
         artefact_dir: &Utf8Path,
         objects: &[Utf8PathBuf],
         output_basename: &str,
+        external_libraries: &[EcoString],
     ) -> Result<(), Error> {
         if objects.is_empty() {
             tracing::debug!("no_objects_to_link");
@@ -594,6 +609,22 @@ where
         args.push(runtime.runtime_lib.as_str().to_string());
         for lib in &runtime.additional_libs {
             args.push(lib.as_str().to_string());
+        }
+
+        for library in external_libraries {
+            if library.as_str() == "runtime_cranelift" {
+                continue;
+            }
+
+            let argument = if library.ends_with(".a") || library.contains('/') {
+                library.as_str().to_string()
+            } else {
+                format!("-l{}", library)
+            };
+
+            if seen.insert(argument.clone()) {
+                args.push(argument);
+            }
         }
         args.push("-lpthread".into());
         #[cfg(target_os = "linux")]
@@ -1118,6 +1149,7 @@ fn analyse(
                 // Module has compiled successfully. Make sure it isn't marked as incomplete.
                 let _ = incomplete_modules.remove(&name.clone());
 
+                let cranelift_externals = collect_cranelift_external_modules(&ast);
                 let mut module = Module {
                     dependencies,
                     origin,
@@ -1127,6 +1159,7 @@ fn analyse(
                     code,
                     ast,
                     input_path: path,
+                    cranelift_externals,
                 };
                 module.attach_doc_and_module_comments();
 
@@ -1147,6 +1180,7 @@ fn analyse(
                 };
                 // Mark as incomplete so that this module isn't reloaded from cache.
                 let _ = incomplete_modules.insert(name.clone());
+                let cranelift_externals = collect_cranelift_external_modules(&ast);
                 // Register the partially type checked module data so that it can be
                 // used in the language server.
                 modules.push(Module {
@@ -1158,6 +1192,7 @@ fn analyse(
                     code,
                     ast,
                     input_path: path,
+                    cranelift_externals,
                 });
                 // WARNING: This cannot be used for code generation as the code has errors.
                 return Outcome::PartialFailure(modules, error);

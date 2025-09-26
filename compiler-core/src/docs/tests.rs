@@ -163,6 +163,7 @@ fn compile_documentation(
         ast: module,
         extra: Default::default(),
         dependencies: Default::default(),
+        cranelift_externals: vec![],
     };
 
     let source_links = SourceLinker::new(&paths, &config, &build_module);

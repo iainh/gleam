@@ -18,13 +18,13 @@ pub use self::project_compiler::{Built, Options, ProjectCompiler};
 pub use self::telemetry::{NullTelemetry, Telemetry};
 
 use crate::ast::{
-    self, CallArg, CustomType, DefinitionLocation, TypeAst, TypedArg, TypedConstant,
+    self, CallArg, CustomType, Definition, DefinitionLocation, TypeAst, TypedArg, TypedConstant,
     TypedDefinition, TypedExpr, TypedFunction, TypedPattern, TypedRecordConstructor,
     TypedStatement,
 };
 use crate::type_::{Type, TypedCallArg};
 use crate::{
-    ast::{Definition, SrcSpan, TypedModule},
+    ast::{SrcSpan, TypedModule},
     config::{self, PackageConfig},
     erlang,
     error::{Error, FileIoAction, FileKind},
@@ -39,7 +39,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{collections::HashMap, ffi::OsString, fs::DirEntry, iter::Peekable, process};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ffi::OsString,
+    fs::DirEntry,
+    iter::Peekable,
+    process,
+};
 use strum::{Display, EnumIter, EnumString, EnumVariantNames, VariantNames};
 use vec1::Vec1;
 
@@ -275,6 +281,7 @@ pub struct Module {
     pub ast: TypedModule,
     pub extra: ModuleExtra,
     pub dependencies: Vec<(EcoString, SrcSpan)>,
+    pub cranelift_externals: Vec<EcoString>,
 }
 
 impl Module {
@@ -355,6 +362,22 @@ impl Module {
 
 pub fn module_erlang_name(gleam_name: &EcoString) -> EcoString {
     gleam_name.replace("/", "@")
+}
+
+pub fn collect_cranelift_external_modules(module: &TypedModule) -> Vec<EcoString> {
+    let mut externals = BTreeSet::new();
+
+    for definition in &module.definitions {
+        if let Definition::Function(function) = definition {
+            if let Some((external_module, _, _)) = &function.external_cranelift {
+                if !external_module.is_empty() {
+                    let _ = externals.insert(external_module.clone());
+                }
+            }
+        }
+    }
+
+    externals.into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]

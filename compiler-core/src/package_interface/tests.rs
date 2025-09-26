@@ -134,6 +134,7 @@ pub fn compile_package(
         ast,
         extra: parsed.extra,
         dependencies: vec![],
+        cranelift_externals: vec![],
     };
     module.attach_doc_and_module_comments();
     let package: Package = package_from_module(module);
