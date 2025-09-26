@@ -27,12 +27,162 @@ use super::patterns::{
     ConstructorTupleCondition, ConstructorTupleInfo, ListConstructorCondition, ListConstructorInfo,
     ListHeadMatch, ListTupleInfo, NestedConstructorInfo, collect_list_pattern_info,
 };
-use super::{BindingSource, FunctionIdMap, ModuleConfig};
+use super::{BindingSource, ExternalFunctionKey, FunctionIdMap, ModuleConfig};
+
+fn ensure_external_cranelift_import(
+    module: &mut ObjectModule,
+    pointer_type: ir::Type,
+    arity: usize,
+    external_module: &EcoString,
+    external_symbol: &EcoString,
+    cache: &mut HashMap<ExternalFunctionKey, FuncId>,
+) -> Result<FuncId> {
+    let key = (external_module.clone(), external_symbol.clone(), arity);
+    if let Some(func_id) = cache.get(&key) {
+        return Ok(*func_id);
+    }
+
+    let mut signature = module.make_signature();
+    for _ in 0..arity {
+        signature.params.push(ir::AbiParam::new(pointer_type));
+    }
+    signature.returns.push(ir::AbiParam::new(pointer_type));
+
+    let func_id = module
+        .declare_function(external_symbol.as_str(), Linkage::Import, &signature)
+        .map_err(|err| crate::Error::NativeCodegen {
+            message: format!(
+                "failed to declare Cranelift external `{external_module}:{external_symbol}`: {err}"
+            ),
+        })?;
+
+    let _ = cache.insert(key, func_id);
+    Ok(func_id)
+}
+
+fn lower_external_cranelift_stub(
+    module: &mut ObjectModule,
+    module_name: &EcoString,
+    function: &Function<Arc<Type>, TypedExpr>,
+    func_id: FuncId,
+    pointer_type: ir::Type,
+    external_module: &EcoString,
+    external_symbol: &EcoString,
+    external_imports: &mut HashMap<ExternalFunctionKey, FuncId>,
+) -> Result<()> {
+    let arity = function.arguments.len();
+
+    let mut ctx = module.make_context();
+    for _ in 0..arity {
+        ctx.func
+            .signature
+            .params
+            .push(ir::AbiParam::new(pointer_type));
+    }
+    ctx.func
+        .signature
+        .returns
+        .push(ir::AbiParam::new(pointer_type));
+
+    let mut func_ctx = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let block = builder.create_block();
+    builder.append_block_params_for_function_params(block);
+    builder.switch_to_block(block);
+    builder.seal_block(block);
+
+    let params: Vec<Value> = builder.block_params(block).to_vec();
+
+    let external_id = ensure_external_cranelift_import(
+        module,
+        pointer_type,
+        arity,
+        external_module,
+        external_symbol,
+        external_imports,
+    )?;
+    let external_ref = module.declare_func_in_func(external_id, builder.func);
+    let call = builder.ins().call(external_ref, &params);
+    let results = builder.inst_results(call);
+    let result = results
+        .first()
+        .copied()
+        .ok_or_else(|| crate::Error::NativeCodegen {
+            message: format!(
+                "Cranelift external `{external_module}:{external_symbol}` returned no value"
+            ),
+        })?;
+
+    let _ = builder.ins().return_(&[result]);
+    builder.finalize();
+
+    if let Err(err) = module.define_function(func_id, &mut ctx) {
+        let clif = format!("{}", ctx.func.display());
+        let func_name = function
+            .name
+            .as_ref()
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("<anonymous>");
+        return Err(crate::Error::NativeCodegen {
+            message: format!(
+                "error lowering {module_name}.{func_name} (external stub): {err} ({err:?})\n{clif}"
+            ),
+        });
+    }
+
+    module.clear_context(&mut ctx);
+    Ok(())
+}
 
 struct OrderedConstructorArg<'a> {
     call_arg: &'a CallArg<Pattern<Arc<Type>>>,
     aliases: Vec<EcoString>,
     pattern: &'a Pattern<Arc<Type>>,
+}
+
+struct ModuleFunctionTarget<'a> {
+    module: &'a EcoString,
+    arity: usize,
+    external_cranelift: Option<&'a (EcoString, EcoString)>,
+}
+
+fn module_function_target<'a>(fun: &'a TypedExpr) -> Option<ModuleFunctionTarget<'a>> {
+    match fun {
+        TypedExpr::ModuleSelect {
+            constructor:
+                ModuleValueConstructor::Fn {
+                    module,
+                    external_cranelift,
+                    ..
+                },
+            type_,
+            ..
+        } => Some(ModuleFunctionTarget {
+            module,
+            arity: type_.fn_arity()?,
+            external_cranelift: external_cranelift.as_ref(),
+        }),
+
+        TypedExpr::Var { constructor, .. } => {
+            if let ValueConstructorVariant::ModuleFn {
+                module,
+                arity,
+                external_cranelift,
+                ..
+            } = &constructor.variant
+            {
+                Some(ModuleFunctionTarget {
+                    module,
+                    arity: *arity,
+                    external_cranelift: external_cranelift.as_ref(),
+                })
+            } else {
+                None
+            }
+        }
+
+        _ => None,
+    }
 }
 
 /// Orders constructor arguments to match the runtime layout, expanding field
@@ -279,6 +429,7 @@ pub(crate) fn lower_module_functions(
     let mut float_constants = HashMap::new();
     let mut record_constructors = HashMap::new();
     let mut module_functions = HashMap::new();
+    let mut external_function_imports = HashMap::new();
     let mut closure_counter = 0usize;
 
     for function in functions {
@@ -302,6 +453,7 @@ pub(crate) fn lower_module_functions(
             &mut float_constants,
             &mut record_constructors,
             &mut module_functions,
+            &mut external_function_imports,
             &mut closure_counter,
         )?;
     }
@@ -322,10 +474,26 @@ fn lower_function(
     float_constants: &mut HashMap<EcoString, DataId>,
     record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
     module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
+    external_imports: &mut HashMap<ExternalFunctionKey, FuncId>,
     closure_counter: &mut usize,
 ) -> Result<()> {
     let pointer_type = module.target_config().pointer_type();
     let pointer_bytes = module.target_config().pointer_bytes();
+
+    if function.body.is_empty() {
+        if let Some((external_module, external_symbol, _)) = &function.external_cranelift {
+            return lower_external_cranelift_stub(
+                module,
+                module_name,
+                function,
+                func_id,
+                pointer_type,
+                external_module,
+                external_symbol,
+                external_imports,
+            );
+        }
+    }
 
     let mut ctx = module.make_context();
     for _ in &function.arguments {
@@ -359,6 +527,7 @@ fn lower_function(
             float_constants,
             record_constructors,
             module_functions,
+            external_imports,
             closure_counter,
         );
         lowering.mark_sealed(block);
@@ -2274,6 +2443,10 @@ fn lower_call(
         return Ok(value);
     }
 
+    if let Some(value) = try_lower_external_function_call(module, fun, arguments, ctx)? {
+        return Ok(value);
+    }
+
     let fun_value = lower_expression(module, fun, ctx)?;
     let pointer_bytes = ctx.pointer_bytes();
     let mut argument_values = Vec::with_capacity(arguments.len());
@@ -2338,6 +2511,47 @@ fn try_lower_defined_function(
     }
 
     Ok(None)
+}
+
+fn try_lower_external_function_call(
+    module: &mut ObjectModule,
+    fun: &TypedExpr,
+    arguments: &[CallArg<TypedExpr>],
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Option<Value>> {
+    let Some(target) = module_function_target(fun) else {
+        return Ok(None);
+    };
+
+    let Some((external_module, external_symbol)) = target.external_cranelift else {
+        return Ok(None);
+    };
+
+    if target.module == ctx.module_name {
+        return Ok(None);
+    }
+
+    if target.arity != arguments.len() {
+        return Ok(None);
+    }
+
+    let mut arg_values = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        arg_values.push(lower_expression(module, &argument.value, ctx)?);
+    }
+
+    let func_id = ensure_external_cranelift_import(
+        module,
+        ctx.pointer_type,
+        target.arity,
+        external_module,
+        external_symbol,
+        ctx.external_imports,
+    )?;
+
+    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
+    let call = ctx.builder.ins().call(func_ref, &arg_values);
+    Ok(Some(ctx.expect_result(call, "external function call")))
 }
 
 fn lower_gleeunit_main(
@@ -4196,6 +4410,7 @@ fn lower_closure_function(
     float_constants: &mut HashMap<EcoString, DataId>,
     record_constructors: &mut HashMap<(EcoString, u16, u16), FuncId>,
     module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
+    external_imports: &mut HashMap<ExternalFunctionKey, FuncId>,
     closure_counter: &mut usize,
     closure_id: usize,
     capture_names: &[EcoString],
@@ -4243,6 +4458,7 @@ fn lower_closure_function(
             float_constants,
             record_constructors,
             module_functions,
+            external_imports,
             closure_counter,
         );
         lowering.mark_sealed(block);
@@ -4368,6 +4584,7 @@ fn lower_function_literal(
         let float_constants = &mut *ctx.float_constants;
         let record_constructors = &mut *ctx.record_constructors;
         let module_functions_ref = &mut *ctx.module_functions;
+        let external_imports_ref = &mut *ctx.external_imports;
         let closure_counter_ref = &mut *ctx.closure_counter;
         lower_closure_function(
             module,
@@ -4380,6 +4597,7 @@ fn lower_function_literal(
             float_constants,
             record_constructors,
             module_functions_ref,
+            external_imports_ref,
             closure_counter_ref,
             closure_id,
             &capture_names,

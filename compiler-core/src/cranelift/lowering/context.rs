@@ -30,9 +30,9 @@ use super::patterns::{
     NestedConstructorInfo, NestedListInfo,
 };
 use super::{
-    BOOLEAN_FALSE_ARITY, BOOLEAN_TRUE_ARITY, BindingSource, FLOAT_HEADER, FunctionIdMap,
-    HEADER_ARITY_SHIFT, HEADER_FIELD_MASK, HEADER_SIZE, TAG_BOOLEAN, TAG_FLOAT, TAG_LIST,
-    TAG_RECORD, TAG_TUPLE, VALUE_TAG_MASK,
+    BOOLEAN_FALSE_ARITY, BOOLEAN_TRUE_ARITY, BindingSource, ExternalFunctionKey, FLOAT_HEADER,
+    FunctionIdMap, HEADER_ARITY_SHIFT, HEADER_FIELD_MASK, HEADER_SIZE, TAG_BOOLEAN, TAG_FLOAT,
+    TAG_LIST, TAG_RECORD, TAG_TUPLE, VALUE_TAG_MASK,
 };
 
 /// Mutable state threaded through expression lowering.
@@ -45,6 +45,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) zero_arity_records: &'c mut HashMap<(EcoString, u16), DataId>,
     pub(super) record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
     pub(super) module_functions: &'c mut HashMap<(EcoString, EcoString, usize), FuncId>,
+    pub(super) external_imports: &'c mut HashMap<ExternalFunctionKey, FuncId>,
     pub(super) closure_counter: &'c mut usize,
     pub(super) runtime_nil: Option<FuncId>,
     pub(super) runtime_alloc_tuple: Option<FuncId>,
@@ -129,6 +130,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         float_constants: &'c mut HashMap<EcoString, DataId>,
         record_constructors: &'c mut HashMap<(EcoString, u16, u16), FuncId>,
         module_functions: &'c mut HashMap<(EcoString, EcoString, usize), FuncId>,
+        external_imports: &'c mut HashMap<ExternalFunctionKey, FuncId>,
         closure_counter: &'c mut usize,
     ) -> Self {
         Self {
@@ -140,6 +142,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             zero_arity_records,
             record_constructors,
             module_functions,
+            external_imports,
             closure_counter,
             runtime_nil: None,
             runtime_alloc_tuple: None,

@@ -22,6 +22,7 @@ pub(super) const BOOLEAN_TRUE_ARITY: i64 = 1;
 pub(super) const FLOAT_HEADER: u64 = (1u64 << 32) | TAG_FLOAT;
 
 pub(super) type FunctionIdMap = HashMap<(EcoString, usize), FuncId>;
+pub(super) type ExternalFunctionKey = (EcoString, EcoString, usize);
 
 /// Describes the origin of a value bound during pattern lowering so it can be
 /// materialised later.
