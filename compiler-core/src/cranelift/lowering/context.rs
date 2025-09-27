@@ -118,6 +118,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) runtime_panic: Option<FuncId>,
     pub(super) runtime_gleeunit_main: Option<FuncId>,
     pub(super) runtime_gleeunit_do_main: Option<FuncId>,
+    scratch_block_params: Vec<Value>,
     pub(super) pointer_bytes: u8,
     pub(super) functions: &'a FunctionIdMap,
     pub(super) module_name: &'a EcoString,
@@ -144,6 +145,30 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .get(index)
             .copied()
             .unwrap_or_else(|| panic!("native lowering: {context} missing block param {index}"))
+    }
+
+    fn block_params_slice(&mut self, block: ir::Block) -> &[Value] {
+        self.scratch_block_params.clear();
+        self.scratch_block_params
+            .extend_from_slice(self.builder.block_params(block));
+        &self.scratch_block_params
+    }
+
+    fn func_block_params_slice(&mut self, block: ir::Block) -> &[Value] {
+        self.scratch_block_params.clear();
+        self.scratch_block_params
+            .extend_from_slice(self.builder.func.dfg.block_params(block));
+        &self.scratch_block_params
+    }
+
+    fn block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
+        out.clear();
+        out.extend_from_slice(self.builder.block_params(block));
+    }
+
+    fn func_block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
+        out.clear();
+        out.extend_from_slice(self.builder.func.dfg.block_params(block));
     }
 
     #[cfg(debug_assertions)]
@@ -215,6 +240,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             runtime_panic: None,
             runtime_gleeunit_main: None,
             runtime_gleeunit_do_main: None,
+            scratch_block_params: Vec::new(),
             pointer_bytes,
             functions,
             module_name,
@@ -1412,7 +1438,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(extract_block);
 
         self.builder.switch_to_block(success_block);
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.block_params_slice(success_block);
         let new_subjects =
             expect_prefix(&params, subject_count, "branch_on_bit_array_byte subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_bit_array_byte extras");
@@ -1471,7 +1497,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(extract_block);
 
         self.builder.switch_to_block(success_block);
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.block_params_slice(success_block);
         let new_subjects = expect_prefix(
             &params,
             subject_count,
@@ -1706,7 +1732,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(cmp, success_block, &args, failure_block, &args);
         self.seal_block(current_block);
 
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
+        let mut params = Vec::new();
+        self.func_block_params_into(success_block, &mut params);
         Ok((success_block, params))
     }
 
@@ -1772,7 +1799,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(pointer_block);
 
         self.builder.switch_to_block(float_block);
-        let params = self.builder.block_params(float_block).to_vec();
+        let params = self.block_params_slice(float_block);
         let float_subject = params[0];
         let loaded = self.load_float(float_subject);
         let constant = self.builder.ins().f64const(float_value);
@@ -1783,7 +1810,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(cmp, success_block, &args, failure_block, &args);
         self.seal_block(float_block);
 
-        let params = self.builder.block_params(success_block).to_vec();
+        let mut params = Vec::new();
+        self.block_params_into(success_block, &mut params);
         Ok((success_block, params))
     }
 
@@ -1825,8 +1853,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .brif(is_equal, success_block, &args, failure_block, &args);
         self.seal_block(current_block);
 
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
-        Ok((success_block, params))
+        let params = self.func_block_params_slice(success_block);
+        Ok((success_block, params.to_vec()))
     }
 
     pub(super) fn branch_on_string_prefix_pattern(
@@ -1884,7 +1912,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(extract_block);
 
         self.builder.switch_to_block(success_block);
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.block_params_slice(success_block);
         let new_subjects = expect_prefix(&params, subject_count, "branch_on_utf8_pattern subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_utf8_pattern extras");
         Ok((success_block, new_subjects, extras))
@@ -1939,7 +1967,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(extract_block);
 
         self.builder.switch_to_block(success_block);
-        let params = self.builder.block_params(success_block).to_vec();
+        let params = self.block_params_slice(success_block);
         let new_subjects =
             expect_prefix(&params, subject_count, "branch_on_utf8_codepoint subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_utf8_codepoint extras");
@@ -2318,8 +2346,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             self.seal_block(record_block);
         }
 
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
         self.seal_block(success_block);
+        let params = self.func_block_params_slice(success_block);
         let new_subjects = expect_prefix(&params, subject_count, "branch_on_constructor subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_constructor extras");
         Ok((success_block, new_subjects, extras))
@@ -2488,8 +2516,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let _ = self.builder.ins().jump(success_block, &success_args);
         self.seal_block(tuple_block);
 
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
         self.seal_block(success_block);
+        let params = self.func_block_params_slice(success_block);
         let new_subjects = expect_prefix(&params, subject_count, "branch_on_tuple subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_tuple extras");
         Ok((success_block, new_subjects, extras))
@@ -2600,7 +2628,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
             self.builder.switch_to_block(non_nil_block);
             current_block = non_nil_block;
-            subjects = self.builder.block_params(current_block).to_vec();
+            self.block_params_into(current_block, &mut subjects);
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
@@ -2636,7 +2664,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             self.assert_block_open(pointer_block, "list pattern pointer block entry");
             self.builder.switch_to_block(pointer_block);
             current_block = pointer_block;
-            subjects = self.builder.block_params(current_block).to_vec();
+            self.block_params_into(current_block, &mut subjects);
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
@@ -2679,7 +2707,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             self.assert_block_open(list_block, "list pattern list block entry");
             self.builder.switch_to_block(list_block);
             current_block = list_block;
-            subjects = self.builder.block_params(current_block).to_vec();
+            self.block_params_into(current_block, &mut subjects);
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
@@ -2817,8 +2845,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         self.seal_block(current_block);
                                         self.builder.switch_to_block(continue_block);
                                         current_block = continue_block;
-                                        subjects =
-                                            self.builder.block_params(current_block).to_vec();
+                                        self.block_params_into(current_block, &mut subjects);
                                     }
                                     ListConstructorCondition::EmptyList => {
                                         let nil_func = self.declare_runtime_nil(module)?;
@@ -2847,8 +2874,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         self.seal_block(current_block);
                                         self.builder.switch_to_block(continue_block);
                                         current_block = continue_block;
-                                        subjects =
-                                            self.builder.block_params(current_block).to_vec();
+                                        self.block_params_into(current_block, &mut subjects);
                                     }
                                 }
 
@@ -2938,7 +2964,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
             self.builder.switch_to_block(exact_block);
             current_block = exact_block;
-            subjects = self.builder.block_params(current_block).to_vec();
+            self.block_params_into(current_block, &mut subjects);
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
@@ -2977,8 +3003,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.builder.switch_to_block(success_block);
         #[cfg(debug_assertions)]
         self.assert_block_open(success_block, "before reading list success params");
-        let params = self.builder.block_params(success_block).to_vec();
         self.seal_block(success_block);
+        let params = self.block_params_slice(success_block);
         let new_subjects = expect_prefix(&params, subject_count, "branch_on_list subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_list extras");
         Ok((success_block, new_subjects, extras))
@@ -3231,7 +3257,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(*pattern_block);
         self.builder.switch_to_block(continue_block);
         *pattern_block = continue_block;
-        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+        self.block_params_into(continue_block, pattern_subjects);
         Ok(())
     }
 
@@ -3306,7 +3332,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         self.seal_block(*pattern_block);
         self.builder.switch_to_block(continue_block);
         *pattern_block = continue_block;
-        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+        self.block_params_into(continue_block, pattern_subjects);
         Ok(())
     }
 
@@ -3413,7 +3439,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                         self.seal_block(*pattern_block);
                         self.builder.switch_to_block(continue_block);
                         *pattern_block = continue_block;
-                        *pattern_subjects = self.builder.block_params(continue_block).to_vec();
+                        self.block_params_into(continue_block, pattern_subjects);
                     }
                 }
 
