@@ -34,7 +34,7 @@ the tagging scheme and heap layout that the code in this crate implements.
 - `atom.rs` maintains the global atom table used to intern module, function, and
   constructor names.
 - `ffi.rs` is where the bulk of the runtime surface lives. It defines the
-  `#[no_mangle] extern "C" fn` entry points invoked from generated code and the
+  `#[unsafe(no_mangle)] extern "C" fn` entry points invoked from generated code and the
   standard library when running on the native backend. Most of the logic in the
   runtime sits in this module.
 

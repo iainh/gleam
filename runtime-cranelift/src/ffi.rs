@@ -60,50 +60,50 @@ fn atom_error() -> Value {
     atom("error")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_runtime_init() {
     gc::ensure_initialised();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_runtime_collect() {
     gc::collect();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_list_nil() -> u64 {
     Value::nil().to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_bool_true() -> u64 {
     Value::from_bool(true).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_bool_false() -> u64 {
     Value::from_bool(false).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_float_from_f64(number: f64) -> u64 {
     float_to_value(number).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_int_negate(raw: u64) -> u64 {
     let int = value_to_i63(Value::from_raw(raw), "int_negate");
     Value::from_i63(-int).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_panic(message_raw: u64) -> u64 {
     let default_message = "`panic` expression evaluated.".to_string();
     let message = value_to_string(Value::from_raw(message_raw)).unwrap_or(default_message);
     panic!("{message}");
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// # Safety
 /// `env_ptr` must reference `env_len` valid `Value` words captured by the closure.
 pub unsafe extern "C" fn gleam_alloc_closure(
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn gleam_alloc_closure(
     value.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_apply_closure(closure_raw: u64, args_ptr: *const u64, argc: usize) -> u64 {
     let closure_value = Value::from_raw(closure_raw);
     let closure_ptr = closure_value
@@ -137,7 +137,7 @@ pub extern "C" fn gleam_apply_closure(closure_raw: u64, args_ptr: *const u64, ar
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// # Safety
 /// `values_ptr` must point to `len` valid `Value` words.
 pub unsafe extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -> u64 {
@@ -152,7 +152,7 @@ pub unsafe extern "C" fn gleam_alloc_tuple(values_ptr: *const u64, len: usize) -
     unwrap_allocation(heap.alloc_tuple(&values), "tuple").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// # Safety
 /// `fields_ptr` must point to `len` valid `Value` words.
 pub unsafe extern "C" fn gleam_alloc_record(
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn gleam_alloc_record(
     unwrap_allocation(heap.alloc_record(index, values), "record").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_list_cons(head_raw: u64, tail_raw: u64) -> u64 {
     gc::ensure_initialised();
     let heap = Heap::new();
@@ -177,7 +177,7 @@ pub extern "C" fn gleam_list_cons(head_raw: u64, tail_raw: u64) -> u64 {
     unwrap_allocation(heap.alloc_cons(head, tail), "list cons").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 /// # Safety
 /// `bytes_ptr` must reference `len` initialised bytes.
 pub unsafe extern "C" fn gleam_binary_from_slice(bytes_ptr: *const u8, len: usize) -> u64 {
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn gleam_binary_from_slice(bytes_ptr: *const u8, len: usiz
     value.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_binary_retain(raw: u64) {
     let value = Value::from_raw(raw);
     if !value.is_boxed() {
@@ -213,7 +213,7 @@ pub extern "C" fn gleam_binary_retain(raw: u64) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_binary_release(raw: u64) {
     let value = Value::from_raw(raw);
     if !value.is_boxed() {
@@ -734,19 +734,19 @@ fn decode_error_list(expected: &str, data: Value) -> Value {
     list_from_vec(vec![error])
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn classify_dynamic(raw: u64) -> u64 {
     let value = Value::from_raw(raw);
     string_to_value(classify_value(value)).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn list_to_array(list_raw: u64) -> u64 {
     let elements = list_to_vec(Value::from_raw(list_raw));
     tuple_from(&elements, "list_to_array tuple").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn is_null(raw: u64) -> u64 {
     let value = Value::from_raw(raw);
     Value::from_bool(value == Value::nil()).to_raw()
@@ -1068,48 +1068,48 @@ fn runtime_print(raw: u64, newline: bool, stream: OutputStream) -> u64 {
     Value::nil().to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn print(raw: u64) -> u64 {
     runtime_print(raw, false, OutputStream::Stdout)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn println(raw: u64) -> u64 {
     runtime_print(raw, true, OutputStream::Stdout)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn print_error(raw: u64) -> u64 {
     runtime_print(raw, false, OutputStream::Stderr)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn println_error(raw: u64) -> u64 {
     runtime_print(raw, true, OutputStream::Stderr)
 }
 
 // TODO: Remove legacy `io_*` exports once lowering is updated to call the new names.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn io_print(raw: u64) -> u64 {
     print(raw)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn io_println(raw: u64) -> u64 {
     println(raw)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn io_print_error(raw: u64) -> u64 {
     print_error(raw)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn io_println_error(raw: u64) -> u64 {
     println_error(raw)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn parse_float(raw: u64) -> u64 {
     let input = Value::from_raw(raw);
     let parsed = value_to_string(input)
@@ -1128,7 +1128,7 @@ pub extern "C" fn parse_float(raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn float_to_string(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
@@ -1136,41 +1136,41 @@ pub extern "C" fn float_to_string(raw: u64) -> u64 {
     bytes_to_value(string.as_bytes()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ceiling(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_value(number.ceil()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn floor(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_value(number.floor()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn round(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_i63_value(number.round(), "round").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn truncate(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_i63_value(number, "truncate").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn float(raw: u64) -> u64 {
     let int_value = value_to_i63(Value::from_raw(raw), "float_from_int");
     float_to_value(int_value as f64).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn power(base_raw: u64, exponent_raw: u64) -> u64 {
     let base =
         value_to_f64(Value::from_raw(base_raw)).unwrap_or_else(|_| panic!("expected Float value"));
@@ -1179,28 +1179,28 @@ pub extern "C" fn power(base_raw: u64, exponent_raw: u64) -> u64 {
     float_to_value(base.powf(exponent)).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn random_uniform() -> u64 {
     let mut rng = rand::thread_rng();
     let value: f64 = rng.r#gen::<f64>();
     float_to_value(value).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn log(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_value(number.ln()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn exp(raw: u64) -> u64 {
     let number =
         value_to_f64(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected Float value"));
     float_to_value(number.exp()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_length(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1209,7 +1209,7 @@ pub extern "C" fn string_length(raw: u64) -> u64 {
     Value::from_i63(count).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lowercase(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1217,7 +1217,7 @@ pub extern "C" fn lowercase(raw: u64) -> u64 {
     string_to_value(&lower).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn uppercase(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1225,7 +1225,7 @@ pub extern "C" fn uppercase(raw: u64) -> u64 {
     string_to_value(&upper).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn less_than(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1234,7 +1234,7 @@ pub extern "C" fn less_than(left_raw: u64, right_raw: u64) -> u64 {
     Value::from_bool(left < right).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_slice(string_raw: u64, idx_raw: u64, len_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1256,7 +1256,7 @@ pub extern "C" fn string_slice(string_raw: u64, idx_raw: u64, len_raw: u64) -> u
     string_to_value(&slice).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn crop_string(string_raw: u64, prefix_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1269,7 +1269,7 @@ pub extern "C" fn crop_string(string_raw: u64, prefix_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn contains_string(haystack_raw: u64, needle_raw: u64) -> u64 {
     let haystack = value_to_string(Value::from_raw(haystack_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1278,7 +1278,7 @@ pub extern "C" fn contains_string(haystack_raw: u64, needle_raw: u64) -> u64 {
     Value::from_bool(haystack.contains(needle.as_str())).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_starts_with(string_raw: u64, prefix_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1287,7 +1287,7 @@ pub extern "C" fn string_starts_with(string_raw: u64, prefix_raw: u64) -> u64 {
     Value::from_bool(string.starts_with(prefix.as_str())).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_prefix_split(string_raw: u64, prefix_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1311,7 +1311,7 @@ pub extern "C" fn string_prefix_split(string_raw: u64, prefix_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_ends_with(string_raw: u64, suffix_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1320,7 +1320,7 @@ pub extern "C" fn string_ends_with(string_raw: u64, suffix_raw: u64) -> u64 {
     Value::from_bool(string.ends_with(suffix.as_str())).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn split_once(string_raw: u64, needle_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1340,7 +1340,7 @@ pub extern "C" fn split_once(string_raw: u64, needle_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn trim_start(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1348,7 +1348,7 @@ pub extern "C" fn trim_start(raw: u64) -> u64 {
     string_to_value(trimmed).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn trim_end(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1356,7 +1356,7 @@ pub extern "C" fn trim_end(raw: u64) -> u64 {
     string_to_value(trimmed).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pop_grapheme(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1374,7 +1374,7 @@ pub extern "C" fn pop_grapheme(raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn byte_size(raw: u64) -> u64 {
     let bytes =
         value_to_bytes(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -1382,12 +1382,12 @@ pub extern "C" fn byte_size(raw: u64) -> u64 {
     Value::from_i63(len).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn utf_codepoint_to_int(raw: u64) -> u64 {
     raw
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_bit_size(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_bit_size");
     let size = i64::try_from(view.bit_len)
@@ -1395,7 +1395,7 @@ pub extern "C" fn bit_array_bit_size(raw: u64) -> u64 {
     Value::from_i63(size).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_byte_size(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_byte_size");
     let bytes = view.bit_len.div_ceil(8);
@@ -1404,7 +1404,7 @@ pub extern "C" fn bit_array_byte_size(raw: u64) -> u64 {
     Value::from_i63(size).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_pad_to_bytes(raw: u64) -> u64 {
     let value = Value::from_raw(raw);
     let view = bit_array_view(value, "bit_array_pad_to_bytes");
@@ -1416,7 +1416,7 @@ pub extern "C" fn bit_array_pad_to_bytes(raw: u64) -> u64 {
     bit_array_from_bytes(&bytes, total_bits).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_slice(bits_raw: u64, pos_raw: u64, len_raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(bits_raw), "bit_array_slice bits");
     let pos = value_to_i63(Value::from_raw(pos_raw), "bit_array_slice position");
@@ -1440,7 +1440,7 @@ pub extern "C" fn bit_array_slice(bits_raw: u64, pos_raw: u64, len_raw: u64) -> 
     result_ok(slice_value)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_to_string(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_to_string");
     if !view.bit_len.is_multiple_of(8) {
@@ -1453,7 +1453,7 @@ pub extern "C" fn bit_array_to_string(raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_unsafe_to_string(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_unsafe_to_string");
     if !view.bit_len.is_multiple_of(8) {
@@ -1465,7 +1465,7 @@ pub extern "C" fn bit_array_unsafe_to_string(raw: u64) -> u64 {
     string_to_value(&string).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_concat(list_raw: u64) -> u64 {
     let values = list_to_vec(Value::from_raw(list_raw));
     let mut total_bits: usize = 0;
@@ -1488,7 +1488,7 @@ pub extern "C" fn bit_array_concat(list_raw: u64) -> u64 {
     bit_array_from_bytes(&bytes, total_bits).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn base64_encode(bits_raw: u64, padding_raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(bits_raw), "base64_encode bits");
     let padding = Value::from_raw(padding_raw) == Value::from_bool(true);
@@ -1498,7 +1498,7 @@ pub extern "C" fn base64_encode(bits_raw: u64, padding_raw: u64) -> u64 {
     string_to_value(&encoded).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn base64_decode(string_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("runtime base64_decode expected String value"));
@@ -1514,7 +1514,7 @@ pub extern "C" fn base64_decode(string_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn base16_encode(bits_raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(bits_raw), "base16_encode bits");
     let (bytes, _) = padded_bytes(&view);
@@ -1522,7 +1522,7 @@ pub extern "C" fn base16_encode(bits_raw: u64) -> u64 {
     string_to_value(&encoded).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn base16_decode(string_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("runtime base16_decode expected String value"));
@@ -1538,7 +1538,7 @@ pub extern "C" fn base16_decode(string_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_to_int_and_size(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_to_int_and_size");
     let first_byte = if view.bit_len == 0 {
@@ -1562,7 +1562,7 @@ pub extern "C" fn bit_array_to_int_and_size(raw: u64) -> u64 {
     tuple.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_starts_with(bits_raw: u64, prefix_raw: u64) -> u64 {
     let bits_view = bit_array_view(Value::from_raw(bits_raw), "bit_array_starts_with bits");
     let prefix_view = bit_array_view(Value::from_raw(prefix_raw), "bit_array_starts_with prefix");
@@ -1577,7 +1577,7 @@ pub extern "C" fn bit_array_starts_with(bits_raw: u64, prefix_raw: u64) -> u64 {
     Value::from_bool(true).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn index(data_raw: u64, key_raw: u64) -> u64 {
     let data = Value::from_raw(data_raw);
     let key = Value::from_raw(key_raw);
@@ -1631,7 +1631,7 @@ pub extern "C" fn index(data_raw: u64, key_raw: u64) -> u64 {
     result_error(string_to_value("Dict"))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dynamic_string(data_raw: u64) -> u64 {
     let value = Value::from_raw(data_raw);
     match header_tag(value) {
@@ -1651,7 +1651,7 @@ pub extern "C" fn dynamic_string(data_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dynamic_int(data_raw: u64) -> u64 {
     let value = Value::from_raw(data_raw);
     if value.is_i63() {
@@ -1661,7 +1661,7 @@ pub extern "C" fn dynamic_int(data_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dynamic_float(data_raw: u64) -> u64 {
     let value = Value::from_raw(data_raw);
     if matches!(header_tag(value), Some(Tag::Float)) {
@@ -1671,7 +1671,7 @@ pub extern "C" fn dynamic_float(data_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dynamic_bit_array(data_raw: u64) -> u64 {
     let value = Value::from_raw(data_raw);
     if matches!(header_tag(value), Some(Tag::BitArray)) {
@@ -1682,7 +1682,7 @@ pub extern "C" fn dynamic_bit_array(data_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn decode_list(
     data_raw: u64,
     item_raw: u64,
@@ -1747,7 +1747,7 @@ pub extern "C" fn decode_list(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dynamic_dict(data_raw: u64) -> u64 {
     let value = Value::from_raw(data_raw);
     if matches!(header_tag(value), Some(Tag::Map)) {
@@ -1757,7 +1757,7 @@ pub extern "C" fn dynamic_dict(data_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn utf_codepoint_list_to_string(raw: u64) -> u64 {
     let elements = list_to_vec(Value::from_raw(raw));
     let mut buffer = String::new();
@@ -1772,7 +1772,7 @@ pub extern "C" fn utf_codepoint_list_to_string(raw: u64) -> u64 {
     string_to_value(&buffer).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn add(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1783,7 +1783,7 @@ pub extern "C" fn add(left_raw: u64, right_raw: u64) -> u64 {
     string_to_value(&buffer).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn concat(list_raw: u64) -> u64 {
     let elements = list_to_vec(Value::from_raw(list_raw));
     let mut buffer = String::new();
@@ -1794,7 +1794,7 @@ pub extern "C" fn concat(list_raw: u64) -> u64 {
     string_to_value(&buffer).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -1806,14 +1806,14 @@ pub extern "C" fn string_replace(string_raw: u64, pattern_raw: u64, substitute_r
     string_to_value(&replaced).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_to_utf8_bits(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
     bit_array_from_bytes(string.as_bytes(), string.len() * 8).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_pop_utf8_codepoint(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_pop_utf8_codepoint");
 
@@ -1866,7 +1866,7 @@ pub extern "C" fn bit_array_pop_utf8_codepoint(raw: u64) -> u64 {
     tuple.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_pop_byte(raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(raw), "bit_array_pop_byte");
 
@@ -1894,7 +1894,7 @@ pub extern "C" fn bit_array_pop_byte(raw: u64) -> u64 {
     tuple.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_split_bits(bits_raw: u64, size_raw: u64) -> u64 {
     let view = bit_array_view(Value::from_raw(bits_raw), "bit_array_split_bits bits");
     let size_value = value_to_i63(Value::from_raw(size_raw), "bit_array_split_bits size");
@@ -1937,13 +1937,13 @@ pub extern "C" fn bit_array_split_bits(bits_raw: u64, size_raw: u64) -> u64 {
     tuple.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_new() -> u64 {
     let builder = Box::new(BitArrayBuilder::new());
     Box::into_raw(builder) as u64
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_append_bit_array(
     builder_raw: u64,
     bits_raw: u64,
@@ -1966,7 +1966,7 @@ pub extern "C" fn bit_array_builder_append_bit_array(
     builder_raw
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_append_int(
     builder_raw: u64,
     value_raw: u64,
@@ -2000,7 +2000,7 @@ pub extern "C" fn bit_array_builder_append_int(
     builder_raw
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_append_string_utf8(builder_raw: u64, string_raw: u64) -> u64 {
     let builder = builder_ref(builder_raw);
     let string = value_to_string(Value::from_raw(string_raw))
@@ -2009,7 +2009,7 @@ pub extern "C" fn bit_array_builder_append_string_utf8(builder_raw: u64, string_
     builder_raw
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_append_utf8_codepoint(
     builder_raw: u64,
     codepoint_raw: u64,
@@ -2029,7 +2029,7 @@ pub extern "C" fn bit_array_builder_append_utf8_codepoint(
     builder_raw
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bit_array_builder_finish(builder_raw: u64) -> u64 {
     let builder_ptr = builder_from_raw(builder_raw);
     let builder = unsafe { Box::from_raw(builder_ptr) };
@@ -2037,7 +2037,7 @@ pub extern "C" fn bit_array_builder_finish(builder_raw: u64) -> u64 {
     value.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
     let left = value_to_string(Value::from_raw(left_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -2046,7 +2046,7 @@ pub extern "C" fn string_eq(left_raw: u64, right_raw: u64) -> u64 {
     Value::from_bool(left == right).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_pop_codeunit(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -2069,7 +2069,7 @@ pub extern "C" fn string_pop_codeunit(raw: u64) -> u64 {
     tuple.to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn string_codeunit_slice(string_raw: u64, from_raw: u64, length_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(string_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -2102,7 +2102,7 @@ pub extern "C" fn string_codeunit_slice(string_raw: u64, from_raw: u64, length_r
     string_to_value(&result).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn percent_encode(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -2110,7 +2110,7 @@ pub extern "C" fn percent_encode(raw: u64) -> u64 {
     string_to_value(&encoded).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn percent_decode(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -2120,7 +2120,7 @@ pub extern "C" fn percent_decode(raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn parse_query(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -2156,7 +2156,7 @@ pub extern "C" fn parse_query(raw: u64) -> u64 {
     result_ok(list)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn from_dynamic(raw: u64) -> u64 {
     let value = Value::from_raw(raw);
     if !matches!(header_tag(value), Some(Tag::Map)) {
@@ -2242,7 +2242,7 @@ pub extern "C" fn from_dynamic(raw: u64) -> u64 {
     result_ok(panic_value)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn read_file(path_raw: u64) -> u64 {
     let path = value_to_string(Value::from_raw(path_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -2255,7 +2255,7 @@ pub extern "C" fn read_file(path_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn read_file_text(path_raw: u64) -> u64 {
     let path = value_to_string(Value::from_raw(path_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -2265,29 +2265,29 @@ pub extern "C" fn read_file_text(path_raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleeunit_main() -> u64 {
     Value::nil().to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleeunit_do_main() -> u64 {
     Value::nil().to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_new() -> u64 {
     map_from_vec(Vec::new()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_size(map_raw: u64) -> u64 {
     let table_ptr = map_table_from_value(Value::from_raw(map_raw));
     let len = unsafe { table_ptr.as_ref().len };
     Value::from_i63(len as i64).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_to_list(map_raw: u64) -> u64 {
     let entries = map_entries_vec(Value::from_raw(map_raw));
     let mut values = Vec::with_capacity(entries.len());
@@ -2298,7 +2298,7 @@ pub extern "C" fn dict_to_list(map_raw: u64) -> u64 {
     list_from_vec(values).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_get(map_raw: u64, key_raw: u64) -> u64 {
     let entries = map_entries_vec(Value::from_raw(map_raw));
     let key = Value::from_raw(key_raw);
@@ -2310,7 +2310,7 @@ pub extern "C" fn dict_get(map_raw: u64, key_raw: u64) -> u64 {
     result_error(Value::nil())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_insert(map_raw: u64, key_raw: u64, value_raw: u64) -> u64 {
     let mut entries = map_entries_vec(Value::from_raw(map_raw));
     let key = Value::from_raw(key_raw);
@@ -2320,7 +2320,7 @@ pub extern "C" fn dict_insert(map_raw: u64, key_raw: u64, value_raw: u64) -> u64
     map_from_vec(entries).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dict_remove(map_raw: u64, key_raw: u64) -> u64 {
     let mut entries = map_entries_vec(Value::from_raw(map_raw));
     let key = Value::from_raw(key_raw);
@@ -2344,37 +2344,37 @@ fn map_from_key_value_list(list_raw: u64, context: &str) -> Value {
     map_from_vec(entries)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_object(items_raw: u64) -> u64 {
     map_from_key_value_list(items_raw, "make_object").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn make_map(items_raw: u64) -> u64 {
     map_from_key_value_list(items_raw, "make_map").to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn unsupported_zero_arity() -> u64 {
     panic!("erlang-only helper invoked on Cranelift runtime")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn unsupported_one_arity(_arg0: u64) -> u64 {
     panic!("erlang-only helper invoked on Cranelift runtime")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn unsupported_two_arity(_arg0: u64, _arg1: u64) -> u64 {
     panic!("erlang-only helper invoked on Cranelift runtime")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn unsupported_three_arity(_arg0: u64, _arg1: u64, _arg2: u64) -> u64 {
     panic!("erlang-only helper invoked on Cranelift runtime")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn graphemes(raw: u64) -> u64 {
     let string =
         value_to_string(Value::from_raw(raw)).unwrap_or_else(|_| panic!("expected String value"));
@@ -2384,7 +2384,7 @@ pub extern "C" fn graphemes(raw: u64) -> u64 {
     list_from_vec(values).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn split_string_tree(tree_raw: u64, pattern_raw: u64, _direction_raw: u64) -> u64 {
     let string = value_to_string(Value::from_raw(tree_raw))
         .unwrap_or_else(|_| panic!("expected String value"));
@@ -2405,7 +2405,7 @@ pub extern "C" fn split_string_tree(tree_raw: u64, pattern_raw: u64, _direction_
     list_from_vec(values).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn parse_int(raw: u64) -> u64 {
     let input = Value::from_raw(raw);
     let parsed = value_to_string(input)
@@ -2420,7 +2420,7 @@ pub extern "C" fn parse_int(raw: u64) -> u64 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn int_from_base_string(string_raw: u64, base_raw: u64) -> u64 {
     let string = Value::from_raw(string_raw);
     let base = value_to_i63(Value::from_raw(base_raw), "int_from_base_string");
@@ -2460,13 +2460,13 @@ fn int_to_base_string_impl(number: i64, base: i64) -> Option<String> {
     Some(digits.into_iter().collect())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn to_string(int_raw: u64) -> u64 {
     let value = value_to_i63(Value::from_raw(int_raw), "int_to_string");
     bytes_to_value(value.to_string().as_bytes()).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn int_to_base_string(int_raw: u64, base_raw: u64) -> u64 {
     let value = value_to_i63(Value::from_raw(int_raw), "int_to_base_string");
     let base = value_to_i63(Value::from_raw(base_raw), "int_to_base_string base");
@@ -2491,22 +2491,22 @@ fn bitwise_unary_op(a_raw: u64, op: impl Fn(i64) -> i64, context: &'static str) 
     Value::from_i63(op(a)).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_and(a_raw: u64, b_raw: u64) -> u64 {
     bitwise_binary_op(a_raw, b_raw, |a, b| a & b, "bitwise_and")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_or(a_raw: u64, b_raw: u64) -> u64 {
     bitwise_binary_op(a_raw, b_raw, |a, b| a | b, "bitwise_or")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_exclusive_or(a_raw: u64, b_raw: u64) -> u64 {
     bitwise_binary_op(a_raw, b_raw, |a, b| a ^ b, "bitwise_xor")
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_not(a_raw: u64) -> u64 {
     bitwise_unary_op(a_raw, |a| !a, "bitwise_not")
 }
@@ -2532,7 +2532,7 @@ fn shift_right(a: i64, b: i64) -> Option<i64> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_shift_left(a_raw: u64, b_raw: u64) -> u64 {
     let a = value_to_i63(Value::from_raw(a_raw), "bitwise_shift_left");
     let b = value_to_i63(Value::from_raw(b_raw), "bitwise_shift_left");
@@ -2540,7 +2540,7 @@ pub extern "C" fn bitwise_shift_left(a_raw: u64, b_raw: u64) -> u64 {
     Value::from_i63(result).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bitwise_shift_right(a_raw: u64, b_raw: u64) -> u64 {
     let a = value_to_i63(Value::from_raw(a_raw), "bitwise_shift_right");
     let b = value_to_i63(Value::from_raw(b_raw), "bitwise_shift_right");
@@ -2549,7 +2549,7 @@ pub extern "C" fn bitwise_shift_right(a_raw: u64, b_raw: u64) -> u64 {
     Value::from_i63(result).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn identity(raw: u64) -> u64 {
     raw
 }
@@ -2627,7 +2627,7 @@ fn list_error_to_status(error: ListDecodeError) -> GleamFfiStatus {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_string_to_utf8(value_raw: u64) -> GleamFfiBytes {
     let value = Value::from_raw(value_raw);
     match string_bytes(value) {
@@ -2658,7 +2658,7 @@ pub extern "C" fn gleam_ffi_string_to_utf8(value_raw: u64) -> GleamFfiBytes {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_bytes_free(bytes: GleamFfiBytes) {
     if bytes.ptr.is_null() || bytes.len == 0 {
         return;
@@ -2670,7 +2670,7 @@ pub extern "C" fn gleam_ffi_bytes_free(bytes: GleamFfiBytes) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_string_from_utf8(ptr: *const u8, len: usize) -> GleamFfiValue {
     if len == 0 {
         return GleamFfiValue {
@@ -2694,12 +2694,12 @@ pub extern "C" fn gleam_ffi_string_from_utf8(ptr: *const u8, len: usize) -> Glea
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_encode_uint(value: u64) -> u64 {
     encode_unsigned_int(value).to_raw()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_decode_uint(value_raw: u64) -> GleamFfiUint {
     let value = Value::from_raw(value_raw);
     match decode_unsigned_int(value) {
@@ -2718,7 +2718,7 @@ pub extern "C" fn gleam_ffi_decode_uint(value_raw: u64) -> GleamFfiUint {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_resource_from_ptr(ptr: *mut c_void) -> GleamFfiValue {
     if ptr.is_null() {
         return GleamFfiValue {
@@ -2734,7 +2734,7 @@ pub extern "C" fn gleam_ffi_resource_from_ptr(ptr: *mut c_void) -> GleamFfiValue
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_resource_to_ptr(value_raw: u64) -> GleamFfiResourcePtr {
     let value = Value::from_raw(value_raw);
     match resource_to_ptr(value) {
@@ -2749,7 +2749,7 @@ pub extern "C" fn gleam_ffi_resource_to_ptr(value_raw: u64) -> GleamFfiResourceP
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_list_from_array(ptr: *const u64, len: usize) -> GleamFfiValue {
     if len == 0 {
         return GleamFfiValue {
@@ -2774,7 +2774,7 @@ pub extern "C" fn gleam_ffi_list_from_array(ptr: *const u64, len: usize) -> Glea
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_list_to_array(list_raw: u64) -> GleamFfiValues {
     let value = Value::from_raw(list_raw);
     match list_to_values(value) {
@@ -2805,7 +2805,7 @@ pub extern "C" fn gleam_ffi_list_to_array(list_raw: u64) -> GleamFfiValues {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn gleam_ffi_values_free(values: GleamFfiValues) {
     if values.ptr.is_null() || values.len == 0 {
         return;
