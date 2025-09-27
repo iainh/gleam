@@ -147,26 +147,26 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .unwrap_or_else(|| panic!("native lowering: {context} missing block param {index}"))
     }
 
-    fn block_params_slice(&mut self, block: ir::Block) -> &[Value] {
+    pub(super) fn block_params_slice(&mut self, block: ir::Block) -> &[Value] {
         self.scratch_block_params.clear();
         self.scratch_block_params
             .extend_from_slice(self.builder.block_params(block));
         &self.scratch_block_params
     }
 
-    fn func_block_params_slice(&mut self, block: ir::Block) -> &[Value] {
+    pub(super) fn func_block_params_slice(&mut self, block: ir::Block) -> &[Value] {
         self.scratch_block_params.clear();
         self.scratch_block_params
             .extend_from_slice(self.builder.func.dfg.block_params(block));
         &self.scratch_block_params
     }
 
-    fn block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
+    pub(super) fn block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
         out.clear();
         out.extend_from_slice(self.builder.block_params(block));
     }
 
-    fn func_block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
+    pub(super) fn func_block_params_into(&mut self, block: ir::Block, out: &mut Vec<Value>) {
         out.clear();
         out.extend_from_slice(self.builder.func.dfg.block_params(block));
     }

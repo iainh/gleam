@@ -2885,11 +2885,11 @@ fn lower_case(
         let next_block = ctx.create_subject_block(subject_count);
 
         let mut pattern_block = current_block;
-        let mut pattern_subjects = ctx.builder.block_params(current_block).to_vec();
+        let mut pattern_subjects: Vec<Value> = ctx.builder.block_params(current_block).to_vec();
         let mut bindings: Vec<(EcoString, BindingSource)> = Vec::new();
 
         for (subject_index, pattern) in clause.pattern.iter().enumerate() {
-            let current_params = ctx.builder.block_params(pattern_block).to_vec();
+            let current_params = ctx.builder.block_params(pattern_block);
             for (_, source) in &mut bindings {
                 match source {
                     BindingSource::Value(value) => {
@@ -2948,7 +2948,7 @@ fn lower_case(
                                     "invalid float literal `{value}` in native pattern"
                                 ),
                             })?;
-                    let (block, params) = ctx.branch_on_float_pattern(
+                    let (block, _params) = ctx.branch_on_float_pattern(
                         pattern_block,
                         pattern_subjects[subject_index],
                         float_value,
@@ -2957,11 +2957,11 @@ fn lower_case(
                         subject_count,
                     )?;
                     pattern_block = block;
-                    pattern_subjects = params;
+                    ctx.block_params_into(pattern_block, &mut pattern_subjects);
                 }
                 Pattern::String { value, .. } => {
                     let literal = ctx.string_constant(module, value.as_str())?;
-                    let (block, params) = ctx.branch_on_string_pattern(
+                    let (block, _params) = ctx.branch_on_string_pattern(
                         module,
                         pattern_block,
                         pattern_subjects[subject_index],
@@ -2971,7 +2971,7 @@ fn lower_case(
                         subject_count,
                     )?;
                     pattern_block = block;
-                    pattern_subjects = params;
+                    ctx.block_params_into(pattern_block, &mut pattern_subjects);
                 }
                 Pattern::StringPrefix {
                     left_side_string,
