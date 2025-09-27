@@ -102,6 +102,9 @@ macro_rules! assert_echo {
             Target::Erlang => {
                 assert_echo!(&snapshot_name, Some($target), None, $project_name);
             }
+            Target::Native => {
+                // Native snapshots not wired into this suite yet.
+            }
         }
     };
 

@@ -8,7 +8,7 @@ use pretty_assertions::assert_eq;
 use gleam_core::{
     Error,
     build::Runtime,
-    config::{DenoConfig, DenoFlag, Docs, ErlangConfig, JavaScriptConfig},
+    config::{CraneliftConfig, DenoConfig, DenoFlag, Docs, ErlangConfig, JavaScriptConfig},
     manifest::{Base16Checksum, Manifest, ManifestPackage, ManifestPackageSource},
     requirement::Requirement,
 };
@@ -1199,6 +1199,7 @@ fn package_config(
                 location: None,
             },
         },
+        cranelift: CraneliftConfig::default(),
         target: Target::Erlang,
         internal_modules: None,
     }

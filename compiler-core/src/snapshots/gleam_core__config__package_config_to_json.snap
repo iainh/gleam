@@ -118,6 +118,13 @@ allow_read = ["./database.sqlite"]
       "location": null
     }
   },
+  "cranelift": {
+    "linker": null,
+    "linker-args": [],
+    "search-paths": [],
+    "systems": {},
+    "targets": {}
+  },
   "target": "erlang",
   "internal_modules": [
     "my_app/internal"

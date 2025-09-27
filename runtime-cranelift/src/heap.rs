@@ -85,8 +85,9 @@ impl Heap {
     pub fn alloc_float(&self, value: f64) -> Result<Value, AllocationError> {
         let ptr = self.allocate_box(FloatBox::HEADER)?;
         unsafe {
-            let float_box = ptr.cast::<FloatBox>().as_ptr();
-            core::ptr::addr_of_mut!((*float_box).value).write(value);
+            ptr.cast::<FloatBox>()
+                .as_ptr()
+                .write(FloatBox::new(value));
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }
@@ -217,8 +218,9 @@ impl Heap {
     pub fn alloc_resource(&self, pointer: *mut c_void) -> Result<Value, AllocationError> {
         let ptr = self.allocate_box(ResourceHandle::HEADER)?;
         unsafe {
-            let handle = ptr.cast::<ResourceHandle>().as_ptr();
-            (*handle).pointer = pointer;
+            ptr.cast::<ResourceHandle>()
+                .as_ptr()
+                .write(ResourceHandle::new(pointer));
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }

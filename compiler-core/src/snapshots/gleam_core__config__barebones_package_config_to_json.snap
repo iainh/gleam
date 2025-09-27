@@ -46,6 +46,13 @@ version = "1.0.0"
       "location": null
     }
   },
+  "cranelift": {
+    "linker": null,
+    "linker-args": [],
+    "search-paths": [],
+    "systems": {},
+    "targets": {}
+  },
   "target": "erlang",
   "internal_modules": null
 }

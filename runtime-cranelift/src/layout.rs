@@ -3,6 +3,8 @@
 use std::alloc::{Layout, LayoutError};
 use std::sync::atomic::AtomicUsize;
 
+use core::ffi::c_void;
+
 use crate::{
     header::{Header, Tag},
     value::Value,
@@ -240,11 +242,18 @@ pub struct Message {
 #[derive(Debug)]
 pub struct ResourceHandle {
     pub header: Header,
-    pub pointer: *mut core::ffi::c_void,
+    pub pointer: *mut c_void,
 }
 
 impl ResourceHandle {
     pub const HEADER: Header = Header::new(Tag::Resource, 0, 1);
+
+    pub fn new(pointer: *mut c_void) -> Self {
+        Self {
+            header: Self::HEADER,
+            pointer,
+        }
+    }
 }
 
 #[cfg(test)]
