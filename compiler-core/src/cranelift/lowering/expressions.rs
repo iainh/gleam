@@ -13,7 +13,8 @@ use crate::{
 use cranelift_codegen::{
     Context,
     ir::{
-        self, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, Value,
+        self, BlockCall, InstBuilder, JumpTableData, MemFlags, StackSlotData, StackSlotKind,
+        TrapCode, Value,
         condcodes::{FloatCC, IntCC},
     },
 };
@@ -30,7 +31,11 @@ use super::patterns::{
     ConstructorTupleCondition, ConstructorTupleInfo, ListConstructorCondition, ListConstructorInfo,
     ListHeadMatch, ListTupleInfo, NestedConstructorInfo, collect_list_pattern_info,
 };
-use super::{BindingSource, ExternalFunctionKey, FunctionIdMap, ModuleConfig};
+use super::{
+    BindingSource, ExternalFunctionKey, FunctionIdMap, HEADER_FIELD_MASK, ModuleConfig, TAG_RECORD,
+    VALUE_TAG_MASK,
+};
+use crate::analyse::Inferred;
 
 fn ensure_external_cranelift_import(
     module: &mut ObjectModule,
@@ -2606,6 +2611,218 @@ fn lower_print_call(
     Ok(ctx.expect_result(call, "print"))
 }
 
+struct ConstructorDispatchCase<'a> {
+    constructor_index: u16,
+    clause: &'a crate::ast::Clause<TypedExpr, Arc<Type>, EcoString>,
+}
+
+fn try_lower_zero_arity_constructor_case(
+    module: &mut ObjectModule,
+    subject_value: Value,
+    clauses: &[crate::ast::Clause<TypedExpr, Arc<Type>, EcoString>],
+    ctx: &mut LoweringContext<'_, '_, '_>,
+) -> Result<Option<Value>> {
+    if clauses.is_empty() {
+        return Ok(None);
+    }
+
+    let mut cases = Vec::new();
+    let mut default_clause = None;
+    let mut record_type: Option<Arc<Type>> = None;
+
+    for (index, clause) in clauses.iter().enumerate() {
+        if clause.guard.is_some() {
+            return Ok(None);
+        }
+
+        let Some(pattern) = clause.pattern.first() else {
+            return Ok(None);
+        };
+
+        match pattern {
+            Pattern::Constructor {
+                arguments,
+                spread,
+                constructor: Inferred::Known(constructor),
+                type_,
+                ..
+            } if arguments.is_empty() && spread.is_none() => {
+                if type_.is_bool() {
+                    return Ok(None);
+                }
+
+                if let Some(existing) = &record_type {
+                    if !Arc::ptr_eq(existing, type_) {
+                        return Ok(None);
+                    }
+                } else {
+                    record_type = Some(type_.clone());
+                }
+
+                cases.push(ConstructorDispatchCase {
+                    constructor_index: constructor.constructor_index,
+                    clause,
+                });
+            }
+            Pattern::Discard { .. } | Pattern::Variable { .. } => {
+                if default_clause.is_some() {
+                    return Ok(None);
+                }
+                default_clause = Some(index);
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    if cases.len() < 2 {
+        return Ok(None);
+    }
+
+    cases.sort_by_key(|case| case.constructor_index);
+    for pair in cases.windows(2) {
+        if pair[0].constructor_index == pair[1].constructor_index {
+            return Ok(None);
+        }
+    }
+
+    let first = cases.first().unwrap();
+    let last = cases.last().unwrap();
+    let min_index = first.constructor_index as u32;
+    let max_index = last.constructor_index as u32;
+    if max_index - min_index + 1 != cases.len() as u32 {
+        return Ok(None);
+    }
+
+    let pointer_type = ctx.pointer_type;
+    let exit_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(exit_block, pointer_type);
+
+    let dispatch_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(dispatch_block, pointer_type);
+    let default_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(default_block, pointer_type);
+
+    let _ = ctx.builder.ins().jump(dispatch_block, &[subject_value]);
+    ctx.builder.switch_to_block(dispatch_block);
+    let subject = ctx.expect_block_param(dispatch_block, 0, "constructor dispatch subject");
+
+    let value_tag_mask = ctx.builder.ins().iconst(pointer_type, VALUE_TAG_MASK);
+    let boxed_check = ctx.builder.ins().band(subject, value_tag_mask);
+    let zero = ctx.builder.ins().iconst(pointer_type, 0);
+    let is_boxed = ctx.builder.ins().icmp(IntCC::Equal, boxed_check, zero);
+
+    let pointer_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(pointer_block, pointer_type);
+    let _ = ctx.builder.ins().brif(
+        is_boxed,
+        pointer_block,
+        &[subject],
+        default_block,
+        &[subject],
+    );
+    ctx.seal_block(dispatch_block);
+
+    let mem_flags = MemFlags::trusted();
+
+    ctx.builder.switch_to_block(pointer_block);
+    let pointer_subject = ctx.expect_block_param(pointer_block, 0, "constructor pointer subject");
+    let header = ctx
+        .builder
+        .ins()
+        .load(pointer_type, mem_flags, pointer_subject, 0);
+    let tag_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(tag_block, pointer_type);
+    let _ = ctx.builder.append_block_param(tag_block, pointer_type);
+    let _ = ctx
+        .builder
+        .ins()
+        .jump(tag_block, &[pointer_subject, header]);
+    ctx.seal_block(pointer_block);
+
+    ctx.builder.switch_to_block(tag_block);
+    let tag_subject = ctx.expect_block_param(tag_block, 0, "constructor tag subject");
+    let tag_header = ctx.expect_block_param(tag_block, 1, "constructor tag header");
+    let header_mask = ctx.builder.ins().iconst(pointer_type, HEADER_FIELD_MASK);
+    let record_tag = ctx.builder.ins().iconst(pointer_type, TAG_RECORD);
+    let header_tag = ctx.builder.ins().band(tag_header, header_mask);
+    let tag_matches = ctx.builder.ins().icmp(IntCC::Equal, header_tag, record_tag);
+
+    let record_block = ctx.builder.create_block();
+    let _ = ctx.builder.append_block_param(record_block, pointer_type);
+    let _ = ctx.builder.ins().brif(
+        tag_matches,
+        record_block,
+        &[tag_subject],
+        default_block,
+        &[subject],
+    );
+    ctx.seal_block(tag_block);
+
+    ctx.builder.switch_to_block(record_block);
+    let record_subject = ctx.expect_block_param(record_block, 0, "constructor record subject");
+    let constructor_offset = ctx.pointer_bytes() as i32;
+    let ctor_index = ctx.builder.ins().load(
+        ir::types::I32,
+        mem_flags,
+        record_subject,
+        constructor_offset,
+    );
+
+    let mut case_blocks = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let block = ctx.builder.create_block();
+        case_blocks.push((block, case));
+    }
+
+    let pool = &mut ctx.builder.func.dfg.value_lists;
+    let default_call = BlockCall::new(default_block, &[subject], pool);
+    let mut case_calls = Vec::with_capacity(case_blocks.len());
+    for (block, _) in &case_blocks {
+        case_calls.push(BlockCall::new(*block, &[], pool));
+    }
+    let jump_table_data = JumpTableData::new(default_call, &case_calls);
+    let jump_table = ctx.builder.create_jump_table(jump_table_data);
+
+    let adjusted_index = if min_index != 0 {
+        ctx.builder.ins().iadd_imm(ctor_index, -(min_index as i64))
+    } else {
+        ctor_index
+    };
+
+    let _ = ctx.builder.ins().br_table(adjusted_index, jump_table);
+    ctx.seal_block(record_block);
+
+    for (case_block, case) in case_blocks {
+        ctx.builder.switch_to_block(case_block);
+        ctx.push_scope();
+        let value = lower_expression(module, &case.clause.then, ctx)?;
+        ctx.pop_scope();
+        let _ = ctx.builder.ins().jump(exit_block, &[value]);
+        ctx.seal_block(case_block);
+    }
+
+    ctx.builder.switch_to_block(default_block);
+    let default_subject = ctx.expect_block_param(default_block, 0, "constructor default subject");
+    if let Some(index) = default_clause {
+        let clause = &clauses[index];
+        ctx.push_scope();
+        if let Pattern::Variable { name, .. } = &clause.pattern[0] {
+            ctx.define(name, default_subject);
+        }
+        let value = lower_expression(module, &clause.then, ctx)?;
+        ctx.pop_scope();
+        let _ = ctx.builder.ins().jump(exit_block, &[value]);
+    } else {
+        let _ = ctx.builder.ins().trap(TrapCode::User(0));
+    }
+    ctx.seal_block(default_block);
+
+    ctx.seal_block(exit_block);
+    ctx.builder.switch_to_block(exit_block);
+    let result = ctx.expect_block_param(exit_block, 0, "constructor dispatch result");
+    Ok(Some(result))
+}
+
 fn lower_case(
     module: &mut ObjectModule,
     subjects: &[TypedExpr],
@@ -2636,6 +2853,14 @@ fn lower_case(
     let mut subject_values = Vec::with_capacity(subject_count);
     for subject in subjects {
         subject_values.push(lower_expression(module, subject, ctx)?);
+    }
+
+    if subject_count == 1 {
+        if let Some(value) =
+            try_lower_zero_arity_constructor_case(module, subject_values[0], clauses, ctx)?
+        {
+            return Ok(value);
+        }
     }
 
     let exit_block = ctx.builder.create_block();
