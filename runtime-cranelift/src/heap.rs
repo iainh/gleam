@@ -85,9 +85,7 @@ impl Heap {
     pub fn alloc_float(&self, value: f64) -> Result<Value, AllocationError> {
         let ptr = self.allocate_box(FloatBox::HEADER)?;
         unsafe {
-            ptr.cast::<FloatBox>()
-                .as_ptr()
-                .write(FloatBox::new(value));
+            ptr.cast::<FloatBox>().as_ptr().write(FloatBox::new(value));
         }
         Ok(Value::from_raw(ptr.as_ptr() as u64))
     }

@@ -37,7 +37,10 @@ use super::{
 
 fn expect_nth<'a, T>(slice: &'a [T], index: usize, context: &'static str) -> &'a T {
     slice.get(index).unwrap_or_else(|| {
-        panic!("native lowering: {context} expected element at index {index}, len {}", slice.len())
+        panic!(
+            "native lowering: {context} expected element at index {index}, len {}",
+            slice.len()
+        )
     })
 }
 
@@ -1255,7 +1258,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         current_block: ir::Block,
         subject: Value,
         failure_block: ir::Block,
-        failure_args: &[Value],
+        mut subjects: Vec<Value>,
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>)> {
         let success_block = self.create_subject_block(subject_count);
@@ -1276,15 +1279,20 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .icmp(IntCC::Equal, size_value, zero_value);
 
-        let args = failure_args.to_vec();
-        let _ = self
-            .builder
-            .ins()
-            .brif(is_empty, success_block, &args, failure_block, &args);
+        let failure_values = subjects.as_slice();
+        let _ = self.builder.ins().brif(
+            is_empty,
+            success_block,
+            failure_values,
+            failure_block,
+            failure_values,
+        );
         self.seal_block(current_block);
 
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
-        Ok((success_block, params))
+        let params = self.builder.func.dfg.block_params(success_block);
+        subjects.clear();
+        subjects.extend_from_slice(params);
+        Ok((success_block, subjects))
     }
 
     pub(super) fn branch_on_sized_int_bit_array_pattern(
@@ -1294,7 +1302,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         subject: Value,
         size_bits: i64,
         failure_block: ir::Block,
-        failure_args: &[Value],
+        mut subjects: Vec<Value>,
         subject_count: usize,
     ) -> Result<(ir::Block, Vec<Value>, Value)> {
         let success_block = self.builder.create_block();
@@ -1327,22 +1335,29 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .icmp(IntCC::Equal, size_value, expected_size);
 
-        let args = failure_args.to_vec();
-        let mut success_args = args.clone();
-        success_args.push(value);
+        let failure_len = subjects.len();
+        subjects.push(value);
+        let success_args = subjects.as_slice();
+        let failure_args = &success_args[..failure_len];
         let _ = self.builder.ins().brif(
             size_matches,
             success_block,
-            &success_args,
+            success_args,
             failure_block,
-            &args,
+            failure_args,
         );
         self.seal_block(current_block);
 
+        subjects.truncate(failure_len);
+
         self.builder.switch_to_block(success_block);
-        let params = self.builder.func.dfg.block_params(success_block).to_vec();
-        let subjects = expect_prefix(&params, subject_count, "branch_on_sized_int_bit_array subjects");
-        let captured = *expect_nth(&params, subject_count, "branch_on_sized_int_bit_array captured");
+        let params = self.builder.func.dfg.block_params(success_block);
+        subjects.clear();
+        subjects.extend_from_slice(params);
+        let captured = subjects.pop().ok_or_else(|| crate::Error::NativeCodegen {
+            message: "missing captured sized integer value in native bit array pattern lowering"
+                .into(),
+        })?;
         Ok((success_block, subjects, captured))
     }
 
@@ -1398,7 +1413,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         self.builder.switch_to_block(success_block);
         let params = self.builder.block_params(success_block).to_vec();
-        let new_subjects = expect_prefix(&params, subject_count, "branch_on_bit_array_byte subjects");
+        let new_subjects =
+            expect_prefix(&params, subject_count, "branch_on_bit_array_byte subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_bit_array_byte extras");
         Ok((success_block, new_subjects, extras))
     }
@@ -1456,7 +1472,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         self.builder.switch_to_block(success_block);
         let params = self.builder.block_params(success_block).to_vec();
-        let new_subjects = expect_prefix(&params, subject_count, "branch_on_bit_array_prefix subjects");
+        let new_subjects = expect_prefix(
+            &params,
+            subject_count,
+            "branch_on_bit_array_prefix subjects",
+        );
         let extras = expect_suffix(&params, subject_count, "branch_on_bit_array_prefix extras");
         Ok((success_block, new_subjects, extras))
     }
@@ -1920,7 +1940,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
 
         self.builder.switch_to_block(success_block);
         let params = self.builder.block_params(success_block).to_vec();
-        let new_subjects = expect_prefix(&params, subject_count, "branch_on_utf8_codepoint subjects");
+        let new_subjects =
+            expect_prefix(&params, subject_count, "branch_on_utf8_codepoint subjects");
         let extras = expect_suffix(&params, subject_count, "branch_on_utf8_codepoint extras");
         Ok((success_block, new_subjects, extras))
     }
@@ -2144,7 +2165,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let failure_values = expect_prefix(
             failure_args,
             failure_block_arg_count,
-            "bit array constructor failure args"
+            "bit array constructor failure args",
         );
         let _ = self.builder.ins().brif(
             is_boxed,
@@ -2384,7 +2405,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         let failure_values = expect_prefix(
             failure_args,
             failure_block_arg_count,
-            "tuple constructor failure args"
+            "tuple constructor failure args",
         );
         let _ = self.builder.ins().brif(
             is_boxed,
@@ -2566,7 +2587,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let failure_values = expect_prefix(
                 &subjects,
                 failure_block_arg_count,
-                "list pattern failure args before non-nil"
+                "list pattern failure args before non-nil",
             );
             let _ = self.builder.ins().brif(
                 is_nil,
@@ -2583,7 +2604,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
-                "list pattern subject after non-nil"
+                "list pattern subject after non-nil",
             );
 
             let value_tag_mask = self.builder.ins().iconst(self.pointer_type, VALUE_TAG_MASK);
@@ -2600,7 +2621,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let failure_values = expect_prefix(
                 &subjects,
                 failure_block_arg_count,
-                "list pattern failure args before pointer"
+                "list pattern failure args before pointer",
             );
             let _ = self.builder.ins().brif(
                 is_boxed,
@@ -2619,7 +2640,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
-                "list pattern subject after pointer"
+                "list pattern subject after pointer",
             );
 
             let header = self
@@ -2643,7 +2664,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let failure_values = expect_prefix(
                 &subjects,
                 failure_block_arg_count,
-                "list pattern failure args before list block"
+                "list pattern failure args before list block",
             );
             let _ = self.builder.ins().brif(
                 is_list,
@@ -2662,9 +2683,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
-                "list pattern subject after list block"
+                "list pattern subject after list block",
             );
-            let head_pattern = expect_nth(head_patterns, index, "list pattern head pattern").as_ref();
+            let head_pattern =
+                expect_nth(head_patterns, index, "list pattern head pattern").as_ref();
             let mut head_extras: Vec<Value> = Vec::new();
             if let Some(pattern) = head_pattern {
                 let head_value = self.builder.ins().load(
@@ -2711,7 +2733,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 current_subject = *expect_nth(
                     &subjects,
                     subject_index,
-                    "list pattern subject after head match"
+                    "list pattern subject after head match",
                 );
                 head_extras = extras;
                 if self.builder.current_block() != Some(current_block) {
@@ -2782,7 +2804,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         let failure_values = expect_prefix(
                                             &subjects,
                                             failure_block_arg_count,
-                                            "list constructor string condition failure args"
+                                            "list constructor string condition failure args",
                                         );
                                         let success_values = subjects.clone();
                                         let _ = self.builder.ins().brif(
@@ -2812,7 +2834,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                                         let failure_values = expect_prefix(
                                             &subjects,
                                             failure_block_arg_count,
-                                            "list constructor empty condition failure args"
+                                            "list constructor empty condition failure args",
                                         );
                                         let success_values = subjects.clone();
                                         let _ = self.builder.ins().brif(
@@ -2874,11 +2896,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
                 }
             }
 
-            *expect_nth_mut(
-                &mut subjects,
-                subject_index,
-                "list pattern assign tail"
-            ) = tail;
+            *expect_nth_mut(&mut subjects, subject_index, "list pattern assign tail") = tail;
             current_subject = tail;
         }
 
@@ -2907,7 +2925,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             let failure_values = expect_prefix(
                 &subjects,
                 failure_block_arg_count,
-                "list pattern ensure exact failure args"
+                "list pattern ensure exact failure args",
             );
             let _ = self.builder.ins().brif(
                 is_nil,
@@ -2924,7 +2942,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             current_subject = *expect_nth(
                 &subjects,
                 subject_index,
-                "list pattern subject after exact check"
+                "list pattern subject after exact check",
             );
         }
 

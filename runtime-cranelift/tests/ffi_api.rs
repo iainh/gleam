@@ -1,10 +1,11 @@
 use runtime_cranelift::ffi::{
-    gleam_ffi_bytes_free, gleam_ffi_decode_uint, gleam_ffi_encode_uint, gleam_ffi_list_from_array,
-    gleam_ffi_list_to_array, gleam_ffi_resource_from_ptr, gleam_ffi_resource_to_ptr,
-    gleam_ffi_string_from_utf8, gleam_ffi_string_to_utf8, gleam_ffi_values_free, GleamFfiStatus,
+    GleamFfiStatus, gleam_ffi_bytes_free, gleam_ffi_decode_uint, gleam_ffi_encode_uint,
+    gleam_ffi_list_from_array, gleam_ffi_list_to_array, gleam_ffi_resource_from_ptr,
+    gleam_ffi_resource_to_ptr, gleam_ffi_string_from_utf8, gleam_ffi_string_to_utf8,
+    gleam_ffi_values_free,
 };
 use runtime_cranelift::{
-    list_from_values, list_to_values, string_from_rust, string_to_rust, Value,
+    Value, list_from_values, list_to_values, string_from_rust, string_to_rust,
 };
 
 #[test]

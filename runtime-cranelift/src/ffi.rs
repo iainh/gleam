@@ -1,8 +1,10 @@
 //! `extern "C"` entry points and helpers invoked from native Gleam code.
 
 use std::{
+    collections::HashSet,
     convert::TryFrom,
     ffi::c_void,
+    fmt::Write as FmtWrite,
     fs,
     io::{self, Write},
     mem,
@@ -12,24 +14,24 @@ use std::{
 };
 
 use crate::{
+    Header, Heap, Tag, Value,
     atom::AtomTable,
     binary,
     ffi_helpers::{
+        ListDecodeError, ResourceDecodeError, StringDecodeError, UnsignedIntDecodeError,
         decode_unsigned_int, encode_unsigned_int, list_from_values, list_to_values,
-        resource_from_ptr, resource_to_ptr, string_bytes, string_from_bytes, ListDecodeError,
-        ResourceDecodeError, StringDecodeError, UnsignedIntDecodeError,
+        resource_from_ptr, resource_to_ptr, string_bytes, string_from_bytes,
     },
     gc,
     heap::AllocationError,
     layout::{
         Binary, BinaryData, BinarySlice, BitArray as BitArrayLayout, Closure, ClosureFn, ConsCell,
-        FloatBox, Map, MapEntry, MapTable,
+        FloatBox, Map, MapEntry, MapTable, Record, ResourceHandle,
     },
-    Header, Heap, Tag, Value,
 };
 
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use hex::{decode as hex_decode, encode_upper};
 use rand::Rng;
 use unicode_segmentation::UnicodeSegmentation;
@@ -83,6 +85,14 @@ pub extern "C" fn gleam_bool_true() -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn gleam_bool_false() -> u64 {
     Value::from_bool(false).to_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn inspect(value_raw: u64) -> u64 {
+    let value = Value::from_raw(value_raw);
+    let mut inspector = ValueInspector::new();
+    let rendered = inspector.inspect(value);
+    string_to_value(&rendered).to_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -668,10 +678,311 @@ fn tuple_to_vec(value: Value) -> Vec<Value> {
     unsafe { slice::from_raw_parts(payload_ptr, len) }.to_vec()
 }
 
+fn record_to_fields(value: Value) -> (u32, Vec<Value>) {
+    let record_ptr = value
+        .as_boxed::<Record>()
+        .unwrap_or_else(|| panic!("expected record value"));
+    unsafe {
+        let record = record_ptr.as_ref();
+        let ctor = record.constructor_index;
+        let field_count = record.header.arity() as usize;
+        let fields_ptr =
+            (record_ptr.as_ptr() as *const u8).add(mem::size_of::<Record>()) as *const Value;
+        let fields = slice::from_raw_parts(fields_ptr, field_count).to_vec();
+        (ctor, fields)
+    }
+}
+
 fn header_tag(value: Value) -> Option<Tag> {
     value
         .as_boxed::<Header>()
         .map(|ptr| unsafe { ptr.as_ref().tag() })
+}
+
+fn format_float_for_inspect(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
+    }
+
+    let mut text = value.to_string();
+    if let Some(stripped) = text.strip_prefix('+') {
+        text = stripped.to_string();
+    }
+
+    if text.contains('.') {
+        text
+    } else if let Some(exp_index) = text.find(['e', 'E']) {
+        let (base, exponent) = text.split_at(exp_index);
+        let mut result = base.to_string();
+        result.push_str(".0");
+        result.push_str(exponent);
+        result
+    } else {
+        text + ".0"
+    }
+}
+
+fn escape_string_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 2);
+    for ch in text.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\r' => escaped.push_str("\\r"),
+            '\n' => escaped.push_str("\\n"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            c if (c as u32) < 32 || ((c as u32) > 126 && (c as u32) < 160) => {
+                let code = c as u32;
+                let _ = FmtWrite::write_fmt(&mut escaped, format_args!("\\u{{{code:04X}}}"));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn char_from_list_element(value: Value) -> Option<char> {
+    let code = value.to_i63()?;
+    if !(32..=126).contains(&code) {
+        return None;
+    }
+    char::from_u32(code as u32)
+}
+
+struct ValueInspector {
+    seen: HashSet<u64>,
+}
+
+impl ValueInspector {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+        }
+    }
+
+    fn inspect(&mut self, value: Value) -> String {
+        if value == Value::nil() {
+            return "Nil".into();
+        }
+        if value == Value::from_bool(true) {
+            return "True".into();
+        }
+        if value == Value::from_bool(false) {
+            return "False".into();
+        }
+        if value.is_i63() {
+            if let Some(int) = value.to_i63() {
+                return int.to_string();
+            }
+        }
+        if value.is_atom() {
+            return self.inspect_atom(value);
+        }
+
+        let Some(tag) = header_tag(value) else {
+            return format!("//native(unknown {:#x})", value.to_raw());
+        };
+        let raw = value.to_raw();
+        if !self.seen.insert(raw) {
+            return "//native(circular reference)".into();
+        }
+        let rendered = self.inspect_boxed(value, tag);
+        self.seen.remove(&raw);
+        rendered
+    }
+
+    fn inspect_boxed(&mut self, value: Value, tag: Tag) -> String {
+        match tag {
+            Tag::Binary | Tag::BinarySlice => self.inspect_string(value),
+            Tag::List => self.inspect_list(value),
+            Tag::Tuple => self.inspect_tuple(value),
+            Tag::Record => self.inspect_record(value),
+            Tag::Map => self.inspect_map(value),
+            Tag::Closure => self.inspect_closure(value),
+            Tag::BitArray => self.inspect_bit_array(value),
+            Tag::Float => {
+                let ptr = value
+                    .as_boxed::<FloatBox>()
+                    .unwrap_or_else(|| panic!("expected Float value"));
+                let float = unsafe { (*ptr.as_ptr()).value };
+                format_float_for_inspect(float)
+            }
+            Tag::Resource => self.inspect_resource(value),
+            Tag::Boolean => {
+                if value == Value::from_bool(true) {
+                    "True".into()
+                } else {
+                    "False".into()
+                }
+            }
+            Tag::Nil => "Nil".into(),
+            other => format!("//native({other:?})"),
+        }
+    }
+
+    fn inspect_atom(&self, value: Value) -> String {
+        let Some(index) = value.atom_index() else {
+            return "//native(atom)".into();
+        };
+        let name = atom_table()
+            .resolve(index)
+            .map(|arc| arc.to_string())
+            .unwrap_or_else(|| format!("atom#{index}"));
+        format!(
+            "atom.create_from_string(\"{}\")",
+            escape_string_literal(&name)
+        )
+    }
+
+    fn inspect_string(&self, value: Value) -> String {
+        match value_to_string(value) {
+            Ok(text) => format!("\"{}\"", escape_string_literal(&text)),
+            Err(_) => match value_to_bytes(value) {
+                Ok(bytes) => {
+                    if bytes.is_empty() {
+                        "<<>>".into()
+                    } else {
+                        let pieces: Vec<String> =
+                            bytes.into_iter().map(|b| b.to_string()).collect();
+                        format!("<<{}>>", pieces.join(", "))
+                    }
+                }
+                Err(_) => "//native(binary)".into(),
+            },
+        }
+    }
+
+    fn inspect_list(&mut self, value: Value) -> String {
+        let mut elements = Vec::new();
+        let mut char_builder = Some(String::new());
+        let mut visited_nodes = HashSet::new();
+        let mut current = value;
+
+        while current != Value::nil() {
+            if !visited_nodes.insert(current.to_raw()) {
+                elements.push("//native(circular reference)".into());
+                break;
+            }
+
+            let Some(cons_ptr) = current.as_boxed::<ConsCell>() else {
+                let improp_tail = self.inspect(current);
+                if elements.is_empty() {
+                    return format!("//native([ | {improp_tail}])");
+                }
+                return format!("//native([{} | {improp_tail}])", elements.join(", "));
+            };
+
+            unsafe {
+                let cons = cons_ptr.as_ref();
+                if let Some(builder) = char_builder.as_mut() {
+                    if let Some(ch) = char_from_list_element(cons.head) {
+                        builder.push(ch);
+                    } else {
+                        char_builder = None;
+                    }
+                }
+                elements.push(self.inspect(cons.head));
+                current = cons.tail;
+            }
+        }
+
+        if let Some(chars) = char_builder {
+            format!(
+                "charlist.from_string(\"{}\")",
+                escape_string_literal(&chars)
+            )
+        } else {
+            format!("[{}]", elements.join(", "))
+        }
+    }
+
+    fn inspect_tuple(&mut self, value: Value) -> String {
+        let elements = tuple_to_vec(value);
+        let rendered: Vec<String> = elements.into_iter().map(|v| self.inspect(v)).collect();
+        format!("#({})", rendered.join(", "))
+    }
+
+    fn inspect_record(&mut self, value: Value) -> String {
+        let (ctor_index, fields) = record_to_fields(value);
+        let parts: Vec<String> = fields
+            .into_iter()
+            .map(|field| self.inspect(field))
+            .collect();
+        if parts.is_empty() {
+            format!("//record({ctor_index})")
+        } else {
+            format!("//record({ctor_index}, [{}])", parts.join(", "))
+        }
+    }
+
+    fn inspect_map(&mut self, value: Value) -> String {
+        let mut entries = map_entries_vec(value);
+        if entries.is_empty() {
+            return "dict.from_list([])".into();
+        }
+        entries.sort_by_key(|(key, _)| key.to_raw());
+        let rendered: Vec<String> = entries
+            .into_iter()
+            .map(|(key, val)| {
+                let key_str = self.inspect(key);
+                let val_str = self.inspect(val);
+                format!("#({key_str}, {val_str})")
+            })
+            .collect();
+        format!("dict.from_list([{}])", rendered.join(", "))
+    }
+
+    fn inspect_bit_array(&self, value: Value) -> String {
+        let view = bit_array_view(value, "inspect bit array");
+        if view.bit_len == 0 {
+            return "<<>>".into();
+        }
+        let full_bytes = view.bit_len / 8;
+        let mut pieces = Vec::new();
+        for index in 0..full_bytes {
+            let byte = read_byte(&view, index);
+            pieces.push(byte.to_string());
+        }
+        let remainder = view.bit_len % 8;
+        if remainder > 0 {
+            let byte = read_byte(&view, full_bytes);
+            let value = byte >> (8 - remainder);
+            pieces.push(format!("{value}:size({remainder})"));
+        }
+        format!("<<{}>>", pieces.join(", "))
+    }
+
+    fn inspect_closure(&self, value: Value) -> String {
+        let ptr = value
+            .as_boxed::<Closure>()
+            .unwrap_or_else(|| panic!("expected Closure value"));
+        unsafe {
+            let env_size = (*ptr.as_ptr()).env_size;
+            if env_size == 0 {
+                "//fn(...) { ... }".into()
+            } else {
+                format!("//fn(env = {env_size}) {{ ... }}")
+            }
+        }
+    }
+
+    fn inspect_resource(&self, value: Value) -> String {
+        let ptr = value
+            .as_boxed::<ResourceHandle>()
+            .unwrap_or_else(|| panic!("expected Resource value"));
+        unsafe {
+            let resource = ptr.as_ref();
+            format!("//resource({:?})", resource.pointer)
+        }
+    }
 }
 
 fn is_bool_value(value: Value) -> bool {

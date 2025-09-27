@@ -1,7 +1,7 @@
 use runtime_cranelift::{
-    decode_unsigned_int, encode_unsigned_int, list_from_values, list_to_values, resource_from_ptr,
-    resource_to_ptr, string_from_rust, string_to_rust, ListDecodeError, ResourceDecodeError,
-    UnsignedIntDecodeError, Value,
+    ListDecodeError, ResourceDecodeError, UnsignedIntDecodeError, Value, decode_unsigned_int,
+    encode_unsigned_int, list_from_values, list_to_values, resource_from_ptr, resource_to_ptr,
+    string_from_rust, string_to_rust,
 };
 
 #[test]

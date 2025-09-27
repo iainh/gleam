@@ -10,9 +10,12 @@ use crate::{
     bit_array::GetLiteralValue,
     type_::{ModuleValueConstructor, PatternConstructor, Type, ValueConstructorVariant},
 };
-use cranelift_codegen::ir::{
-    self, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, Value,
-    condcodes::{FloatCC, IntCC},
+use cranelift_codegen::{
+    Context,
+    ir::{
+        self, InstBuilder, MemFlags, StackSlotData, StackSlotKind, TrapCode, Value,
+        condcodes::{FloatCC, IntCC},
+    },
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataId, FuncId, Linkage, Module};
@@ -69,10 +72,12 @@ fn lower_external_cranelift_stub(
     external_module: &EcoString,
     external_symbol: &EcoString,
     external_imports: &mut HashMap<ExternalFunctionKey, FuncId>,
+    ctx: &mut Context,
+    builder_ctx: &mut FunctionBuilderContext,
 ) -> Result<()> {
     let arity = function.arguments.len();
 
-    let mut ctx = module.make_context();
+    ctx.clear();
     for _ in 0..arity {
         ctx.func
             .signature
@@ -84,8 +89,7 @@ fn lower_external_cranelift_stub(
         .returns
         .push(ir::AbiParam::new(pointer_type));
 
-    let mut func_ctx = FunctionBuilderContext::new();
-    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let mut builder = FunctionBuilder::new(&mut ctx.func, builder_ctx);
     let block = builder.create_block();
     builder.append_block_params_for_function_params(block);
     builder.switch_to_block(block);
@@ -116,7 +120,7 @@ fn lower_external_cranelift_stub(
     let _ = builder.ins().return_(&[result]);
     builder.finalize();
 
-    if let Err(err) = module.define_function(func_id, &mut ctx) {
+    if let Err(err) = module.define_function(func_id, ctx) {
         let clif = format!("{}", ctx.func.display());
         let func_name = function
             .name
@@ -130,7 +134,7 @@ fn lower_external_cranelift_stub(
         });
     }
 
-    module.clear_context(&mut ctx);
+    module.clear_context(ctx);
     Ok(())
 }
 
@@ -431,6 +435,8 @@ pub(crate) fn lower_module_functions(
     let mut module_functions = HashMap::new();
     let mut external_function_imports = HashMap::new();
     let mut closure_counter = 0usize;
+    let mut reusable_ctx = module.make_context();
+    let mut builder_ctx = FunctionBuilderContext::new();
 
     for function in functions {
         let Some((_, name)) = &function.name else {
@@ -455,6 +461,8 @@ pub(crate) fn lower_module_functions(
             &mut module_functions,
             &mut external_function_imports,
             &mut closure_counter,
+            &mut reusable_ctx,
+            &mut builder_ctx,
         )?;
     }
 
@@ -476,6 +484,8 @@ fn lower_function(
     module_functions: &mut HashMap<(EcoString, EcoString, usize), FuncId>,
     external_imports: &mut HashMap<ExternalFunctionKey, FuncId>,
     closure_counter: &mut usize,
+    ctx: &mut Context,
+    builder_ctx: &mut FunctionBuilderContext,
 ) -> Result<()> {
     let pointer_type = module.target_config().pointer_type();
     let pointer_bytes = module.target_config().pointer_bytes();
@@ -491,11 +501,12 @@ fn lower_function(
                 external_module,
                 external_symbol,
                 external_imports,
+                ctx,
+                builder_ctx,
             );
         }
     }
-
-    let mut ctx = module.make_context();
+    ctx.clear();
     for _ in &function.arguments {
         ctx.func
             .signature
@@ -507,8 +518,7 @@ fn lower_function(
         .returns
         .push(ir::AbiParam::new(pointer_type));
 
-    let mut func_ctx = FunctionBuilderContext::new();
-    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+    let mut builder = FunctionBuilder::new(&mut ctx.func, builder_ctx);
     let block = builder.create_block();
     builder.append_block_params_for_function_params(block);
     builder.switch_to_block(block);
@@ -577,7 +587,7 @@ fn lower_function(
 
     builder.finalize();
 
-    if let Err(err) = module.define_function(func_id, &mut ctx) {
+    if let Err(err) = module.define_function(func_id, ctx) {
         let clif = format!("{}", ctx.func.display());
         let func_name = function
             .name
@@ -588,7 +598,7 @@ fn lower_function(
             message: format!("error lowering {module_name}.{func_name}: {err} ({err:?})\n{clif}",),
         });
     }
-    module.clear_context(&mut ctx);
+    module.clear_context(ctx);
     Ok(())
 }
 
@@ -3264,12 +3274,13 @@ fn lower_case(
                 }
                 Pattern::BitArray { segments, .. } => {
                     if segments.is_empty() {
+                        let subject = pattern_subjects[subject_index];
                         let (block, params) = ctx.branch_on_empty_bit_array_pattern(
                             module,
                             pattern_block,
-                            pattern_subjects[subject_index],
+                            subject,
                             next_block,
-                            pattern_subjects.as_slice(),
+                            pattern_subjects,
                             subject_count,
                         )?;
                         pattern_block = block;
@@ -3289,14 +3300,15 @@ fn lower_case(
                                 if segment.type_.is_int() {
                                     if let Some(size_literal) = size_pattern.as_int_literal() {
                                         if let Some(size_bits) = size_literal.to_i64() {
-                                            let (block, params, _value) = ctx
+                                            let subject = pattern_subjects[subject_index];
+                                            let (block, params, captured) = ctx
                                                 .branch_on_sized_int_bit_array_pattern(
                                                     module,
                                                     pattern_block,
-                                                    pattern_subjects[subject_index],
+                                                    subject,
                                                     size_bits,
                                                     next_block,
-                                                    pattern_subjects.as_slice(),
+                                                    pattern_subjects,
                                                     subject_count,
                                                 )?;
                                             pattern_block = block;
@@ -3304,19 +3316,6 @@ fn lower_case(
 
                                             match segment.value.as_ref() {
                                                 Pattern::Variable { name, .. } => {
-                                                    let block_params = ctx
-                                                        .builder
-                                                        .block_params(pattern_block)
-                                                        .to_vec();
-                                                    let base_index = pattern_subjects.len();
-                                                    let captured = block_params
-                                                        .get(base_index)
-                                                        .copied()
-                                                        .ok_or_else(|| {
-                                                            crate::Error::NativeCodegen {
-                                                                message: "missing sized int capture parameter in native case lowering".into(),
-                                                            }
-                                                        })?;
                                                     bindings.push((
                                                         name.clone(),
                                                         BindingSource::Value(captured),
@@ -4039,8 +4038,6 @@ fn lower_case(
                                     .into(),
                         });
                     }
-
-                    continue;
                 }
                 other => {
                     eprintln!("UNSUPPORTED_PATTERN {:?}", other);
