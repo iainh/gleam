@@ -38,7 +38,7 @@ use super::{
 use crate::analyse::Inferred;
 
 #[cfg(test)]
-use {crate::ast::SrcSpan, cranelift_codegen::ir::Opcode};
+use crate::ast::SrcSpan;
 
 fn constant_pool_key_from_expr(expr: &TypedExpr) -> Option<ConstantPoolKey> {
     match expr {
@@ -107,15 +107,19 @@ fn constant_pool_key_from_expr(expr: &TypedExpr) -> Option<ConstantPoolKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ast::TypedExpr, type_};
+    use crate::{
+        ast::{ClauseGuard, TypedExpr},
+        type_,
+    };
     use cranelift_codegen::{
         Context as ClifContext,
+        ir::{self, Opcode},
         settings::{self, Configurable},
     };
     use cranelift_frontend::FunctionBuilderContext;
     use cranelift_object::{ObjectBuilder, ObjectModule};
     use num_bigint::BigInt;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
     fn setup_module() -> (
         ObjectModule,
@@ -169,12 +173,16 @@ mod tests {
         }
     }
 
-    fn call_count(func: &ir::Function) -> usize {
+    fn opcode_count(func: &ir::Function, opcode: Opcode) -> usize {
         func.layout
             .blocks()
             .flat_map(|block| func.layout.block_insts(block))
-            .filter(|inst| func.dfg.insts[*inst].opcode() == Opcode::Call)
+            .filter(|inst| func.dfg.insts[*inst].opcode() == opcode)
             .count()
+    }
+
+    fn call_count(func: &ir::Function) -> usize {
+        opcode_count(func, Opcode::Call)
     }
 
     #[test]
@@ -226,6 +234,192 @@ mod tests {
             assert_eq!(initial_calls, after_calls);
 
             let _ = lowering.builder.ins().return_(&[first]);
+        }
+
+        builder.finalize();
+    }
+
+    fn bool_var_guard(name: &str) -> ClauseGuard<Arc<Type>, EcoString> {
+        ClauseGuard::Var {
+            location: SrcSpan::default(),
+            type_: type_::bool(),
+            name: name.into(),
+            definition_location: SrcSpan::default(),
+        }
+    }
+
+    #[test]
+    fn guard_equals_same_operand_is_true() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let guard_var = bool_var_guard("v");
+            let guard = ClauseGuard::Equals {
+                location: SrcSpan::default(),
+                left: Box::new(guard_var.clone()),
+                right: Box::new(guard_var),
+            };
+
+            let _ = lowering
+                .lower_clause_guard_condition(&mut module, &guard)
+                .unwrap();
+            let _ = lowering.builder.ins().return_(&[]);
+        }
+
+        builder.finalize();
+    }
+
+    #[test]
+    fn and_short_circuits_false_without_rhs_evaluation() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let guard_var = bool_var_guard("a");
+            let false_guard = ClauseGuard::NotEquals {
+                location: SrcSpan::default(),
+                left: Box::new(guard_var.clone()),
+                right: Box::new(guard_var),
+            };
+            let rhs = ClauseGuard::Var {
+                location: SrcSpan::default(),
+                type_: type_::bool(),
+                name: "missing".into(),
+                definition_location: SrcSpan::default(),
+            };
+            let guard = ClauseGuard::And {
+                location: SrcSpan::default(),
+                left: Box::new(false_guard),
+                right: Box::new(rhs),
+            };
+
+            let _ = lowering
+                .lower_clause_guard_condition(&mut module, &guard)
+                .unwrap();
+            assert_eq!(opcode_count(&lowering.builder.func, Opcode::Band), 0);
+            let _ = lowering.builder.ins().return_(&[]);
+        }
+
+        builder.finalize();
+    }
+
+    #[test]
+    fn or_short_circuits_true_without_rhs_evaluation() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let guard_var = bool_var_guard("b");
+            let true_guard = ClauseGuard::Equals {
+                location: SrcSpan::default(),
+                left: Box::new(guard_var.clone()),
+                right: Box::new(guard_var),
+            };
+            let rhs = ClauseGuard::Var {
+                location: SrcSpan::default(),
+                type_: type_::bool(),
+                name: "missing".into(),
+                definition_location: SrcSpan::default(),
+            };
+            let guard = ClauseGuard::Or {
+                location: SrcSpan::default(),
+                left: Box::new(true_guard),
+                right: Box::new(rhs),
+            };
+
+            let _ = lowering
+                .lower_clause_guard_condition(&mut module, &guard)
+                .unwrap();
+            assert_eq!(opcode_count(&lowering.builder.func, Opcode::Bor), 0);
+            let _ = lowering.builder.ins().return_(&[]);
         }
 
         builder.finalize();

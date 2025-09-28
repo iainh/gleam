@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::TryFrom,
     mem::size_of,
+    ptr,
     sync::Arc,
 };
 
@@ -34,6 +35,70 @@ use super::{
     FunctionIdMap, HEADER_ARITY_SHIFT, HEADER_FIELD_MASK, HEADER_SIZE, TAG_BOOLEAN, TAG_FLOAT,
     TAG_LIST, TAG_RECORD, TAG_TUPLE, VALUE_TAG_MASK,
 };
+
+fn constant_bool_value(constant: &TypedConstant) -> Option<bool> {
+    if !constant.type_().is_bool() {
+        return None;
+    }
+
+    match constant {
+        Constant::Var { name, .. } | Constant::Record { name, .. } => match name.as_str() {
+            "True" => Some(true),
+            "False" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn guard_static_value(guard: &TypedClauseGuard) -> Option<bool> {
+    match guard {
+        ClauseGuard::Block { value, .. } => guard_static_value(value),
+        ClauseGuard::Constant(constant) => constant_bool_value(constant),
+        ClauseGuard::Not { expression, .. } => guard_static_value(expression).map(|v| !v),
+        ClauseGuard::Equals { left, right, .. } => {
+            if left.as_ref() == right.as_ref() {
+                return Some(true);
+            }
+            match (guard_static_value(left), guard_static_value(right)) {
+                (Some(lhs), Some(rhs)) => Some(lhs == rhs),
+                _ => None,
+            }
+        }
+        ClauseGuard::NotEquals { left, right, .. } => {
+            if left.as_ref() == right.as_ref() {
+                return Some(false);
+            }
+            match (guard_static_value(left), guard_static_value(right)) {
+                (Some(lhs), Some(rhs)) => Some(lhs != rhs),
+                _ => None,
+            }
+        }
+        ClauseGuard::And { left, right, .. } => {
+            match (guard_static_value(left), guard_static_value(right)) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                (Some(true), None) => guard_static_value(right),
+                (None, Some(true)) => guard_static_value(left),
+                _ => None,
+            }
+        }
+        ClauseGuard::Or { left, right, .. } => {
+            match (guard_static_value(left), guard_static_value(right)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                (Some(false), None) => guard_static_value(right),
+                (None, Some(false)) => guard_static_value(left),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn guard_cache_key(guard: &TypedClauseGuard) -> usize {
+    ptr::from_ref(guard) as *const TypedClauseGuard as usize
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ConstantPoolKey {
@@ -136,6 +201,8 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) module_name: &'a EcoString,
     pub(super) sealed_blocks: HashSet<ir::Block>,
     constant_pool: HashMap<ConstantPoolKey, (ir::Block, Value)>,
+    guard_condition_cache: HashMap<usize, Value>,
+    guard_operand_cache: HashMap<usize, Value>,
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
@@ -166,6 +233,14 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         if let Some(block) = self.builder.current_block() {
             let _ = self.constant_pool.insert(key, (block, value));
         }
+    }
+
+    fn guard_condition_constant(&mut self, value: bool) -> Value {
+        let int_value = self
+            .builder
+            .ins()
+            .iconst(ir::types::I8, if value { 1 } else { 0 });
+        self.builder.ins().icmp_imm(IntCC::NotEqual, int_value, 0)
     }
 
     pub(super) fn expect_block_param(
@@ -280,6 +355,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             module_name,
             sealed_blocks: HashSet::new(),
             constant_pool: HashMap::new(),
+            guard_condition_cache: HashMap::new(),
+            guard_operand_cache: HashMap::new(),
         }
     }
 
@@ -2014,72 +2091,157 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         module: &mut ObjectModule,
         guard: &TypedClauseGuard,
     ) -> Result<Value> {
+        let key = guard_cache_key(guard);
+        if let Some(value) = self.guard_condition_cache.get(&key) {
+            return Ok(*value);
+        }
+
+        if let Some(constant) = guard_static_value(guard) {
+            let value = self.guard_condition_constant(constant);
+            let _ = self.guard_condition_cache.insert(key, value);
+            return Ok(value);
+        }
+
         match guard {
-            ClauseGuard::Block { value, .. } => self.lower_clause_guard_condition(module, value),
+            ClauseGuard::Block { value, .. } => {
+                let result = self.lower_clause_guard_condition(module, value)?;
+                let _ = self.guard_condition_cache.insert(key, result);
+                Ok(result)
+            }
             ClauseGuard::Equals { left, right, .. } => {
+                if left.as_ref() == right.as_ref() {
+                    let value = self.guard_condition_constant(true);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
-                Ok(self.builder.ins().icmp(IntCC::Equal, left, right))
+                let value = self.builder.ins().icmp(IntCC::Equal, left, right);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::NotEquals { left, right, .. } => {
+                if left.as_ref() == right.as_ref() {
+                    let value = self.guard_condition_constant(false);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
-                Ok(self.builder.ins().icmp(IntCC::NotEqual, left, right))
+                let value = self.builder.ins().icmp(IntCC::NotEqual, left, right);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::GtInt { left, right, .. } => {
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
                 let left_int = self.builder.ins().sshr_imm(left, 2);
                 let right_int = self.builder.ins().sshr_imm(right, 2);
-                Ok(self
+                let value = self
                     .builder
                     .ins()
-                    .icmp(IntCC::SignedGreaterThan, left_int, right_int))
+                    .icmp(IntCC::SignedGreaterThan, left_int, right_int);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::GtEqInt { left, right, .. } => {
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
                 let left_int = self.builder.ins().sshr_imm(left, 2);
                 let right_int = self.builder.ins().sshr_imm(right, 2);
-                Ok(self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::SignedGreaterThanOrEqual, left_int, right_int))
+                let value =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, left_int, right_int);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::LtInt { left, right, .. } => {
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
                 let left_int = self.builder.ins().sshr_imm(left, 2);
                 let right_int = self.builder.ins().sshr_imm(right, 2);
-                Ok(self
+                let value = self
                     .builder
                     .ins()
-                    .icmp(IntCC::SignedLessThan, left_int, right_int))
+                    .icmp(IntCC::SignedLessThan, left_int, right_int);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::LtEqInt { left, right, .. } => {
                 let left = self.lower_clause_guard_operand(module, left)?;
                 let right = self.lower_clause_guard_operand(module, right)?;
                 let left_int = self.builder.ins().sshr_imm(left, 2);
                 let right_int = self.builder.ins().sshr_imm(right, 2);
-                Ok(self
-                    .builder
-                    .ins()
-                    .icmp(IntCC::SignedLessThanOrEqual, left_int, right_int))
+                let value =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThanOrEqual, left_int, right_int);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::And { left, right, .. } => {
+                if let Some(false) = guard_static_value(left) {
+                    let value = self.guard_condition_constant(false);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(false) = guard_static_value(right) {
+                    let value = self.guard_condition_constant(false);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(true) = guard_static_value(left) {
+                    let value = self.lower_clause_guard_condition(module, right)?;
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(true) = guard_static_value(right) {
+                    let value = self.lower_clause_guard_condition(module, left)?;
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+
                 let left = self.lower_clause_guard_condition(module, left)?;
                 let right = self.lower_clause_guard_condition(module, right)?;
-                Ok(self.builder.ins().band(left, right))
+                let value = self.builder.ins().band(left, right);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::Or { left, right, .. } => {
+                if let Some(true) = guard_static_value(left) {
+                    let value = self.guard_condition_constant(true);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(true) = guard_static_value(right) {
+                    let value = self.guard_condition_constant(true);
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(false) = guard_static_value(left) {
+                    let value = self.lower_clause_guard_condition(module, right)?;
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+                if let Some(false) = guard_static_value(right) {
+                    let value = self.lower_clause_guard_condition(module, left)?;
+                    let _ = self.guard_condition_cache.insert(key, value);
+                    return Ok(value);
+                }
+
                 let left = self.lower_clause_guard_condition(module, left)?;
                 let right = self.lower_clause_guard_condition(module, right)?;
-                Ok(self.builder.ins().bor(left, right))
+                let value = self.builder.ins().bor(left, right);
+                let _ = self.guard_condition_cache.insert(key, value);
+                Ok(value)
             }
             ClauseGuard::Var { .. } | ClauseGuard::Constant(_) => {
                 let value = self.lower_clause_guard_operand(module, guard)?;
                 let true_value = self.bool_constant(module, true)?;
-                Ok(self.builder.ins().icmp(IntCC::Equal, value, true_value))
+                let result = self.builder.ins().icmp(IntCC::Equal, value, true_value);
+                let _ = self.guard_condition_cache.insert(key, result);
+                Ok(result)
             }
             other => Err(crate::Error::NativeCodegen {
                 message: format!("guard `{other:?}` is not yet supported in native functions"),
@@ -2092,18 +2254,34 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
         module: &mut ObjectModule,
         guard: &TypedClauseGuard,
     ) -> Result<Value> {
+        let key = guard_cache_key(guard);
+        if let Some(value) = self.guard_operand_cache.get(&key) {
+            return Ok(*value);
+        }
+
         match guard {
             ClauseGuard::Var { name, .. } => {
-                self.lookup(name)
-                    .copied()
-                    .ok_or_else(|| crate::Error::NativeCodegen {
-                        message: format!(
-                            "unknown guard variable `{name}` in native case expression"
-                        ),
-                    })
+                let value =
+                    self.lookup(name)
+                        .copied()
+                        .ok_or_else(|| crate::Error::NativeCodegen {
+                            message: format!(
+                                "unknown guard variable `{name}` in native case expression"
+                            ),
+                        })?;
+                let _ = self.guard_operand_cache.insert(key, value);
+                Ok(value)
             }
-            ClauseGuard::Constant(constant) => self.lower_clause_guard_constant(module, constant),
-            ClauseGuard::Block { value, .. } => self.lower_clause_guard_operand(module, value),
+            ClauseGuard::Constant(constant) => {
+                let value = self.lower_clause_guard_constant(module, constant)?;
+                let _ = self.guard_operand_cache.insert(key, value);
+                Ok(value)
+            }
+            ClauseGuard::Block { value, .. } => {
+                let value = self.lower_clause_guard_operand(module, value)?;
+                let _ = self.guard_operand_cache.insert(key, value);
+                Ok(value)
+            }
             other => Err(crate::Error::NativeCodegen {
                 message: format!(
                     "guard expression `{other:?}` is not yet supported in native functions"
