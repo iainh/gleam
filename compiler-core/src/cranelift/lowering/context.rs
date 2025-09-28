@@ -201,6 +201,8 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) module_name: &'a EcoString,
     pub(super) sealed_blocks: HashSet<ir::Block>,
     constant_pool: HashMap<ConstantPoolKey, (ir::Block, Value)>,
+    tuple_element_cache: HashMap<(Value, u64), Value>,
+    record_field_cache: HashMap<(Value, u64), Value>,
     guard_condition_cache: HashMap<usize, Value>,
     guard_operand_cache: HashMap<usize, Value>,
 }
@@ -355,6 +357,8 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             module_name,
             sealed_blocks: HashSet::new(),
             constant_pool: HashMap::new(),
+            tuple_element_cache: HashMap::new(),
+            record_field_cache: HashMap::new(),
             guard_condition_cache: HashMap::new(),
             guard_operand_cache: HashMap::new(),
         }
@@ -3673,6 +3677,10 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     }
 
     pub(super) fn tuple_element(&mut self, tuple: Value, index: u64) -> Result<Value> {
+        if let Some(value) = self.tuple_element_cache.get(&(tuple, index)) {
+            return Ok(*value);
+        }
+
         let pointer_block = self.builder.create_block();
         let _ = self
             .builder
@@ -3771,10 +3779,15 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .load(self.pointer_type, mem_flags, tuple_ptr, offset);
         self.seal_block(element_block);
+        let _ = self.tuple_element_cache.insert((tuple, index), element);
         Ok(element)
     }
 
     pub(super) fn record_field(&mut self, record: Value, index: u64) -> Result<Value> {
+        if let Some(value) = self.record_field_cache.get(&(record, index)) {
+            return Ok(*value);
+        }
+
         let pointer_block = self.builder.create_block();
         let _ = self
             .builder
@@ -3877,6 +3890,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .load(self.pointer_type, mem_flags, record_ptr, offset);
         self.seal_block(field_block);
+        let _ = self.record_field_cache.insert((record, index), field);
         Ok(field)
     }
 

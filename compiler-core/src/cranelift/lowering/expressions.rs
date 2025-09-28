@@ -426,6 +426,62 @@ mod tests {
     }
 
     #[test]
+    fn tuple_element_is_cached() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        ctx.func
+            .signature
+            .returns
+            .push(ir::AbiParam::new(pointer_type));
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let tuple_value = lower_expression(&mut module, &tuple_expr(), &mut lowering).unwrap();
+            let loads_before = opcode_count(&lowering.builder.func, Opcode::Load);
+            let first = lowering.tuple_element(tuple_value, 0).unwrap();
+            let loads_after_first = opcode_count(&lowering.builder.func, Opcode::Load);
+            let second = lowering.tuple_element(tuple_value, 0).unwrap();
+            let loads_after_second = opcode_count(&lowering.builder.func, Opcode::Load);
+
+            assert_eq!(first, second);
+            assert!(loads_after_first > loads_before);
+            assert_eq!(loads_after_second, loads_after_first);
+
+            let _ = lowering.builder.ins().return_(&[first]);
+        }
+
+        builder.finalize();
+    }
+
+    #[test]
     fn list_literals_are_pooled_in_block() {
         let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
         ctx.func
