@@ -35,6 +35,18 @@ use super::{
     TAG_LIST, TAG_RECORD, TAG_TUPLE, VALUE_TAG_MASK,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ConstantPoolKey {
+    Int(i64),
+    Float(EcoString),
+    String(EcoString),
+    Bool(bool),
+    EmptyTuple,
+    Tuple(Vec<ConstantPoolKey>),
+    EmptyList,
+    List(Vec<ConstantPoolKey>),
+}
+
 fn expect_nth<'a, T>(slice: &'a [T], index: usize, context: &'static str) -> &'a T {
     slice.get(index).unwrap_or_else(|| {
         panic!(
@@ -123,6 +135,7 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) functions: &'a FunctionIdMap,
     pub(super) module_name: &'a EcoString,
     pub(super) sealed_blocks: HashSet<ir::Block>,
+    constant_pool: HashMap<ConstantPoolKey, (ir::Block, Value)>,
 }
 
 impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
@@ -132,6 +145,27 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .first()
             .copied()
             .unwrap_or_else(|| panic!("native lowering: {context} produced no value"))
+    }
+
+    pub(super) fn pooled_constant(&mut self, key: &ConstantPoolKey) -> Option<Value> {
+        let current_block = self.builder.current_block()?;
+        if let Some((stored_block, value)) = self.constant_pool.get(key) {
+            if *stored_block == current_block {
+                return Some(*value);
+            }
+            if let Some(entry) = self.builder.func.layout.entry_block() {
+                if *stored_block == entry {
+                    return Some(*value);
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn record_pooled_constant(&mut self, key: ConstantPoolKey, value: Value) {
+        if let Some(block) = self.builder.current_block() {
+            let _ = self.constant_pool.insert(key, (block, value));
+        }
     }
 
     pub(super) fn expect_block_param(
@@ -245,6 +279,7 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             functions,
             module_name,
             sealed_blocks: HashSet::new(),
+            constant_pool: HashMap::new(),
         }
     }
 

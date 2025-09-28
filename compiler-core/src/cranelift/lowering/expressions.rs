@@ -26,7 +26,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::{collections::HashMap, convert::TryFrom, sync::Arc};
 
-use super::context::{LoweringContext, encode_small_int};
+use super::context::{ConstantPoolKey, LoweringContext, encode_small_int};
 use super::patterns::{
     ConstructorTupleCondition, ConstructorTupleInfo, ListConstructorCondition, ListConstructorInfo,
     ListHeadMatch, ListTupleInfo, NestedConstructorInfo, collect_list_pattern_info,
@@ -36,6 +36,255 @@ use super::{
     VALUE_TAG_MASK,
 };
 use crate::analyse::Inferred;
+
+#[cfg(test)]
+use {crate::ast::SrcSpan, cranelift_codegen::ir::Opcode};
+
+fn constant_pool_key_from_expr(expr: &TypedExpr) -> Option<ConstantPoolKey> {
+    match expr {
+        TypedExpr::Int { int_value, .. } => int_value.to_i64().map(ConstantPoolKey::Int),
+        TypedExpr::Float { value, .. } => {
+            Some(ConstantPoolKey::Float(value.replace("_", "").into()))
+        }
+        TypedExpr::String { value, .. } => Some(ConstantPoolKey::String(value.clone())),
+        TypedExpr::Var {
+            name, constructor, ..
+        } => {
+            if constructor.type_.is_bool() {
+                match name.as_str() {
+                    "True" => Some(ConstantPoolKey::Bool(true)),
+                    "False" => Some(ConstantPoolKey::Bool(false)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        TypedExpr::ModuleSelect { label, type_, .. } => {
+            if type_.is_bool() {
+                match label.as_str() {
+                    "True" => Some(ConstantPoolKey::Bool(true)),
+                    "False" => Some(ConstantPoolKey::Bool(false)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        TypedExpr::Tuple { elements, .. } => {
+            if elements.is_empty() {
+                return Some(ConstantPoolKey::EmptyTuple);
+            }
+            let mut pooled = Vec::with_capacity(elements.len());
+            for element in elements {
+                pooled.push(constant_pool_key_from_expr(element)?);
+            }
+            Some(ConstantPoolKey::Tuple(pooled))
+        }
+        TypedExpr::List { elements, tail, .. } => {
+            if let Some(tail_expr) = tail.as_deref() {
+                match constant_pool_key_from_expr(tail_expr)? {
+                    ConstantPoolKey::EmptyList | ConstantPoolKey::List(_) => {}
+                    _ => return None,
+                }
+            }
+            let mut pooled = Vec::with_capacity(elements.len());
+            for element in elements {
+                pooled.push(constant_pool_key_from_expr(element)?);
+            }
+            if pooled.is_empty() && tail.is_none() {
+                Some(ConstantPoolKey::EmptyList)
+            } else if tail.is_none() {
+                Some(ConstantPoolKey::List(pooled))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ast::TypedExpr, type_};
+    use cranelift_codegen::{
+        Context as ClifContext,
+        settings::{self, Configurable},
+    };
+    use cranelift_frontend::FunctionBuilderContext;
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+    use num_bigint::BigInt;
+    use std::collections::HashMap;
+
+    fn setup_module() -> (
+        ObjectModule,
+        ClifContext,
+        FunctionBuilderContext,
+        ir::Type,
+        u8,
+    ) {
+        let isa_builder = cranelift_native::builder().unwrap();
+        let mut flag_builder = settings::builder();
+        flag_builder.set("is_pic", "true").unwrap();
+        let flags = settings::Flags::new(flag_builder);
+        let isa = isa_builder.finish(flags).unwrap();
+        let object_builder = ObjectBuilder::new(
+            isa,
+            String::from("gleam_test"),
+            cranelift_module::default_libcall_names(),
+        )
+        .unwrap();
+        let module = ObjectModule::new(object_builder);
+        let ctx = ClifContext::new();
+        let builder_ctx = FunctionBuilderContext::new();
+        let pointer_type = module.target_config().pointer_type();
+        let pointer_bytes = module.target_config().pointer_bytes();
+        (module, ctx, builder_ctx, pointer_type, pointer_bytes)
+    }
+
+    fn int_expr(value: i64) -> TypedExpr {
+        TypedExpr::Int {
+            location: SrcSpan::default(),
+            type_: type_::int(),
+            value: value.to_string().into(),
+            int_value: BigInt::from(value),
+        }
+    }
+
+    fn tuple_expr() -> TypedExpr {
+        TypedExpr::Tuple {
+            location: SrcSpan::default(),
+            type_: type_::tuple(vec![type_::int(), type_::int()]),
+            elements: vec![int_expr(1), int_expr(2)],
+        }
+    }
+
+    fn list_expr() -> TypedExpr {
+        TypedExpr::List {
+            location: SrcSpan::default(),
+            type_: type_::list(type_::int()),
+            elements: vec![int_expr(1), int_expr(2)],
+            tail: None,
+        }
+    }
+
+    fn call_count(func: &ir::Function) -> usize {
+        func.layout
+            .blocks()
+            .flat_map(|block| func.layout.block_insts(block))
+            .filter(|inst| func.dfg.insts[*inst].opcode() == Opcode::Call)
+            .count()
+    }
+
+    #[test]
+    fn tuple_literals_are_pooled_in_block() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        ctx.func
+            .signature
+            .returns
+            .push(ir::AbiParam::new(pointer_type));
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let expr = tuple_expr();
+            let first = lower_expression(&mut module, &expr, &mut lowering).unwrap();
+            let initial_calls = call_count(&lowering.builder.func);
+            let second = lower_expression(&mut module, &expr, &mut lowering).unwrap();
+            let after_calls = call_count(&lowering.builder.func);
+
+            assert_eq!(first, second);
+            assert_eq!(initial_calls, after_calls);
+
+            let _ = lowering.builder.ins().return_(&[first]);
+        }
+
+        builder.finalize();
+    }
+
+    #[test]
+    fn list_literals_are_pooled_in_block() {
+        let (mut module, mut ctx, mut builder_ctx, pointer_type, pointer_bytes) = setup_module();
+        ctx.func
+            .signature
+            .returns
+            .push(ir::AbiParam::new(pointer_type));
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+
+        let functions = FunctionIdMap::new();
+        let mut zero_arity_records = HashMap::new();
+        let mut string_data = HashMap::new();
+        let mut float_constants = HashMap::new();
+        let mut record_constructors = HashMap::new();
+        let mut module_functions = HashMap::new();
+        let mut external_imports = HashMap::new();
+        let mut closure_counter = 0usize;
+        let module_name: EcoString = "test/module".into();
+
+        {
+            let mut lowering = LoweringContext::new(
+                &mut builder,
+                pointer_type,
+                pointer_bytes,
+                &functions,
+                &module_name,
+                &mut zero_arity_records,
+                &mut string_data,
+                &mut float_constants,
+                &mut record_constructors,
+                &mut module_functions,
+                &mut external_imports,
+                &mut closure_counter,
+            );
+            lowering.mark_sealed(block);
+
+            let expr = list_expr();
+            let first = lower_expression(&mut module, &expr, &mut lowering).unwrap();
+            let initial_calls = call_count(&lowering.builder.func);
+            let second = lower_expression(&mut module, &expr, &mut lowering).unwrap();
+            let after_calls = call_count(&lowering.builder.func);
+
+            assert_eq!(first, second);
+            assert_eq!(initial_calls, after_calls);
+
+            let _ = lowering.builder.ins().return_(&[first]);
+        }
+
+        builder.finalize();
+    }
+}
 
 fn ensure_external_cranelift_import(
     module: &mut ObjectModule,
@@ -734,35 +983,64 @@ pub(super) fn lower_expression(
             Ok(ctx.expect_result(call, "int negate"))
         }
 
-        TypedExpr::Tuple { elements, .. } => {
-            if elements.is_empty() {
-                let func_id = ctx.declare_runtime_nil(module)?;
+        TypedExpr::Tuple { .. } => {
+            let pool_key = constant_pool_key_from_expr(expression);
+            if let Some(ref key) = pool_key {
+                if let Some(value) = ctx.pooled_constant(key) {
+                    return Ok(value);
+                }
+            }
+
+            if let TypedExpr::Tuple { elements, .. } = expression {
+                if elements.is_empty() {
+                    let func_id = ctx.declare_runtime_nil(module)?;
+                    let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
+                    let call = ctx.builder.ins().call(func_ref, &[]);
+                    let value = ctx.expect_result(call, "tuple nil");
+                    if let Some(key) = pool_key {
+                        ctx.record_pooled_constant(key, value);
+                    }
+                    return Ok(value);
+                }
+
+                let count = elements.len();
+                let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    (count * ctx.pointer_bytes()) as u32,
+                ));
+
+                for (index, element) in elements.iter().enumerate() {
+                    let value = lower_expression(module, element, ctx)?;
+                    let offset = (index * ctx.pointer_bytes()) as i32;
+                    let _ = ctx.builder.ins().stack_store(value, slot, offset);
+                }
+
+                let base_ptr = ctx.builder.ins().stack_addr(ctx.pointer_type, slot, 0);
+                let len_value = ctx.builder.ins().iconst(ctx.pointer_type, count as i64);
+
+                let func_id = ctx.declare_runtime_alloc_tuple(module)?;
                 let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
-                let call = ctx.builder.ins().call(func_ref, &[]);
-                return Ok(ctx.expect_result(call, "tuple nil"));
+                let call = ctx.builder.ins().call(func_ref, &[base_ptr, len_value]);
+                let value = ctx.expect_result(call, "tuple allocation");
+                if let Some(key) = pool_key {
+                    ctx.record_pooled_constant(key, value);
+                }
+                Ok(value)
+            } else {
+                unreachable!()
             }
-
-            let count = elements.len();
-            let slot = ctx.builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                (count * ctx.pointer_bytes()) as u32,
-            ));
-
-            for (index, element) in elements.iter().enumerate() {
-                let value = lower_expression(module, element, ctx)?;
-                let offset = (index * ctx.pointer_bytes()) as i32;
-                let _ = ctx.builder.ins().stack_store(value, slot, offset);
-            }
-
-            let base_ptr = ctx.builder.ins().stack_addr(ctx.pointer_type, slot, 0);
-            let len_value = ctx.builder.ins().iconst(ctx.pointer_type, count as i64);
-
-            let func_id = ctx.declare_runtime_alloc_tuple(module)?;
-            let func_ref = module.declare_func_in_func(func_id, ctx.builder.func);
-            let call = ctx.builder.ins().call(func_ref, &[base_ptr, len_value]);
-            Ok(ctx.expect_result(call, "tuple allocation"))
         }
-        TypedExpr::List { elements, tail, .. } => {
+        TypedExpr::List { .. } => {
+            let pool_key = constant_pool_key_from_expr(expression);
+            if let Some(ref key) = pool_key {
+                if let Some(value) = ctx.pooled_constant(key) {
+                    return Ok(value);
+                }
+            }
+
+            let TypedExpr::List { elements, tail, .. } = expression else {
+                unreachable!()
+            };
             let mut values = Vec::with_capacity(elements.len());
             for element in elements {
                 values.push(lower_expression(module, element, ctx)?);
@@ -784,6 +1062,9 @@ pub(super) fn lower_expression(
                     let call = ctx.builder.ins().call(func_ref, &[value, current]);
                     current = ctx.expect_result(call, "list cons");
                 }
+            }
+            if let Some(key) = pool_key {
+                ctx.record_pooled_constant(key, current);
             }
             Ok(current)
         }
