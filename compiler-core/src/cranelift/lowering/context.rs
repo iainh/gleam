@@ -201,8 +201,8 @@ pub(super) struct LoweringContext<'a, 'b, 'c> {
     pub(super) module_name: &'a EcoString,
     pub(super) sealed_blocks: HashSet<ir::Block>,
     constant_pool: HashMap<ConstantPoolKey, (ir::Block, Value)>,
-    tuple_element_cache: HashMap<(Value, u64), Value>,
-    record_field_cache: HashMap<(Value, u64), Value>,
+    tuple_element_cache: HashMap<(Value, u64), (ir::Block, Value)>,
+    record_field_cache: HashMap<(Value, u64), (ir::Block, Value)>,
     guard_condition_cache: HashMap<usize, Value>,
     guard_operand_cache: HashMap<usize, Value>,
 }
@@ -3677,8 +3677,12 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
     }
 
     pub(super) fn tuple_element(&mut self, tuple: Value, index: u64) -> Result<Value> {
-        if let Some(value) = self.tuple_element_cache.get(&(tuple, index)) {
-            return Ok(*value);
+        if let Some((block, value)) = self.tuple_element_cache.get(&(tuple, index)) {
+            if let Some(current) = self.builder.current_block() {
+                if *block == current {
+                    return Ok(*value);
+                }
+            }
         }
 
         let pointer_block = self.builder.create_block();
@@ -3779,13 +3783,21 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .load(self.pointer_type, mem_flags, tuple_ptr, offset);
         self.seal_block(element_block);
-        let _ = self.tuple_element_cache.insert((tuple, index), element);
+        if let Some(current) = self.builder.current_block() {
+            let _ = self
+                .tuple_element_cache
+                .insert((tuple, index), (current, element));
+        }
         Ok(element)
     }
 
     pub(super) fn record_field(&mut self, record: Value, index: u64) -> Result<Value> {
-        if let Some(value) = self.record_field_cache.get(&(record, index)) {
-            return Ok(*value);
+        if let Some((block, value)) = self.record_field_cache.get(&(record, index)) {
+            if let Some(current) = self.builder.current_block() {
+                if *block == current {
+                    return Ok(*value);
+                }
+            }
         }
 
         let pointer_block = self.builder.create_block();
@@ -3890,7 +3902,11 @@ impl<'a, 'b, 'c> LoweringContext<'a, 'b, 'c> {
             .ins()
             .load(self.pointer_type, mem_flags, record_ptr, offset);
         self.seal_block(field_block);
-        let _ = self.record_field_cache.insert((record, index), field);
+        if let Some(current) = self.builder.current_block() {
+            let _ = self
+                .record_field_cache
+                .insert((record, index), (current, field));
+        }
         Ok(field)
     }
 
