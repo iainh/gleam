@@ -16,7 +16,11 @@ install: ## Build the Gleam compiler and place it on PATH
 	cd gleam-bin && cargo install --path . --force --locked
 	RUNTIME_INSTALL_DIR=$${CARGO_HOME:-$$HOME/.cargo}/lib/gleam ; \
 	mkdir -p $$RUNTIME_INSTALL_DIR ; \
-	cp target/release/libruntime_cranelift.a $$RUNTIME_INSTALL_DIR/ ; \
+	for lib in libruntime_cranelift.a libruntime_cranelift.dylib libruntime_cranelift.so runtime_cranelift.dll; do \
+	  if [ -f target/release/$$lib ]; then \
+	    cp target/release/$$lib $$RUNTIME_INSTALL_DIR/ ; \
+	  fi ; \
+	done ; \
 	BDWGC_LIB_DIR=$$(find target/release/build -maxdepth 5 -path '*/out/lib' -print -quit) ; \
 	if [ -n "$$BDWGC_LIB_DIR" ]; then \
 	  cp $$BDWGC_LIB_DIR/libgc.a $$RUNTIME_INSTALL_DIR/ ; \

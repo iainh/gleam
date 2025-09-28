@@ -17,7 +17,7 @@ use crate::{
     codegen::{Erlang, ErlangApp, JavaScript, TypeScriptDeclarations},
     config::{CraneliftLinkerSettings, PackageConfig},
     dep_tree, error,
-    io::{BeamCompiler, CommandExecutor, FileSystemReader, FileSystemWriter, Stdio},
+    io::{BeamCompiler, Command, CommandExecutor, FileSystemReader, FileSystemWriter, Stdio},
     metadata::ModuleEncoder,
     parse::extra::ModuleExtra,
     paths, type_,
@@ -38,7 +38,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use super::{
     CraneliftCodegenConfiguration, ErlangAppCodegenConfiguration, TargetCodegenConfiguration,
-    Telemetry, runtime_lib::locate_runtime_artifacts,
+    Telemetry,
+    runtime_lib::{RuntimeArtifacts, RuntimeLibraryKind, locate_runtime_artifacts},
 };
 
 pub struct Compiled {
@@ -601,11 +602,12 @@ where
         if !exe_suffix.is_empty() && !output_name.ends_with(exe_suffix) {
             output_name.push_str(exe_suffix);
         }
-        let output = artefact_dir.join(output_name);
+        let executable_path = artefact_dir.join(output_name);
 
         let runtime = locate_runtime_artifacts(&self.io)?;
+        let runtime_library_for_link = prepare_runtime_library(&self.io, &runtime, &artefact_dir)?;
 
-        let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 12);
+        let mut args = Vec::with_capacity(objects.len() + runtime.additional_libs.len() + 16);
         let mut seen = HashSet::new();
 
         for search_path in &linker_settings.search_paths {
@@ -633,7 +635,29 @@ where
             }
         }
 
-        args.push(runtime.runtime_lib.as_str().to_string());
+        if runtime.kind == RuntimeLibraryKind::Shared {
+            if let Some(rpath) = shared_runtime_rpath_flag() {
+                if !linker_settings
+                    .linker_args
+                    .iter()
+                    .any(|arg| arg.as_str() == rpath)
+                {
+                    args.push(rpath);
+                }
+            }
+        }
+
+        match runtime.kind {
+            RuntimeLibraryKind::Static => {
+                args.push(runtime_library_for_link.as_str().to_string());
+            }
+            RuntimeLibraryKind::Shared => {
+                let runtime_path = runtime_library_for_link.as_str().to_string();
+                if seen.insert(runtime_path.clone()) {
+                    args.push(runtime_path);
+                }
+            }
+        }
         for lib in &runtime.additional_libs {
             args.push(lib.as_str().to_string());
         }
@@ -666,7 +690,7 @@ where
             args.push("-ldl".into());
         }
         args.push("-o".into());
-        args.push(output.as_str().to_string());
+        args.push(executable_path.as_str().to_string());
 
         let linker_program = linker_settings.linker.as_deref().unwrap_or("cc");
         let command_for_display = args.join(" ");
@@ -675,15 +699,15 @@ where
             command = %command_for_display,
             "invoking_native_linker",
         );
-        let output = std::process::Command::new(linker_program)
+        let link_output = std::process::Command::new(linker_program)
             .args(&args)
             .output()
             .map_err(|err| Error::NativeCodegen {
                 message: format!("failed to invoke linker: {err}"),
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !link_output.status.success() {
+            let stderr = String::from_utf8_lossy(&link_output.stderr);
             return Err(Error::NativeCodegen {
                 message: format!(
                     "linker failed: {}\ncommand: {} {}",
@@ -692,6 +716,21 @@ where
                     command_for_display
                 ),
             });
+        }
+
+        #[cfg(target_os = "macos")]
+        if runtime.kind == RuntimeLibraryKind::Shared {
+            if let Some(binary) = runtime.runtime_binary.as_ref() {
+                if let Some(file_name) = binary.file_name() {
+                    update_macos_executable_runtime_ref(
+                        &self.io,
+                        &executable_path,
+                        &runtime,
+                        runtime_library_for_link.as_path(),
+                        file_name,
+                    )?;
+                }
+            }
         }
 
         Ok(())
@@ -1126,6 +1165,164 @@ where
         } else {
             StdlibPackage::Missing
         }
+    }
+}
+
+fn prepare_runtime_library<IO>(
+    io: &IO,
+    runtime: &RuntimeArtifacts,
+    artefact_dir: &Utf8Path,
+) -> Result<Utf8PathBuf, Error>
+where
+    IO: FileSystemWriter + CommandExecutor,
+{
+    if runtime.kind != RuntimeLibraryKind::Shared {
+        return Ok(runtime.runtime_lib.clone());
+    }
+
+    let Some(binary) = runtime.runtime_binary.as_ref() else {
+        return Ok(runtime.runtime_lib.clone());
+    };
+
+    let Some(file_name) = binary.file_name() else {
+        return Ok(runtime.runtime_lib.clone());
+    };
+
+    let destination = artefact_dir.join(file_name);
+    if destination != *binary {
+        io.copy(binary, &destination)?;
+    }
+
+    #[cfg(target_os = "macos")]
+    adjust_macos_install_name(io, &destination, file_name)?;
+
+    if cfg!(target_os = "windows") {
+        Ok(runtime.runtime_lib.clone())
+    } else {
+        Ok(destination)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn adjust_macos_install_name<IO>(
+    io: &IO,
+    library_path: &Utf8Path,
+    file_name: &str,
+) -> Result<(), Error>
+where
+    IO: CommandExecutor,
+{
+    let id = format!("@rpath/{file_name}");
+    let status = io.exec(Command {
+        program: "install_name_tool".into(),
+        args: vec!["-id".into(), id, library_path.as_str().to_string()],
+        env: Vec::new(),
+        cwd: None,
+        stdio: Stdio::Null,
+    })?;
+
+    if status != 0 {
+        return Err(Error::NativeCodegen {
+            message: format!("install_name_tool failed while updating {}", library_path),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn adjust_macos_install_name<IO>(
+    _io: &IO,
+    _library_path: &Utf8Path,
+    _file_name: &str,
+) -> Result<(), Error>
+where
+    IO: CommandExecutor,
+{
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn update_macos_executable_runtime_ref<IO>(
+    io: &IO,
+    executable_path: &Utf8Path,
+    runtime: &RuntimeArtifacts,
+    runtime_library_for_link: &Utf8Path,
+    file_name: &str,
+) -> Result<(), Error>
+where
+    IO: CommandExecutor,
+{
+    use std::collections::HashSet;
+
+    let new_path = format!("@rpath/{file_name}");
+    let executable = executable_path.as_str().to_string();
+    let mut attempted = HashSet::new();
+
+    let mut candidates = Vec::new();
+    candidates.push(runtime.runtime_lib.as_str().to_string());
+    candidates.push(runtime_library_for_link.as_str().to_string());
+
+    if let Some(parent) = runtime.runtime_lib.parent() {
+        let candidate = parent.join("deps").join(file_name);
+        candidates.push(candidate.to_string());
+    }
+
+    if let Some(parent) = runtime_library_for_link.parent() {
+        let candidate = parent.join("deps").join(file_name);
+        candidates.push(candidate.to_string());
+    }
+
+    for original in candidates {
+        if !attempted.insert(original.clone()) {
+            continue;
+        }
+
+        let status = io.exec(Command {
+            program: "install_name_tool".into(),
+            args: vec![
+                "-change".into(),
+                original.clone(),
+                new_path.clone(),
+                executable.clone(),
+            ],
+            env: Vec::new(),
+            cwd: None,
+            stdio: Stdio::Null,
+        })?;
+
+        if status == 0 {
+            return Ok(());
+        }
+    }
+
+    Err(Error::NativeCodegen {
+        message: format!(
+            "install_name_tool failed to update runtime reference in {}",
+            executable_path
+        ),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_macos_executable_runtime_ref<IO>(
+    _io: &IO,
+    _executable_path: &Utf8Path,
+    _runtime: &RuntimeArtifacts,
+    _runtime_library_for_link: &Utf8Path,
+    _file_name: &str,
+) -> Result<(), Error>
+where
+    IO: CommandExecutor,
+{
+    Ok(())
+}
+
+fn shared_runtime_rpath_flag() -> Option<String> {
+    match std::env::consts::OS {
+        "macos" => Some("-Wl,-rpath,@loader_path".into()),
+        "linux" => Some("-Wl,-rpath,$ORIGIN".into()),
+        _ => None,
     }
 }
 
